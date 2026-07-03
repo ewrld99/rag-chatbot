@@ -4,7 +4,6 @@ from app.core.config import settings
 
 
 class GenerationService:
-    DOCUMENT_REFUSAL = "I don't have enough information from the provided documents."
 
     def __init__(self):
         # ✅ Validate API key early
@@ -19,22 +18,24 @@ class GenerationService:
     # ---------------------------------------
     def system_prompt(self) -> str:
         """
-        Strong grounding with XML boundaries and mandatory citations to prevent hallucination.
+        Strong grounding with XML boundaries, but allows general knowledge fallback.
         """
         return (
-            "You are a retrieval-augmented AI assistant.\n"
-            "You MUST answer ONLY using the provided <documents>.\n\n"
+            "You are a helpful retrieval-augmented AI assistant for the University of Dodoma (UDOM).\n"
+            "You have been provided with some <documents> as context.\n\n"
             "RULES:\n"
-            "- Do NOT use outside knowledge.\n"
-            "- Do NOT include inline citations (e.g., [Doc 1]) in your answer.\n"
-            "- Instead, you MUST add a 'Sources:' section at the very bottom of your response.\n"
-            "- In the 'Sources:' section, list the actual document names from the 'source' attribute (e.g., 'Sources: curriculum.pdf') that you used to answer the question.\n"
-            "- If the answer is missing from the provided documents, say exactly:\n"
-            f"\"{self.DOCUMENT_REFUSAL}\"\n"
-            "- Be concise, factual, and strictly adhere to the context."
+            "- If the <documents> contain the answer, use them and add a 'Sources:' section at the bottom listing the document names from the 'source' attribute.\n"
+            "- If the <documents> DO NOT contain the answer, you MUST use your own general knowledge to provide a helpful and relevant answer to the user.\n"
+            "- Do not hallucinate UDOM-specific policies if you aren't sure. Be concise and factual."
         )
 
-    # (Fallback system prompt removed)
+    def fallback_system_prompt(self) -> str:
+        return (
+            "You are a helpful AI assistant for the University of Dodoma (UDOM).\n"
+            "The user asked a question, but you do not have specific institutional documents containing the answer.\n"
+            "You should answer the user's question using your general knowledge.\n"
+            "If you do not know the answer, politely say so. DO NOT hallucinate UDOM-specific policies."
+        )
 
     def _history_messages(self, chat_history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
         messages = []
@@ -94,7 +95,28 @@ QUESTION:
         except Exception as e:
             raise RuntimeError(f"Groq API error: {str(e)}")
 
-    # (generate_fallback removed)
+    # ---------------------------------------
+    # Fallback Generation
+    # ---------------------------------------
+    def generate_fallback(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.fallback_system_prompt()},
+                    *self._history_messages(chat_history),
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise RuntimeError(f"Groq API error (fallback): {str(e)}")
 
     # ---------------------------------------
     # 4. Structured Response
@@ -190,4 +212,25 @@ QUESTION:
         except Exception as e:
             yield f"[ERROR]: {str(e)}"
 
-    # (stream_fallback removed)
+    async def stream_fallback(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+    ) -> AsyncGenerator[str, None]:
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.fallback_system_prompt()},
+                    *self._history_messages(chat_history),
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.3,
+                stream=True
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+        except Exception as e:
+            yield f"[ERROR]: {str(e)}"

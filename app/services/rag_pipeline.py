@@ -9,30 +9,9 @@ class RAGPipeline:
     def __init__(self, retrieval_service: RetrievalService):
         self.retrieval_service = retrieval_service
         self.generator = GenerationService()
-        self.document_refusal = GenerationService.DOCUMENT_REFUSAL
-        self.greeting_response = (
-            "Hello! How can I help you today? "
-            "You can ask me anything, and I'll do my best to help."
-        )
-
-    def _is_greeting(self, query: str) -> bool:
-        normalized = re.sub(r"[^a-z\s]", " ", query.lower()).strip()
-        normalized = re.sub(r"\s+", " ", normalized)
-
-        greeting_patterns = (
-            r"^(hi|hello|hey|hii|hiya)$",
-            r"^(hi|hello|hey|hii|hiya)\s+(there|bot|assistant)$",
-            r"^good\s+(morning|afternoon|evening)$",
-            r"^(howdy|greetings)$",
-        )
-
-        return any(re.match(pattern, normalized) for pattern in greeting_patterns)
 
     def _is_empty_context(self, context: str) -> bool:
         return not context or context.strip() == "No relevant context found."
-
-    def _should_fallback(self, answer: str) -> bool:
-        return answer.strip() == self.document_refusal
 
     def _retrieval_query(
         self,
@@ -54,26 +33,10 @@ class RAGPipeline:
         uploaded documents cannot answer.
         """
 
-        if self._is_greeting(query):
-            return {
-                "query": query,
-                "answer": self.greeting_response,
-                "sources": [],
-                "context_used": False
-            }
-
         retrieval_query = self._retrieval_query(query, chat_history)
         retrieval_result = self.retrieval_service.get_context(retrieval_query)
         context = retrieval_result["context"]
         documents = retrieval_result["documents"]
-
-        if self._is_empty_context(context):
-            return {
-                "query": query,
-                "answer": self.document_refusal,
-                "sources": [],
-                "context_used": False
-            }
 
         generation_result = self.generator.generate_response(query, context, chat_history)
         answer = generation_result["answer"]
@@ -92,22 +55,11 @@ class RAGPipeline:
     ) -> AsyncGenerator[str, None]:
         """
         Streaming pipeline for WebSocket or real-time UI.
-
-        The document answer is buffered so users do not see the document-only
-        refusal before the fallback answer.
         """
-
-        if self._is_greeting(query):
-            yield self.greeting_response
-            return
 
         retrieval_query = self._retrieval_query(query, chat_history)
         retrieval_result = self.retrieval_service.get_context(retrieval_query)
         context = retrieval_result["context"]
-
-        if self._is_empty_context(context):
-            yield self.document_refusal
-            return
 
         async for token in self.generator.stream_generate(query, context, chat_history):
             yield token
@@ -120,18 +72,6 @@ class RAGPipeline:
         """
         Returns detailed internal pipeline data for debugging.
         """
-
-        if self._is_greeting(query):
-            return {
-                "query": query,
-                "answer": self.greeting_response,
-                "debug": {
-                    "num_docs": 0,
-                    "documents": [],
-                    "context_preview": "Greeting handled without document retrieval.",
-                    "fallback_used": False
-                }
-            }
 
         retrieval_query = self._retrieval_query(query, chat_history)
         scored_docs = self.retrieval_service.retrieve_with_scores(retrieval_query)
@@ -149,12 +89,8 @@ class RAGPipeline:
 
         context = self.retrieval_service.format_context(documents)
 
-        if self._is_empty_context(context):
-            answer = self.document_refusal
-            fallback_used = False
-        else:
-            answer = self.generator.generate(query, context, chat_history)
-            fallback_used = False
+        answer = self.generator.generate(query, context, chat_history)
+        fallback_used = False
 
         return {
             "query": query,

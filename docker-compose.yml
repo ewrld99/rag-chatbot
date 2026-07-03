@@ -1,0 +1,59 @@
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: rag_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rag_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-rag_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-rag_db}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - JWT_SECRET=${JWT_SECRET:-super-secret-key-change-in-prod}
+      # Make sure the frontend URL matches the host machine's port or domain
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/app/uploads
+
+  frontend:
+    build:
+      context: ./rag-frontend
+      dockerfile: Dockerfile
+    container_name: rag_frontend
+    restart: always
+    depends_on:
+      - backend
+    # Environment variables in the frontend build process are baked into the static files.
+    # To use runtime env vars with React/Vite in Docker, you'd need an env replacement script.
+    # We will build assuming the backend is at /api, or exposed externally if running locally.
+    ports:
+      - "3000:80"
+
+volumes:
+  postgres_data:
+  uploads_data:
