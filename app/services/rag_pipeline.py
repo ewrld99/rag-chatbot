@@ -40,28 +40,9 @@ class RAGPipeline:
         chat_history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
-        Include recent turns in the embedding query so follow-up questions can
-        resolve references like "it", "that course", or "the second one".
+        Use the LLM to rewrite the query based on chat history.
         """
-
-        history_lines = []
-
-        for item in (chat_history or [])[-8:]:
-            role = item.get("role")
-            content = item.get("content", "").strip()
-
-            if role in {"user", "assistant"} and content:
-                label = "User" if role == "user" else "Assistant"
-                history_lines.append(f"{label}: {content[:500]}")
-
-        if not history_lines:
-            return query
-
-        return (
-            "Recent conversation:\n"
-            f"{chr(10).join(history_lines)}\n\n"
-            f"Current question: {query}"
-        )
+        return self.generator.rewrite_query(query, chat_history)
 
     def run(
         self,
@@ -89,21 +70,13 @@ class RAGPipeline:
         if self._is_empty_context(context):
             return {
                 "query": query,
-                "answer": self.generator.generate_fallback(query, chat_history),
+                "answer": self.document_refusal,
                 "sources": [],
                 "context_used": False
             }
 
         generation_result = self.generator.generate_response(query, context, chat_history)
         answer = generation_result["answer"]
-
-        if self._should_fallback(answer):
-            return {
-                "query": query,
-                "answer": self.generator.generate_fallback(query, chat_history),
-                "sources": [],
-                "context_used": False
-            }
 
         return {
             "query": query,
@@ -133,20 +106,11 @@ class RAGPipeline:
         context = retrieval_result["context"]
 
         if self._is_empty_context(context):
-            async for token in self.generator.stream_fallback(query, chat_history):
-                yield token
+            yield self.document_refusal
             return
 
-        document_answer = ""
         async for token in self.generator.stream_generate(query, context, chat_history):
-            document_answer += token
-
-        if self._should_fallback(document_answer):
-            async for token in self.generator.stream_fallback(query, chat_history):
-                yield token
-            return
-
-        yield document_answer
+            yield token
 
     def run_debug(
         self,
@@ -186,13 +150,11 @@ class RAGPipeline:
         context = self.retrieval_service.format_context(documents)
 
         if self._is_empty_context(context):
-            answer = self.generator.generate_fallback(query, chat_history)
-            fallback_used = True
+            answer = self.document_refusal
+            fallback_used = False
         else:
             answer = self.generator.generate(query, context, chat_history)
-            fallback_used = self._should_fallback(answer)
-            if fallback_used:
-                answer = self.generator.generate_fallback(query, chat_history)
+            fallback_used = False
 
         return {
             "query": query,

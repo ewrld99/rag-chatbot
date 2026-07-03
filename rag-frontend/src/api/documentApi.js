@@ -1,9 +1,10 @@
 import { API_BASE } from "./chatApi";
 import { getAdminToken } from "../utils/adminAuth";
 
-export async function uploadDocument(file, onProgress) {
+export async function uploadDocument(file, onProgress, strategy = "auto") {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("strategy", strategy);
 
     return new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();

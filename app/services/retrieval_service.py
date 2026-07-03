@@ -108,12 +108,13 @@ class RetrievalService:
             source = doc.metadata.get("source", "unknown")
             chunk_index = doc.metadata.get("chunk_index", i)
             chunk_text = (
-                f"[Source: {source} | Chunk: {chunk_index}]\n"
-                f"{doc.page_content.strip()}"
+                f'  <document id="[Doc {i+1}]" source="{source}" chunk="{chunk_index}">\n'
+                f'    {doc.page_content.strip()}\n'
+                f'  </document>'
             )
             formatted_chunks.append(chunk_text)
 
-        return "\n\n---\n\n".join(formatted_chunks)
+        return "\n".join(formatted_chunks)
 
     # -----------------------------------------------------------------------
     # 5. Full Pipeline

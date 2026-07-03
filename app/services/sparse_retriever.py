@@ -84,6 +84,27 @@ _FTS_QUERY = text(
     """
 )
 
+_FTS_FAQ_QUERY = text(
+    """
+    SELECT
+        f.id::text                            AS chunk_id,
+        f.id::text                            AS document_id,
+        COALESCE('FAQ - ' || f.category, 'FAQ') AS source,
+        f.question || E'\n\n' || f.answer     AS text,
+        0                                     AS chunk_index,
+        f.category                            AS category,
+        ts_rank_cd(f.fts_vector, tsq, 32)     AS fts_score
+    FROM
+        faqs f,
+        websearch_to_tsquery('english', :query) AS tsq
+    WHERE
+        f.is_active = true AND f.fts_vector @@ tsq
+    ORDER BY
+        fts_score DESC
+    LIMIT :top_k
+    """
+)
+
 
 # ---------------------------------------------------------------------------
 # Retriever
@@ -122,25 +143,59 @@ class SparseRetriever:
                 _FTS_QUERY,
                 {"query": query.strip(), "top_k": top_k},
             ).fetchall()
+            
+            faq_rows = self.db.execute(
+                _FTS_FAQ_QUERY,
+                {"query": query.strip(), "top_k": top_k},
+            ).fetchall()
+            
         except Exception as exc:
             # Graceful degradation: FTS failure never kills the pipeline
             logger.warning("SparseRetriever FTS query failed: %s", exc)
             return []
 
-        results: list[SparseResult] = []
+        # Merge and sort
+        combined = []
         for row in rows:
+            combined.append((row.fts_score, row, "doc"))
+        for row in faq_rows:
+            combined.append((row.fts_score, row, "faq"))
+            
+        combined.sort(key=lambda x: x[0], reverse=True)
+        combined = combined[:top_k]
+
+        results: list[SparseResult] = []
+        for score, row, type_ in combined:
             chunk_id = str(row.chunk_id)
-            results.append(
-                SparseResult(
-                    chunk_id=chunk_id,
-                    document_id=str(row.document_id),
-                    fts_score=round(float(row.fts_score), 6),
-                    text=row.text,
-                    metadata={
-                        "source": row.source or "database",
-                        "chunk_index": row.chunk_index,
-                    },
+            if type_ == "doc":
+                results.append(
+                    SparseResult(
+                        chunk_id=chunk_id,
+                        document_id=str(row.document_id),
+                        fts_score=round(float(score), 6),
+                        text=row.text,
+                        metadata={
+                            "source": row.source or "database",
+                            "chunk_index": row.chunk_index,
+                            "source_type": "document"
+                        },
+                    )
                 )
-            )
+            else:
+                results.append(
+                    SparseResult(
+                        chunk_id=chunk_id,
+                        document_id=str(row.document_id),
+                        fts_score=round(float(score), 6),
+                        text=row.text,
+                        metadata={
+                            "source": row.source,
+                            "chunk_index": 0,
+                            "source_type": "faq",
+                            "faq_id": str(row.document_id),
+                            "category": row.category
+                        },
+                    )
+                )
 
         return results

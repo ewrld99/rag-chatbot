@@ -19,29 +19,22 @@ class GenerationService:
     # ---------------------------------------
     def system_prompt(self) -> str:
         """
-        Strong grounding to prevent hallucination.
+        Strong grounding with XML boundaries and mandatory citations to prevent hallucination.
         """
         return (
             "You are a retrieval-augmented AI assistant.\n"
-            "You MUST answer ONLY using the provided context.\n\n"
+            "You MUST answer ONLY using the provided <documents>.\n\n"
             "RULES:\n"
-            "- Do NOT use outside knowledge\n"
-            "- If answer is missing, say exactly:\n"
+            "- Do NOT use outside knowledge.\n"
+            "- Do NOT include inline citations (e.g., [Doc 1]) in your answer.\n"
+            "- Instead, you MUST add a 'Sources:' section at the very bottom of your response.\n"
+            "- In the 'Sources:' section, list the actual document names from the 'source' attribute (e.g., 'Sources: curriculum.pdf') that you used to answer the question.\n"
+            "- If the answer is missing from the provided documents, say exactly:\n"
             f"\"{self.DOCUMENT_REFUSAL}\"\n"
-            "- Be concise and factual\n"
+            "- Be concise, factual, and strictly adhere to the context."
         )
 
-    def fallback_system_prompt(self) -> str:
-        """
-        General assistant mode used only when uploaded documents cannot answer.
-        """
-        return (
-            "You are a helpful general-purpose AI assistant.\n"
-            "Answer the user's question using your general knowledge.\n"
-            "Be clear, useful, and concise.\n"
-            "If the question needs current or private information you do not have, "
-            "say what you cannot verify and explain how the user can check it."
-        )
+    # (Fallback system prompt removed)
 
     def _history_messages(self, chat_history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
         messages = []
@@ -60,11 +53,12 @@ class GenerationService:
     # ---------------------------------------
     def user_prompt(self, query: str, context: str) -> str:
         """
-        Clean separation of context and question.
+        Clean separation of context and question using XML tags.
         """
         return f"""
-CONTEXT:
+<documents>
 {context}
+</documents>
 
 QUESTION:
 {query}
@@ -100,31 +94,7 @@ QUESTION:
         except Exception as e:
             raise RuntimeError(f"Groq API error: {str(e)}")
 
-    def generate_fallback(
-        self,
-        query: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
-        """
-        Calls Groq LLM as a normal assistant without document-only grounding.
-        """
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.fallback_system_prompt()},
-                    *self._history_messages(chat_history),
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-
-            return response.choices[0].message.content.strip()
-
-        except Exception as e:
-            raise RuntimeError(f"Groq API fallback error: {str(e)}")
+    # (generate_fallback removed)
 
     # ---------------------------------------
     # 4. Structured Response
@@ -146,6 +116,45 @@ QUESTION:
             "answer": answer,
             "context_used": bool(context and context.strip()),
         }
+
+    # ---------------------------------------
+    # 5. Query Rewriting (Contextualization)
+    # ---------------------------------------
+    def rewrite_query(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """
+        Rewrites conversational queries into standalone search queries for dense retrieval.
+        """
+        if not chat_history:
+            return query
+
+        history_msgs = self._history_messages(chat_history)[-6:]
+        if not history_msgs:
+            return query
+            
+        system = (
+            "Given a chat history and the latest user question, formulate a standalone query "
+            "that can be understood without the chat history. Do NOT answer the question, "
+            "just reformulate it if needed, otherwise return it as is."
+        )
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    *history_msgs,
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.0,
+                max_tokens=100
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return query  # Fallback to raw query on failure
 
     # ---------------------------------------
     # 5. Streaming Response (FIXED + INSIDE CLASS)
@@ -181,32 +190,4 @@ QUESTION:
         except Exception as e:
             yield f"[ERROR]: {str(e)}"
 
-    async def stream_fallback(
-        self,
-        query: str,
-        chat_history: Optional[List[Dict[str, str]]] = None,
-    ) -> AsyncGenerator[str, None]:
-        """
-        Streams a normal assistant response without document-only grounding.
-        """
-
-        try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.fallback_system_prompt()},
-                    *self._history_messages(chat_history),
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.3,
-                stream=True
-            )
-
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-
-                if delta and delta.content:
-                    yield delta.content
-
-        except Exception as e:
-            yield f"[ERROR]: {str(e)}"
+    # (stream_fallback removed)

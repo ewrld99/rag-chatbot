@@ -11,5 +11,10 @@ groq
 langchain-core
 langchain-openai
 pypdf
+pdfplumber
 python-docx
 alembic
+pandas
+openpyxl
+httpx
+beautifulsoup4

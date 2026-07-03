@@ -4,6 +4,9 @@ import DocumentManager from "../components/admin/DocumentManager.jsx";
 import UploadCard from "../components/admin/UploadCard.jsx";
 import VectorStatus from "../components/admin/VectorStatus.jsx";
 import FeedbackViewer from "../components/admin/FeedbackViewer.jsx";
+import RagSettings from "../components/admin/RagSettings.jsx";
+import FaqManager from "../components/admin/FaqManager.jsx";
+import TimetableFetcher from "../components/admin/TimetableFetcher.jsx";
 import { getDocuments } from "../api/documentApi.js";
 
 function getCurrentSection() {
@@ -73,7 +76,10 @@ export default function AdminDashboardPage() {
             {section === "upload" && <UploadCard onUploaded={() => setRefreshKey((value) => value + 1)} />}
             {section === "documents" && <DocumentManager refreshKey={refreshKey} onChanged={() => setRefreshKey((value) => value + 1)} />}
             {section === "vector" && <VectorStatus stats={stats} documents={documents} />}
+            {section === "faq" && <FaqManager />}
+            {section === "timetable" && <TimetableFetcher />}
             {section === "feedback" && <FeedbackViewer />}
+            {section === "settings" && <RagSettings />}
         </div>
     );
 }

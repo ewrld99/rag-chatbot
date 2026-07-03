@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Text, text, Boolean
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Text, text, Boolean, Index
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -91,3 +91,31 @@ class SystemSetting(Base):
     is_editable = Column(Boolean, default=True)
     updated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    admin = Column(Text, nullable=False)
+    setting_key = Column(Text, nullable=False)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class FAQModel(Base):
+    __tablename__ = "faqs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, index=True, server_default=text("gen_random_uuid()"))
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+    category = Column(Text, nullable=True)
+    embedding = Column(Vector(settings.EMBEDDING_DIMENSION), nullable=True)
+    fts_vector = Column(TSVECTOR, nullable=True)
+    metadata_ = Column("metadata", JSONB, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    creator = relationship("User")

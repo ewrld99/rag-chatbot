@@ -1,6 +1,7 @@
 import hashlib
 import math
 import re
+import time
 from typing import List, Union
 from openai import APIStatusError, OpenAI, RateLimitError
 
@@ -29,7 +30,7 @@ class EmbeddingService:
         
         # Read from dynamic settings if available, else fallback to env config
         self.provider = settings.EMBEDDING_PROVIDER.lower()
-        self.model = settings_svc.get("embedding_model", settings.EMBEDDING_MODEL)
+        self.model = settings_svc.embedding_model
         self.dimension = settings.EMBEDDING_DIMENSION
         self.batch_size = max(settings.EMBEDDING_BATCH_SIZE, 1)
         self.client = None
@@ -150,20 +151,31 @@ class EmbeddingService:
 
         return EmbeddingServiceError(f"Embedding service error: {str(error)}")
 
-    def _embed_jina(self, input_value: Union[str, List[str]]) -> List[List[float]]:
-        try:
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=input_value,
-                extra_body={
-                    "normalized": True,
-                    "embedding_type": "float",
-                },
-            )
-        except APIStatusError as error:
-            return self._raise_jina_status_error(error)
-        except Exception as error:
-            raise EmbeddingServiceError(f"Jina embedding request failed: {str(error)}")
+    def _embed_jina(self, input_value: Union[str, List[str]], retries=3) -> List[List[float]]:
+        for attempt in range(retries):
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=input_value,
+                    extra_body={
+                        "normalized": True,
+                        "embedding_type": "float",
+                    },
+                )
+                break
+            except APIStatusError as error:
+                code = getattr(error, "code", None)
+                if (code == "RATE_TOKEN_LIMIT_EXCEEDED" or error.status_code == 429) and attempt < retries - 1:
+                    sleep_time = 20 * (attempt + 1)
+                    print(f"Jina API rate limit hit. Retrying in {sleep_time}s...")
+                    time.sleep(sleep_time)
+                    continue
+                return self._raise_jina_status_error(error)
+            except Exception as error:
+                if attempt < retries - 1:
+                    time.sleep(5)
+                    continue
+                raise EmbeddingServiceError(f"Jina embedding request failed: {str(error)}")
 
         embeddings = [item.embedding for item in response.data]
 

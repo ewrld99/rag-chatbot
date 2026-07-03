@@ -74,10 +74,10 @@ class HybridRetriever:
     ) -> None:
         self.db = db
         settings_svc = SettingsService(db)
-        self.top_k = top_k if top_k is not None else settings_svc.get("top_k_final", settings.HYBRID_TOP_K)
-        self.dense_top_k = dense_top_k if dense_top_k is not None else settings_svc.get("top_k_dense", settings.DENSE_TOP_K)
-        self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_svc.get("top_k_sparse", settings.SPARSE_TOP_K)
-        self.rrf_k = rrf_k if rrf_k is not None else settings.RRF_K
+        self.top_k = top_k if top_k is not None else settings_svc.top_k_final
+        self.dense_top_k = dense_top_k if dense_top_k is not None else settings_svc.top_k_dense
+        self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_svc.top_k_sparse
+        self.rrf_k = rrf_k if rrf_k is not None else settings_svc.rrf_k
 
     # -----------------------------------------------------------------------
     # Core: RRF fusion, returns raw results

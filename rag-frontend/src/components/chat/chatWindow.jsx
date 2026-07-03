@@ -18,6 +18,12 @@ const MenuIcon = () => (
         <line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="18" x2="21" y2="18" />
     </svg>
 );
+const SidebarIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+        <line x1="9" y1="3" x2="9" y2="21"></line>
+    </svg>
+);
 const XIcon = () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
         <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
@@ -70,12 +76,37 @@ function navigate(to) {
     window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
+const morningGreetings = [
+    "Good morning",
+    "Rise and shine",
+    "Top of the morning",
+    "A beautiful morning"
+];
+
+const afternoonGreetings = [
+    "Good afternoon",
+    "Hope your day is going well",
+    "Good day"
+];
+
+const eveningGreetings = [
+    "Good evening",
+    "Welcome back",
+    "Hope you had a great day"
+];
+
 function getTimeGreeting(date = new Date()) {
     const hour = date.getHours();
+    const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-    if (hour < 12) return "Good morning";
-    if (hour < 17) return "Good afternoon";
-    return "Good evening";
+    if (hour >= 5 && hour < 12) return pickRandom(morningGreetings);
+    if (hour >= 12 && hour < 17) return pickRandom(afternoonGreetings);
+    return pickRandom(eveningGreetings);
+}
+
+function capitalizeFirst(str) {
+    if (!str) return "";
+    return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
 function useMediaQuery(query) {
@@ -98,7 +129,7 @@ function useMediaQuery(query) {
 
 export default function ChatWindow() {
     const isNarrow = useMediaQuery("(max-width: 760px)");
-    const greeting = getTimeGreeting();
+    const [greeting] = useState(() => getTimeGreeting());
     const [user, setUser] = useState(() => {
         try {
             const saved = window.localStorage.getItem("ragUser");
@@ -303,7 +334,7 @@ export default function ChatWindow() {
                         onClick={() => setIsSidebarOpen((v) => !v)}
                         aria-label={isSidebarOpen ? "Close sidebar" : "Open sidebar"}
                     >
-                        {isSidebarOpen ? <XIcon /> : <MenuIcon />}
+                        <SidebarIcon />
                     </button>
 
                     {isSidebarOpen && (
@@ -396,7 +427,7 @@ export default function ChatWindow() {
                         <div>
                             <h2 style={styles.panelTitle}>University Assistant</h2>
                             <p style={styles.panelSubtitle}>
-                                {user ? `${greeting}, ${user.username}` : "Ready to help"}
+                                {user ? capitalizeFirst(user.username) : "Ready to help"}
                             </p>
                         </div>
                     </div>
@@ -447,7 +478,7 @@ export default function ChatWindow() {
                         <section style={{ ...styles.emptyChat, ...(isNarrow ? styles.emptyChatNarrow : {}) }}>
                             <div style={styles.emptyChatIcon}><ChatLogo /></div>
                             <h3 style={styles.emptyChatTitle}>
-                                {user ? `${greeting}, ${user.username}` : "How can I assist you?"}
+                                {user ? `${greeting}, ${capitalizeFirst(user.username)}` : "How can I assist you?"}
                             </h3>
                             <p style={styles.emptyChatSubtitle}>
                                 {user

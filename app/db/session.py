@@ -56,3 +56,35 @@ def init_db():
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_document_chunks_fts ON document_chunks USING GIN (tsv)"
         ))
+
+        # ── FTS trigger for faqs ──────────────────────────────
+        conn.execute(text(
+            """
+            CREATE OR REPLACE FUNCTION faqs_fts_update()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                NEW.fts_vector := to_tsvector('english', NEW.question || ' ' || NEW.answer);
+                RETURN NEW;
+            END;
+            $$
+            """
+        ))
+
+        conn.execute(text(
+            """
+            DROP TRIGGER IF EXISTS trg_faqs_fts ON faqs;
+            CREATE TRIGGER trg_faqs_fts
+                BEFORE INSERT OR UPDATE OF question, answer
+                ON faqs
+                FOR EACH ROW
+                EXECUTE FUNCTION faqs_fts_update();
+            """
+        ))
+        
+        # ensure indexes exist for faqs
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_faqs_fts ON faqs USING GIN (fts_vector)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_faqs_embedding ON faqs USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)"
+        ))

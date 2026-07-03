@@ -49,6 +49,7 @@ export default function UploadCard({ onUploaded }) {
     const [isUploading, setIsUploading] = useState(false);
     const [progress, setProgress] = useState(0);
     const [statusType, setStatusType] = useState("");
+    const [strategy, setStrategy] = useState("auto");
 
     const fileMeta = useMemo(() => {
         if (!file) return "PDF, DOCX, or TXT · up to your backend limit";
@@ -80,7 +81,7 @@ export default function UploadCard({ onUploaded }) {
         setStatusType("info");
         setProgress(8);
         try {
-            const res = await uploadDocument(file, setProgress);
+            const res = await uploadDocument(file, setProgress, strategy);
             setMsg(`✓ Uploaded ${res.filename} — ${res.chunks_stored ?? 0} searchable chunks added.`);
             setStatusType("success");
             setProgress(100);
@@ -135,6 +136,25 @@ export default function UploadCard({ onUploaded }) {
                 <span style={styles.dropzoneMeta}>{fileMeta}</span>
             </label>
 
+            {/* Strategy Selection */}
+            {file && file.name.toLowerCase().endsWith(".pdf") && (
+                <div style={styles.strategyContainer}>
+                    <label style={styles.strategyLabel} htmlFor="extraction-strategy">
+                        Extraction Strategy:
+                    </label>
+                    <select 
+                        id="extraction-strategy" 
+                        value={strategy}
+                        onChange={(e) => setStrategy(e.target.value)}
+                        style={styles.strategySelect}
+                        disabled={isUploading}
+                    >
+                        <option value="auto">Advanced (High-fidelity tables via pdfplumber)</option>
+                        <option value="fast">Fast (Raw text via pypdf - best for long books)</option>
+                    </select>
+                </div>
+            )}
+
             {/* Progress Bar */}
             {progress > 0 && (
                 <div style={styles.progressTrack} aria-label="Upload progress">
@@ -159,7 +179,7 @@ export default function UploadCard({ onUploaded }) {
                 }}
             >
                 {isUploading ? (
-                    <span style={styles.buttonInner}><span style={styles.spinner} />Uploading…</span>
+                    <span style={styles.buttonInner}><span style={styles.spinner} />Uploading… {progress}%</span>
                 ) : (
                     <span style={styles.buttonInner}><SendIcon />Upload Document</span>
                 )}
@@ -271,6 +291,26 @@ const styles = {
     dropzoneMeta: {
         fontSize: "12px",
         color: "#8a8478",
+    },
+    strategyContainer: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+    },
+    strategyLabel: {
+        fontSize: "12px",
+        fontWeight: "600",
+        color: "#6f6a61",
+    },
+    strategySelect: {
+        padding: "10px 12px",
+        borderRadius: "10px",
+        border: "1px solid #d7d0c1",
+        background: "#ffffff",
+        color: "#2b2925",
+        fontSize: "13px",
+        outline: "none",
+        cursor: "pointer",
     },
     progressTrack: {
         height: "4px",

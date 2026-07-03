@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { deleteDocument, getDocuments, updateDocument } from "../../api/documentApi";
+import { reindexAll } from "../../api/settingsApi";
 
 const emptyForm = { content: "", filename: "" };
+// keep ref outside component to avoid stale-closure issues
+let _pollInterval = null;
 
 const RefreshIcon = () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -54,6 +57,38 @@ const InboxIcon = () => (
         <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
     </svg>
 );
+const ReindexIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" />
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+);
+
+const STATUS_CONFIG = {
+    active:         { label: "Indexed",       bg: "#e8f5e9", color: "#2e7d32", border: "#a5d6a7" },
+    needs_reindex:  { label: "Needs Reindex", bg: "#fff8e1", color: "#856404", border: "#f5d878" },
+    processing:     { label: "Processing",    bg: "#e3f2fd", color: "#1565c0", border: "#90caf9" },
+    failed:         { label: "Failed",        bg: "#ffebee", color: "#c62828", border: "#ef9a9a" },
+};
+
+function StatusBadge({ status }) {
+    const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.active;
+    return (
+        <span style={{
+            fontSize: "11px",
+            fontWeight: "700",
+            padding: "2px 8px",
+            borderRadius: "20px",
+            background: cfg.bg,
+            color: cfg.color,
+            border: `1px solid ${cfg.border}`,
+            letterSpacing: "0.3px",
+            whiteSpace: "nowrap",
+        }}>
+            {cfg.label}
+        </span>
+    );
+}
 
 function useMediaQuery(query) {
     const [matches, setMatches] = useState(() => (
@@ -82,7 +117,9 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const [statusType, setStatusType] = useState("");
     const [isLoading, setIsLoading] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
+    const [isReindexing, setIsReindexing] = useState(false);
     const [focused, setFocused] = useState(null);
+    const pollRef = useRef(null);
 
     const selectedDocument = useMemo(
         () => documents.find((d) => d.id === editingId),
@@ -107,6 +144,27 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         const timer = window.setTimeout(() => loadDocuments(), 0);
         return () => window.clearTimeout(timer);
     }, [loadDocuments, refreshKey]);
+
+    // Poll every 3 s while any document is "processing"
+    useEffect(() => {
+        const hasProcessing = documents.some((d) => d.status === "processing");
+        if (hasProcessing) {
+            if (!_pollInterval) {
+                _pollInterval = window.setInterval(() => loadDocuments({ clearStatus: false }), 3000);
+            }
+        } else {
+            if (_pollInterval) {
+                window.clearInterval(_pollInterval);
+                _pollInterval = null;
+            }
+        }
+        return () => {
+            if (_pollInterval) {
+                window.clearInterval(_pollInterval);
+                _pollInterval = null;
+            }
+        };
+    }, [documents, loadDocuments]);
 
     const handleChange = (e) => {
         const { name, value } = e.target;
@@ -147,14 +205,14 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
 
     const handleEdit = (doc) => {
         setEditingId(doc.id);
-        setForm({ content: doc.content, filename: doc.filename || doc.title || "" });
+        setForm({ content: doc.content, filename: doc.title || doc.filename || "" });
         setStatus("");
         setStatusType("");
     };
 
     const handleDelete = async (doc) => {
         const confirmed = window.confirm(
-            `Delete "${doc.filename || doc.title || "this document"}"? This removes the whole document from search.`
+            `Delete "${doc.title || doc.filename || "this document"}"? This removes the whole document from search.`
         );
         if (!confirmed) return;
         try {
@@ -170,6 +228,24 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         }
     };
 
+    const handleReindexAll = async () => {
+        setIsReindexing(true);
+        try {
+            const result = await reindexAll();
+            setStatus(result.message || "Reindex started.");
+            setStatusType("success");
+            await loadDocuments({ clearStatus: false });
+            onChanged?.();
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setIsReindexing(false);
+        }
+    };
+
+    const hasNeedsReindex = documents.some((d) => d.status === "needs_reindex");
+
     return (
         <section style={styles.page}>
             {/* Header */}
@@ -178,19 +254,34 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                     <span style={styles.eyebrow}>Library Controls</span>
                     <h2 style={styles.title}>Manage Documents</h2>
                 </div>
-                <button
-                    type="button"
-                    style={{
-                        ...styles.ghostBtn,
-                        ...(isNarrow ? styles.fullWidthButton : {}),
-                        ...(isLoading ? styles.disabledBtn : {}),
-                    }}
-                    onClick={loadDocuments}
-                    disabled={isLoading}
-                >
-                    <RefreshIcon />
-                    {isLoading ? "Refreshing…" : "Refresh"}
-                </button>
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                    <button
+                        type="button"
+                        style={{
+                            ...styles.reindexBtn,
+                            ...(isReindexing ? styles.disabledBtn : {}),
+                        }}
+                        onClick={handleReindexAll}
+                        disabled={isReindexing}
+                        id="btn-reindex-all"
+                    >
+                        <ReindexIcon />
+                        {isReindexing ? "Reindexing…" : "Reindex All"}
+                    </button>
+                    <button
+                        type="button"
+                        style={{
+                            ...styles.ghostBtn,
+                            ...(isNarrow ? styles.fullWidthButton : {}),
+                            ...(isLoading ? styles.disabledBtn : {}),
+                        }}
+                        onClick={loadDocuments}
+                        disabled={isLoading}
+                    >
+                        <RefreshIcon />
+                        {isLoading ? "Refreshing…" : "Refresh"}
+                    </button>
+                </div>
             </div>
 
             {/* Edit Panel */}
@@ -313,11 +404,12 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                                 <div style={styles.docRowMeta}>
                                     <span style={styles.docRowSource}>
                                         <FileTextIcon />
-                                        {doc.filename || doc.title || "Manual entry"}
+                                        {doc.title || doc.filename || "Manual entry"}
                                     </span>
                                     <span style={styles.docRowChunks}>
                                         {doc.chunk_count ?? 1} parts
                                     </span>
+                                    <StatusBadge status={doc.status || "active"} />
                                 </div>
                                 <p style={{ ...styles.docRowPreview, ...(isNarrow ? styles.docRowPreviewNarrow : {}) }}>{doc.content}</p>
                             </div>
@@ -388,6 +480,22 @@ const styles = {
         color: "#4d4942",
         fontSize: "13px",
         fontWeight: "600",
+        cursor: "pointer",
+        transition: "all 0.15s",
+        whiteSpace: "nowrap",
+    },
+    reindexBtn: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "6px",
+        padding: "8px 14px",
+        borderRadius: "10px",
+        border: "1px solid #f5d878",
+        background: "#fff8e1",
+        color: "#856404",
+        fontSize: "13px",
+        fontWeight: "700",
         cursor: "pointer",
         transition: "all 0.15s",
         whiteSpace: "nowrap",

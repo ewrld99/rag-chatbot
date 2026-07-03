@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import DocumentChunk
+from app.db.models import DocumentChunk, FAQModel
 from app.services.embedding_service import get_embedding
 
 
@@ -98,25 +98,66 @@ class DenseRetriever:
             .limit(top_k)
             .all()
         )
+        
+        faq_rows = (
+            self.db.query(
+                FAQModel,
+                FAQModel.embedding.cosine_distance(query_embedding).label("dist"),
+            )
+            .filter(FAQModel.is_active == True)
+            .order_by("dist")
+            .limit(top_k)
+            .all()
+        )
+
+        # Merge and sort
+        combined = []
+        for chunk, dist in rows:
+            combined.append((dist, chunk, "doc"))
+            
+        for faq, dist in faq_rows:
+            combined.append((dist, faq, "faq"))
+            
+        combined.sort(key=lambda x: x[0])
+        combined = combined[:top_k]
 
         results: list[DenseResult] = []
-        for chunk, dist in rows:
-            chunk_id = str(chunk.id)
-            doc_filename = chunk.document.filename if chunk.document and chunk.document.filename else "database"
-            doc_id = str(chunk.document_id)
-            
-            results.append(
-                DenseResult(
-                    chunk_id=chunk_id,
-                    document_id=doc_id,
-                    # convert distance → similarity: sim = 1 - dist/2
-                    similarity_score=round(1.0 - float(dist) / 2.0, 6),
-                    text=chunk.chunk_text,
-                    metadata={
-                        "source": doc_filename,
-                        "chunk_index": chunk.chunk_index,
-                    },
+        for dist, item, type_ in combined:
+            if type_ == "doc":
+                chunk = item
+                chunk_id = str(chunk.id)
+                doc_filename = chunk.document.filename if chunk.document and chunk.document.filename else "database"
+                doc_id = str(chunk.document_id)
+                
+                results.append(
+                    DenseResult(
+                        chunk_id=chunk_id,
+                        document_id=doc_id,
+                        similarity_score=round(1.0 - float(dist) / 2.0, 6),
+                        text=chunk.chunk_text,
+                        metadata={
+                            "source": doc_filename,
+                            "chunk_index": chunk.chunk_index,
+                            "source_type": "document"
+                        },
+                    )
                 )
-            )
+            else:
+                faq = item
+                results.append(
+                    DenseResult(
+                        chunk_id=str(faq.id),
+                        document_id=str(faq.id),
+                        similarity_score=round(1.0 - float(dist) / 2.0, 6),
+                        text=f"{faq.question}\n\n{faq.answer}",
+                        metadata={
+                            "source": f"FAQ - {faq.category}" if faq.category else "FAQ",
+                            "chunk_index": 0,
+                            "source_type": "faq",
+                            "faq_id": str(faq.id),
+                            "category": faq.category
+                        },
+                    )
+                )
 
         return results

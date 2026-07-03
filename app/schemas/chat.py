@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional
 
 class ChatRequest(BaseModel):
     message: str
-    history: Optional[List[Dict[str, str]]] = None
+    history: Optional[List[Dict[str, Any]]] = None
     # Optional: provided by the SSE stream endpoint to persist history
     session_id: Optional[int] = None
     user_id: Optional[int] = None
