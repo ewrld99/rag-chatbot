@@ -46,7 +46,7 @@ const statCards = (stats) => [
         value: stats.error ? "Alert" : "Healthy",
         helper: stats.error || "Vector store is responding",
         icon: <ActivityIcon />,
-        accent: stats.error ? "#a13f24" : "#9a4f35",
+        accent: stats.error ? "var(--app-danger)" : "var(--app-accent)",
     },
     {
         key: "chunks",
@@ -54,7 +54,7 @@ const statCards = (stats) => [
         value: stats.isLoading ? "···" : stats.chunks,
         helper: "Total searchable chunks",
         icon: <CpuIcon />,
-        accent: "#9a4f35",
+        accent: "var(--app-accent)",
     },
     {
         key: "documents",
@@ -62,7 +62,7 @@ const statCards = (stats) => [
         value: stats.isLoading ? "···" : stats.documents,
         helper: "Document groups in the index",
         icon: <GridIcon />,
-        accent: "#9a4f35",
+        accent: "var(--app-accent)",
     },
 ];
 
@@ -96,7 +96,7 @@ export default function VectorStatus({ stats, documents }) {
                         <div style={{ ...styles.iconBadge, background: `${card.accent}18`, color: card.accent }}>
                             {card.icon}
                         </div>
-                        <strong style={{ ...styles.statValue, color: card.accent === "#9a4f35" ? "#2b2925" : card.accent }}>
+                        <strong style={{ ...styles.statValue, color: card.accent === "var(--app-accent)" ? "var(--app-text)" : card.accent }}>
                             {card.value ?? "—"}
                         </strong>
                         <p style={styles.statLabel}>{card.label}</p>
@@ -179,8 +179,8 @@ const styles = {
         gap: "12px",
     },
     statCard: {
-        background: "#fffdf8",
-        border: "1px solid #ded9cd",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         borderRadius: "16px",
         padding: "24px",
         display: "flex",
@@ -214,11 +214,11 @@ const styles = {
     },
     statHelper: {
         fontSize: "12px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
     },
     panel: {
-        background: "#fffdf8",
-        border: "1px solid #ded9cd",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         borderRadius: "20px",
         padding: "28px",
         display: "flex",
@@ -246,13 +246,13 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.5px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         marginBottom: "4px",
     },
     panelTitle: {
         fontSize: "18px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
     },
     countBadge: {
@@ -260,9 +260,9 @@ const styles = {
         borderRadius: "20px",
         fontSize: "12px",
         fontWeight: "600",
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         whiteSpace: "nowrap",
     },
     tableWrapper: {
@@ -278,12 +278,12 @@ const styles = {
         display: "flex",
         justifyContent: "space-between",
         padding: "10px 16px",
-        background: "#f7f2e8",
+        background: "var(--app-panel)",
         fontSize: "11px",
         fontWeight: "700",
         letterSpacing: "1px",
         textTransform: "uppercase",
-        color: "#8a8478",
+        color: "var(--app-faint)",
     },
     tableHeaderNarrow: {
         display: "none",
@@ -303,7 +303,7 @@ const styles = {
         padding: "14px",
     },
     tableRowEven: {
-        background: "#fffaf0",
+        background: "var(--app-surface-muted)",
     },
     tableRowSource: {
         display: "flex",
@@ -317,8 +317,8 @@ const styles = {
     tableRowChunks: {
         fontSize: "12px",
         fontWeight: "600",
-        color: "#9a4f35",
-        background: "#f7eadf",
+        color: "var(--app-accent)",
+        background: "var(--app-accent-soft)",
         padding: "3px 10px",
         borderRadius: "20px",
     },
@@ -334,15 +334,15 @@ const styles = {
         width: "44px",
         height: "44px",
         borderRadius: "12px",
-        background: "#f0eee7",
+        background: "var(--app-bg)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#8a8478",
+        color: "var(--app-faint)",
     },
     emptyText: {
         fontSize: "13px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         margin: 0,
     },
     healthBanner: {
@@ -353,13 +353,13 @@ const styles = {
         borderRadius: "10px",
     },
     healthBannerOk: {
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     healthBannerError: {
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
     },
 };

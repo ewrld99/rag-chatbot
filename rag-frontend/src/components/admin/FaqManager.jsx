@@ -111,25 +111,25 @@ export default function FaqManager() {
     };
 
     return (
-        <section className="dashboard-card" style={{ padding: "28px", borderRadius: "20px", background: "#fffdf8", border: "1px solid #ded9cd", display: "flex", flexDirection: "column", gap: "20px" }}>
+        <section className="dashboard-card" style={{ padding: "28px", borderRadius: "20px", background: "var(--app-surface)", border: "1px solid var(--app-border)", display: "flex", flexDirection: "column", gap: "20px" }}>
             <header style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
                 <div>
-                    <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "1.5px", textTransform: "uppercase", color: "#9a4f35" }}>Management</span>
-                    <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0, color: "#2b2925" }}>FAQs</h2>
+                    <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "1.5px", textTransform: "uppercase", color: "var(--app-accent)" }}>Management</span>
+                    <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0, color: "var(--app-text)" }}>FAQs</h2>
                 </div>
                 <div style={{ display: "flex", gap: "10px" }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "10px", background: "#f0eee7", border: "1px solid #ded9cd", cursor: "pointer", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "10px", background: "var(--app-bg)", border: "1px solid var(--app-border)", cursor: "pointer", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
                         <UploadIcon />
                         {isImporting ? "Importing..." : "Bulk Import"}
                         <input type="file" accept=".csv,.xlsx,.xls" style={{ display: "none" }} onChange={handleImport} disabled={isImporting} />
                     </label>
-                    <button onClick={() => openModal()} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "10px", background: "#2b2925", color: "#fffaf0", border: "none", cursor: "pointer", fontSize: "13px", fontWeight: 600 }}>
+                    <button onClick={() => openModal()} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "10px", background: "var(--app-text)", color: "var(--app-surface-muted)", border: "none", cursor: "pointer", fontSize: "13px", fontWeight: 600 }}>
                         <PlusIcon /> Add FAQ
                     </button>
                 </div>
             </header>
 
-            {importMsg && <div style={{ padding: "12px", background: "#f7eadf", color: "#9a4f35", borderRadius: "8px", fontSize: "13px" }}>{importMsg}</div>}
+            {importMsg && <div style={{ padding: "12px", background: "var(--app-accent-soft)", color: "var(--app-accent)", borderRadius: "8px", fontSize: "13px" }}>{importMsg}</div>}
 
             <div style={{ display: "flex", gap: "12px" }}>
                 <input 
@@ -137,37 +137,37 @@ export default function FaqManager() {
                     placeholder="Search FAQs..." 
                     value={searchTerm} 
                     onChange={(e) => setSearchTerm(e.target.value)}
-                    style={{ flex: 1, padding: "10px 14px", borderRadius: "10px", border: "1px solid #ded9cd", background: "#fffaf0", outline: "none", fontSize: "14px" }}
+                    style={{ flex: 1, padding: "10px 14px", borderRadius: "10px", border: "1px solid var(--app-border)", background: "var(--app-surface-muted)", outline: "none", fontSize: "14px" }}
                 />
                 <select 
                     value={filterCategory} 
                     onChange={(e) => setFilterCategory(e.target.value)}
-                    style={{ padding: "10px 14px", borderRadius: "10px", border: "1px solid #ded9cd", background: "#fffaf0", outline: "none", fontSize: "14px" }}
+                    style={{ padding: "10px 14px", borderRadius: "10px", border: "1px solid var(--app-border)", background: "var(--app-surface-muted)", outline: "none", fontSize: "14px" }}
                 >
                     <option value="">All Categories</option>
                     {categories.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
             </div>
 
-            <div style={{ background: "#ffffff", border: "1px solid #ded9cd", borderRadius: "14px", overflow: "hidden" }}>
+            <div style={{ background: "#ffffff", border: "1px solid var(--app-border)", borderRadius: "14px", overflow: "hidden" }}>
                 {isLoading ? (
-                    <div style={{ padding: "40px", textAlign: "center", color: "#8a8478" }}>Loading...</div>
+                    <div style={{ padding: "40px", textAlign: "center", color: "var(--app-faint)" }}>Loading...</div>
                 ) : faqs.length === 0 ? (
-                    <div style={{ padding: "40px", textAlign: "center", color: "#8a8478" }}>No FAQs found.</div>
+                    <div style={{ padding: "40px", textAlign: "center", color: "var(--app-faint)" }}>No FAQs found.</div>
                 ) : (
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
                         <thead>
-                            <tr style={{ background: "#f7f5f0", borderBottom: "1px solid #ded9cd" }}>
-                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "#6f6a61" }}>Question</th>
-                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "#6f6a61" }}>Category</th>
-                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "#6f6a61" }}>Status</th>
-                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "#6f6a61", textAlign: "right" }}>Actions</th>
+                            <tr style={{ background: "#f7f5f0", borderBottom: "1px solid var(--app-border)" }}>
+                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--app-muted)" }}>Question</th>
+                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--app-muted)" }}>Category</th>
+                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--app-muted)" }}>Status</th>
+                                <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--app-muted)", textAlign: "right" }}>Actions</th>
                             </tr>
                         </thead>
                         <tbody>
                             {faqs.map(faq => (
-                                <tr key={faq.id} style={{ borderBottom: "1px solid #f0eee7" }}>
-                                    <td style={{ padding: "14px 16px", color: "#2b2925", maxWidth: "300px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{faq.question}</td>
+                                <tr key={faq.id} style={{ borderBottom: "1px solid var(--app-bg)" }}>
+                                    <td style={{ padding: "14px 16px", color: "var(--app-text)", maxWidth: "300px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{faq.question}</td>
                                     <td style={{ padding: "14px 16px", color: "#4d4942" }}>{faq.category || "—"}</td>
                                     <td style={{ padding: "14px 16px" }}>
                                         <button onClick={() => handleToggleActive(faq)} style={{ padding: "4px 8px", borderRadius: "20px", border: "none", fontSize: "11px", fontWeight: 700, cursor: "pointer", background: faq.is_active ? "#ecfdf5" : "#fef2f2", color: faq.is_active ? "#0f766e" : "#b91c1c" }}>
@@ -175,8 +175,8 @@ export default function FaqManager() {
                                         </button>
                                     </td>
                                     <td style={{ padding: "14px 16px", textAlign: "right" }}>
-                                        <button onClick={() => openModal(faq)} style={{ background: "none", border: "none", color: "#8a8478", cursor: "pointer", padding: "4px" }}><EditIcon /></button>
-                                        <button onClick={() => handleDelete(faq.id)} style={{ background: "none", border: "none", color: "#d96c47", cursor: "pointer", padding: "4px", marginLeft: "4px" }}><DeleteIcon /></button>
+                                        <button onClick={() => openModal(faq)} style={{ background: "none", border: "none", color: "var(--app-faint)", cursor: "pointer", padding: "4px" }}><EditIcon /></button>
+                                        <button onClick={() => handleDelete(faq.id)} style={{ background: "none", border: "none", color: "var(--app-accent-strong)", cursor: "pointer", padding: "4px", marginLeft: "4px" }}><DeleteIcon /></button>
                                     </td>
                                 </tr>
                             ))}
@@ -188,28 +188,28 @@ export default function FaqManager() {
             {/* Modal */}
             {isModalOpen && (
                 <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(43, 41, 37, 0.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
-                    <div style={{ background: "#fffdf8", borderRadius: "16px", width: "100%", maxWidth: "500px", padding: "24px", border: "1px solid #ded9cd", boxShadow: "0 24px 48px rgba(72, 61, 47, 0.2)" }}>
-                        <h3 style={{ margin: "0 0 16px", color: "#2b2925" }}>{editingFaq ? "Edit FAQ" : "Add FAQ"}</h3>
+                    <div style={{ background: "var(--app-surface)", borderRadius: "16px", width: "100%", maxWidth: "500px", padding: "24px", border: "1px solid var(--app-border)", boxShadow: "0 24px 48px rgba(72, 61, 47, 0.2)" }}>
+                        <h3 style={{ margin: "0 0 16px", color: "var(--app-text)" }}>{editingFaq ? "Edit FAQ" : "Add FAQ"}</h3>
                         <form onSubmit={handleSave} style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
                             <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
                                 Question *
-                                <textarea required value={formData.question} onChange={e => setFormData({...formData, question: e.target.value})} maxLength={500} style={{ padding: "10px", borderRadius: "8px", border: "1px solid #ded9cd", minHeight: "60px", resize: "vertical" }} />
+                                <textarea required value={formData.question} onChange={e => setFormData({...formData, question: e.target.value})} maxLength={500} style={{ padding: "10px", borderRadius: "8px", border: "1px solid var(--app-border)", minHeight: "60px", resize: "vertical" }} />
                             </label>
                             <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
                                 Answer *
-                                <textarea required value={formData.answer} onChange={e => setFormData({...formData, answer: e.target.value})} maxLength={10000} style={{ padding: "10px", borderRadius: "8px", border: "1px solid #ded9cd", minHeight: "120px", resize: "vertical" }} />
+                                <textarea required value={formData.answer} onChange={e => setFormData({...formData, answer: e.target.value})} maxLength={10000} style={{ padding: "10px", borderRadius: "8px", border: "1px solid var(--app-border)", minHeight: "120px", resize: "vertical" }} />
                             </label>
                             <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
                                 Category
-                                <input type="text" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})} placeholder="e.g., Admissions" style={{ padding: "10px", borderRadius: "8px", border: "1px solid #ded9cd" }} />
+                                <input type="text" value={formData.category} onChange={e => setFormData({...formData, category: e.target.value})} placeholder="e.g., Admissions" style={{ padding: "10px", borderRadius: "8px", border: "1px solid var(--app-border)" }} />
                             </label>
                             <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>
                                 <input type="checkbox" checked={formData.is_active} onChange={e => setFormData({...formData, is_active: e.target.checked})} />
                                 Is Active
                             </label>
                             <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px", marginTop: "10px" }}>
-                                <button type="button" onClick={() => setIsModalOpen(false)} style={{ padding: "8px 16px", borderRadius: "8px", background: "#f0eee7", border: "1px solid #ded9cd", color: "#4d4942", cursor: "pointer", fontWeight: 600 }}>Cancel</button>
-                                <button type="submit" style={{ padding: "8px 16px", borderRadius: "8px", background: "#2b2925", border: "none", color: "#fffaf0", cursor: "pointer", fontWeight: 600 }}>Save</button>
+                                <button type="button" onClick={() => setIsModalOpen(false)} style={{ padding: "8px 16px", borderRadius: "8px", background: "var(--app-bg)", border: "1px solid var(--app-border)", color: "#4d4942", cursor: "pointer", fontWeight: 600 }}>Cancel</button>
+                                <button type="submit" style={{ padding: "8px 16px", borderRadius: "8px", background: "var(--app-text)", border: "none", color: "var(--app-surface-muted)", cursor: "pointer", fontWeight: 600 }}>Save</button>
                             </div>
                         </form>
                     </div>

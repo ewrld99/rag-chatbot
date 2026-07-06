@@ -18,3 +18,5 @@ pandas
 openpyxl
 httpx
 beautifulsoup4
+apscheduler
+markdownify

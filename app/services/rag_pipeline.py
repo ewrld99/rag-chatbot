@@ -1,5 +1,6 @@
 import re
 from typing import Dict, Any, List, AsyncGenerator, Optional
+from starlette.concurrency import run_in_threadpool
 
 from app.services.retrieval_service import RetrievalService
 from app.services.generation_service import GenerationService
@@ -10,23 +11,10 @@ class RAGPipeline:
         self.retrieval_service = retrieval_service
         self.generator = GenerationService()
         self.document_refusal = GenerationService.DOCUMENT_REFUSAL
-        self.greeting_response = (
-            "Hello! How can I help you today? "
-            "You can ask me anything, and I'll do my best to help."
+        self.out_of_domain_response = (
+            "I am an AI assistant for the University of Dodoma. "
+            "I can only help with university-related questions."
         )
-
-    def _is_greeting(self, query: str) -> bool:
-        normalized = re.sub(r"[^a-z\s]", " ", query.lower()).strip()
-        normalized = re.sub(r"\s+", " ", normalized)
-
-        greeting_patterns = (
-            r"^(hi|hello|hey|hii|hiya)$",
-            r"^(hi|hello|hey|hii|hiya)\s+(there|bot|assistant)$",
-            r"^good\s+(morning|afternoon|evening)$",
-            r"^(howdy|greetings)$",
-        )
-
-        return any(re.match(pattern, normalized) for pattern in greeting_patterns)
 
     def _is_empty_context(self, context: str) -> bool:
         return not context or context.strip() == "No relevant context found."
@@ -38,31 +26,42 @@ class RAGPipeline:
         self,
         query: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Use the LLM to rewrite the query based on chat history.
         """
-        return self.generator.rewrite_query(query, chat_history)
+        return self.generator.rewrite_query(query, chat_history, user_profile=user_profile)
 
     def run(
         self,
         query: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run document-grounded RAG first, then fall back to general AI if the
         uploaded documents cannot answer.
         """
 
-        if self._is_greeting(query):
+        intent = self.generator.classify_intent(query, chat_history, user_profile=user_profile)
+
+        if intent == "conversational":
             return {
                 "query": query,
-                "answer": self.greeting_response,
+                "answer": self.generator.generate_conversational(query, chat_history),
+                "sources": [],
+                "context_used": False
+            }
+        elif intent == "out_of_domain":
+            return {
+                "query": query,
+                "answer": self.out_of_domain_response,
                 "sources": [],
                 "context_used": False
             }
 
-        retrieval_query = self._retrieval_query(query, chat_history)
+        retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
         retrieval_result = self.retrieval_service.get_context(retrieval_query)
         context = retrieval_result["context"]
         documents = retrieval_result["documents"]
@@ -75,7 +74,7 @@ class RAGPipeline:
                 "context_used": False
             }
 
-        generation_result = self.generator.generate_response(query, context, chat_history)
+        generation_result = self.generator.generate_response(query, context, chat_history, user_profile=user_profile)
         answer = generation_result["answer"]
 
         return {
@@ -89,6 +88,7 @@ class RAGPipeline:
         self,
         query: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streaming pipeline for WebSocket or real-time UI.
@@ -97,43 +97,63 @@ class RAGPipeline:
         refusal before the fallback answer.
         """
 
-        if self._is_greeting(query):
-            yield self.greeting_response
+        intent = await run_in_threadpool(self.generator.classify_intent, query, chat_history, user_profile)
+
+        if intent == "conversational":
+            async for token in self.generator.stream_conversational(query, chat_history):
+                yield token
+            return
+        elif intent == "out_of_domain":
+            yield self.out_of_domain_response
             return
 
-        retrieval_query = self._retrieval_query(query, chat_history)
-        retrieval_result = self.retrieval_service.get_context(retrieval_query)
+        retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
+        retrieval_result = await run_in_threadpool(self.retrieval_service.get_context, retrieval_query)
         context = retrieval_result["context"]
 
         if self._is_empty_context(context):
             yield self.document_refusal
             return
 
-        async for token in self.generator.stream_generate(query, context, chat_history):
+        async for token in self.generator.stream_generate(query, context, chat_history, user_profile=user_profile):
             yield token
 
     def run_debug(
         self,
         query: str,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Returns detailed internal pipeline data for debugging.
         """
 
-        if self._is_greeting(query):
+        intent = self.generator.classify_intent(query, chat_history, user_profile=user_profile)
+
+        if intent == "conversational":
             return {
                 "query": query,
-                "answer": self.greeting_response,
+                "answer": self.generator.generate_conversational(query, chat_history),
                 "debug": {
                     "num_docs": 0,
                     "documents": [],
-                    "context_preview": "Greeting handled without document retrieval.",
+                    "context_preview": "Conversational intent handled by LLM.",
+                    "fallback_used": False
+                }
+            }
+        elif intent == "out_of_domain":
+            return {
+                "query": query,
+                "answer": self.out_of_domain_response,
+                "debug": {
+                    "num_docs": 0,
+                    "documents": [],
+                    "context_preview": "Out of domain intent rejected.",
                     "fallback_used": False
                 }
             }
 
-        retrieval_query = self._retrieval_query(query, chat_history)
+        retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
         scored_docs = self.retrieval_service.retrieve_with_scores(retrieval_query)
 
         documents = []
@@ -153,7 +173,7 @@ class RAGPipeline:
             answer = self.document_refusal
             fallback_used = False
         else:
-            answer = self.generator.generate(query, context, chat_history)
+            answer = self.generator.generate(query, context, chat_history, user_profile=user_profile)
             fallback_used = False
 
         return {

@@ -89,7 +89,7 @@ export default function FeedbackViewer() {
                                                 <ThumbsDownIcon /> <span style={{ fontSize: "12px", fontWeight: "bold" }}>Not helpful</span>
                                             </div>
                                         ) : (
-                                            <span style={{ color: "#6f6a61" }}>None</span>
+                                            <span style={{ color: "var(--app-muted)" }}>None</span>
                                         )}
                                     </td>
                                     <td style={{ whiteSpace: "pre-wrap", fontSize: "13px", lineHeight: "1.5" }}>

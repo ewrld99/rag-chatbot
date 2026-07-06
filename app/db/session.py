@@ -26,6 +26,12 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS registration_number TEXT;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS programme TEXT;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS campus TEXT;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS admission_year INTEGER;"))
+
+    with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
         
         # ── FTS trigger for document_chunks ──────────────────────────────

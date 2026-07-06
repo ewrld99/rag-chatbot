@@ -8,7 +8,7 @@
       <circle cx="256" cy="256" r="238" />
     </clipPath>
   </defs>
-  <rect width="512" height="512" fill="#050505" />
+
   <g clip-path="url(#circle-clip)">
     <circle cx="256" cy="256" r="238" fill="#f8f8f8" />
     <circle cx="256" cy="256" r="236" fill="none" stroke="#0b4f9c" stroke-width="4" />

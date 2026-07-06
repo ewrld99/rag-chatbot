@@ -67,6 +67,13 @@ const KeyIcon = () => (
         <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
     </svg>
 );
+const InfoIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="12" y1="16" x2="12" y2="12"></line>
+        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+    </svg>
+);
 const ChatLogo = () => (
     <img src={udomLogo} alt="The University of Dodoma" style={styles.logoImage} />
 );
@@ -155,6 +162,10 @@ export default function ChatWindow() {
     const [pwdError, setPwdError] = useState("");
     const [pwdSuccess, setPwdSuccess] = useState("");
     const [isChangingPwd, setIsChangingPwd] = useState(false);
+
+    // Profile Modal State
+    const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+    const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
 
     const loadSessions = useCallback(async () => {
         if (!user) return;
@@ -357,62 +368,80 @@ export default function ChatWindow() {
                             </button>
 
                             {/* Auth / Sessions */}
-                            {user && (
-                                <div style={styles.sessionSection}>
-                                    {historyError && <p style={styles.historyError}>{historyError}</p>}
+                            <div style={styles.sessionSection}>
+                                {user ? (
+                                    <>
+                                        {historyError && <p style={styles.historyError}>{historyError}</p>}
 
-                                    <div style={styles.historyList}>
-                                        {sessions.length === 0 ? (
-                                            <p style={styles.emptyHistory}>No saved chats yet.</p>
-                                        ) : (
-                                            sessions.map((session) => (
-                                                <div
-                                                    key={session.id}
-                                                    style={{
-                                                        ...styles.historyItem,
-                                                        ...(activeSessionId === session.id ? styles.historyItemActive : {}),
-                                                    }}
-                                                >
-                                                    <button
-                                                        type="button"
-                                                        style={styles.historyItemMain}
-                                                        onClick={() => handleSelectSession(session.id)}
+                                        <div style={styles.historyList}>
+                                            {sessions.length === 0 ? (
+                                                <p style={styles.emptyHistory}>No saved chats yet.</p>
+                                            ) : (
+                                                sessions.map((session) => (
+                                                    <div
+                                                        key={session.id}
+                                                        style={{
+                                                            ...styles.historyItem,
+                                                            ...(activeSessionId === session.id ? styles.historyItemActive : {}),
+                                                        }}
                                                     >
-                                                        <span style={styles.historyItemTitle}>{session.title}</span>
-                                                        <small style={styles.historyItemDate}>
-                                                            {new Date(session.updated_at).toLocaleDateString()}
-                                                        </small>
+                                                        <button
+                                                            type="button"
+                                                            style={styles.historyItemMain}
+                                                            onClick={() => handleSelectSession(session.id)}
+                                                        >
+                                                            <span style={styles.historyItemTitle}>{session.title}</span>
+                                                            <small style={styles.historyItemDate}>
+                                                                {new Date(session.updated_at).toLocaleDateString()}
+                                                            </small>
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            style={styles.historyItemDelete}
+                                                            onClick={(e) => handleDeleteSession(e, session.id)}
+                                                            aria-label="Delete chat"
+                                                        >
+                                                            <TrashIcon />
+                                                        </button>
+                                                    </div>
+                                                ))
+                                            )}
+                                        </div>
+
+                                        {/* User card */}
+                                        <div style={styles.userCard} onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}>
+                                            <div style={styles.userInfo}>
+                                                <div style={styles.userAvatar}><UserIcon /></div>
+                                                <span style={styles.userName}>{user.username}</span>
+                                            </div>
+                                            {isUserMenuOpen && (
+                                                <div style={styles.userMenu}>
+                                                    <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsProfileModalOpen(true); }}>
+                                                        <InfoIcon /> View Profile
                                                     </button>
-                                                    <button
-                                                        type="button"
-                                                        style={styles.historyItemDelete}
-                                                        onClick={(e) => handleDeleteSession(e, session.id)}
-                                                        aria-label="Delete chat"
-                                                    >
-                                                        <TrashIcon />
+                                                    <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsPasswordModalOpen(true); }}>
+                                                        <KeyIcon /> Change Password
+                                                    </button>
+                                                    <button type="button" style={{ ...styles.userMenuItem, color: "var(--app-danger)" }} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); handleLogout(); }}>
+                                                        <LogOutIcon /> Log Out
                                                     </button>
                                                 </div>
-                                            ))
-                                        )}
-                                    </div>
-
-                                    {/* User card */}
-                                    <div style={styles.userCard}>
-                                        <div style={styles.userInfo}>
-                                            <div style={styles.userAvatar}><UserIcon /></div>
-                                            <span style={styles.userName}>{user.username}</span>
+                                            )}
                                         </div>
-                                        <div style={{ display: 'flex', gap: '8px' }}>
-                                            <button type="button" style={styles.logoutBtn} onClick={() => setIsPasswordModalOpen(true)} title="Change Password">
-                                                <KeyIcon />
-                                            </button>
-                                            <button type="button" style={styles.logoutBtn} onClick={handleLogout} title="Log Out">
-                                                <LogOutIcon />
-                                            </button>
+                                    </>
+                                ) : (
+                                    <div style={styles.guestAuthCard}>
+                                        <div style={styles.guestAuthText}>
+                                            <h3 style={styles.guestAuthTitle}>Sign in for more</h3>
+                                            <p style={styles.guestAuthSubtitle}>Save your chat history, personalize your assistant, and more.</p>
+                                        </div>
+                                        <div style={styles.guestAuthButtons}>
+                                            <button type="button" style={styles.guestLoginBtn} onClick={() => navigate("/login")}>Log in</button>
+                                            <button type="button" style={styles.guestSignupBtn} onClick={() => navigate("/register")}>Create account</button>
                                         </div>
                                     </div>
-                                </div>
-                            )}
+                                )}
+                            </div>
                         </div>
                     )}
                 </div>
@@ -431,45 +460,7 @@ export default function ChatWindow() {
                             </p>
                         </div>
                     </div>
-                    {!user && (
-                        <div style={{ ...styles.authHeaderActions, ...(isNarrow ? styles.authHeaderActionsNarrow : {}) }}>
-                            <button
-                                type="button"
-                                style={styles.accountMenuButton}
-                                onClick={() => setIsAuthMenuOpen((value) => !value)}
-                                aria-label="Open account menu"
-                                aria-expanded={isAuthMenuOpen}
-                            >
-                                <UserIcon />
-                            </button>
-                            {isAuthMenuOpen && (
-                                <div style={styles.accountMenu}>
-                                    <button
-                                        type="button"
-                                        style={{ ...styles.accountMenuItem, ...styles.accountMenuSecondary }}
-                                        onClick={() => {
-                                            setIsAuthMenuOpen(false);
-                                            navigate("/login");
-                                        }}
-                                    >
-                                        <LoginIcon />
-                                        Log in
-                                    </button>
-                                    <button
-                                        type="button"
-                                        style={{ ...styles.accountMenuItem, ...styles.accountMenuPrimary }}
-                                        onClick={() => {
-                                            setIsAuthMenuOpen(false);
-                                            navigate("/register");
-                                        }}
-                                    >
-                                        <UserPlusIcon />
-                                        Create account
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    )}
+                    {/* Guest auth moved to sidebar */}
                 </div>
 
                 {/* Messages */}
@@ -502,6 +493,47 @@ export default function ChatWindow() {
 
                 {messages.length > 0 && <ChatInput onSend={handleSend} disabled={isWaiting} />}
             </div>
+
+            {/* Profile Modal */}
+            {isProfileModalOpen && user && (
+                <div style={styles.modalOverlay}>
+                    <div style={styles.modalContent}>
+                        <div style={styles.modalHeader}>
+                            <h3 style={styles.modalTitle}>Your Profile</h3>
+                            <button type="button" style={styles.modalCloseBtn} onClick={() => setIsProfileModalOpen(false)}>
+                                <XIcon />
+                            </button>
+                        </div>
+                        <div style={styles.modalBody}>
+                            <div style={{ marginBottom: "15px" }}>
+                                <label style={{ display: "block", fontSize: "12px", color: "var(--app-text-muted)", marginBottom: "4px" }}>Username</label>
+                                <div style={{ fontSize: "14px", fontWeight: "500", color: "var(--app-text)" }}>{user.username}</div>
+                            </div>
+                            <div style={{ marginBottom: "15px" }}>
+                                <label style={{ display: "block", fontSize: "12px", color: "var(--app-text-muted)", marginBottom: "4px" }}>Registration Number</label>
+                                <div style={{ fontSize: "14px", fontWeight: "500", color: "var(--app-text)" }}>{user.registration_number || "Not provided"}</div>
+                            </div>
+                            <div style={{ marginBottom: "15px" }}>
+                                <label style={{ display: "block", fontSize: "12px", color: "var(--app-text-muted)", marginBottom: "4px" }}>Programme</label>
+                                <div style={{ fontSize: "14px", fontWeight: "500", color: "var(--app-text)" }}>{user.programme || "Not provided"}</div>
+                            </div>
+                            <div style={{ marginBottom: "15px" }}>
+                                <label style={{ display: "block", fontSize: "12px", color: "var(--app-text-muted)", marginBottom: "4px" }}>Campus</label>
+                                <div style={{ fontSize: "14px", fontWeight: "500", color: "var(--app-text)" }}>{user.campus || "Not provided"}</div>
+                            </div>
+                            <div style={{ marginBottom: "15px" }}>
+                                <label style={{ display: "block", fontSize: "12px", color: "var(--app-text-muted)", marginBottom: "4px" }}>Admission Year</label>
+                                <div style={{ fontSize: "14px", fontWeight: "500", color: "var(--app-text)" }}>{user.admission_year || "Not provided"}</div>
+                            </div>
+                        </div>
+                        <div style={styles.modalFooter}>
+                            <button type="button" style={styles.modalCancelBtn} onClick={() => setIsProfileModalOpen(false)}>
+                                Close
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Change Password Modal */}
             {isPasswordModalOpen && (
@@ -1018,10 +1050,10 @@ Object.assign(styles, {
     chatWindow: {
         display: "flex",
         height: "100vh",
-        background: "#faf9f5",
+        background: "var(--app-bg)",
         overflow: "hidden",
         fontFamily: "inherit",
-        color: "#2b2925",
+        color: "var(--app-text)",
     },
     chatWindowNarrow: {
         flexDirection: "column",
@@ -1034,8 +1066,8 @@ Object.assign(styles, {
         height: "100%",
         transition: "width 0.25s ease",
         overflow: "hidden",
-        background: "#f0eee7",
-        borderRight: "1px solid #ded9cd",
+        background: "var(--app-bg)",
+        borderRight: "1px solid var(--app-border)",
     },
     sidebarOpen: { width: "280px" },
     sidebarClosed: { width: "64px" },
@@ -1053,9 +1085,9 @@ Object.assign(styles, {
         height: "36px",
         margin: "12px 10px",
         borderRadius: "10px",
-        border: "1px solid #ded9cd",
+        border: "1px solid var(--app-border)",
         background: "transparent",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -1068,7 +1100,7 @@ Object.assign(styles, {
         alignItems: "center",
         gap: "10px",
         padding: "4px 0 8px",
-        borderBottom: "1px solid #e3ded2",
+        borderBottom: "1px solid var(--app-border)",
         marginBottom: "4px",
     },
     brandMark: {
@@ -1076,7 +1108,7 @@ Object.assign(styles, {
         height: "36px",
         borderRadius: "50%",
         background: "#050505",
-        border: "1px solid #d8d1c3",
+        border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -1088,13 +1120,13 @@ Object.assign(styles, {
         fontWeight: "700",
         letterSpacing: "1.2px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         margin: 0,
     },
     brandTitle: {
         fontSize: "16px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
     },
     newChatBtn: {
@@ -1103,9 +1135,9 @@ Object.assign(styles, {
         gap: "8px",
         padding: "9px 12px",
         borderRadius: "8px",
-        border: "1px solid #ded9cd",
-        background: "#fffaf0",
-        color: "#2f2b25",
+        border: "1px solid var(--app-border)",
+        background: "var(--app-surface-muted)",
+        color: "var(--app-text)",
         fontSize: "13px",
         fontWeight: "700",
         cursor: "pointer",
@@ -1115,9 +1147,9 @@ Object.assign(styles, {
     openAuthBtn: {
         padding: "9px 12px",
         borderRadius: "8px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "transparent",
-        color: "#4d4942",
+        color: "var(--app-text)",
         fontSize: "13px",
         fontWeight: "600",
         cursor: "pointer",
@@ -1125,39 +1157,102 @@ Object.assign(styles, {
         textAlign: "left",
     },
     authCard: {
-        background: "#fffaf0",
+        background: "var(--app-surface-muted)",
         borderRadius: "8px",
         padding: "16px",
         display: "flex",
         flexDirection: "column",
         gap: "12px",
-        border: "1px solid #ded9cd",
+        border: "1px solid var(--app-border)",
     },
     authCardTitle: {
         fontSize: "14px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
+    },
+    guestAuthCard: {
+        marginTop: "auto",
+        display: "flex",
+        flexDirection: "column",
+        gap: "16px",
+        padding: "16px",
+        background: "var(--app-surface-muted)",
+        borderRadius: "12px",
+        border: "1px solid var(--app-border)",
+    },
+    guestAuthText: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "4px",
+    },
+    guestAuthTitle: {
+        fontSize: "14px",
+        fontWeight: "700",
+        color: "var(--app-text)",
+        margin: 0,
+    },
+    guestAuthSubtitle: {
+        fontSize: "12px",
+        color: "var(--app-muted)",
+        margin: 0,
+        lineHeight: 1.4,
+    },
+    guestAuthButtons: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+    },
+    guestLoginBtn: {
+        padding: "10px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-border-strong)",
+        background: "transparent",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        fontWeight: "600",
+        cursor: "pointer",
+        textAlign: "center",
+        transition: "all 0.15s",
+    },
+    guestSignupBtn: {
+        padding: "10px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-text)",
+        background: "var(--app-text)",
+        color: "var(--app-surface)",
+        fontSize: "13px",
+        fontWeight: "600",
+        cursor: "pointer",
+        textAlign: "center",
+        transition: "all 0.15s",
+    },
+    sessionSection: {
+        display: "flex",
+        flexDirection: "column",
+        flex: 1,
+        minHeight: 0,
+        overflow: "hidden",
     },
     closeAuthBtn: {
         width: "26px",
         height: "26px",
         borderRadius: "8px",
-        border: "1px solid #ded9cd",
+        border: "1px solid var(--app-border)",
         background: "transparent",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         cursor: "pointer",
     },
-    authLabel: { fontSize: "11px", fontWeight: "600", color: "#6f6a61" },
+    authLabel: { fontSize: "11px", fontWeight: "600", color: "var(--app-muted)" },
     authInput: {
         padding: "8px 10px",
         borderRadius: "8px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "#ffffff",
-        color: "#2b2925",
+        color: "var(--app-text)",
         fontSize: "13px",
         outline: "none",
         transition: "border-color 0.2s, box-shadow 0.2s",
@@ -1165,13 +1260,13 @@ Object.assign(styles, {
         boxSizing: "border-box",
     },
     authInputFocused: {
-        borderColor: "#d96c47",
+        borderColor: "var(--app-accent-strong)",
         boxShadow: "0 0 0 3px rgba(217,108,71,0.12)",
     },
     authError: {
         fontSize: "12px",
-        color: "#a13f24",
-        background: "#fff0e8",
+        color: "var(--app-danger)",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
         borderRadius: "8px",
         padding: "8px 10px",
@@ -1181,8 +1276,8 @@ Object.assign(styles, {
         padding: "9px",
         borderRadius: "8px",
         border: "none",
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         fontSize: "13px",
         fontWeight: "700",
         cursor: "pointer",
@@ -1191,7 +1286,7 @@ Object.assign(styles, {
     authToggleBtn: {
         background: "transparent",
         border: "none",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         fontSize: "12px",
         cursor: "pointer",
         padding: "0",
@@ -1200,15 +1295,15 @@ Object.assign(styles, {
     },
     historyError: {
         fontSize: "12px",
-        color: "#a13f24",
-        background: "#fff0e8",
+        color: "var(--app-danger)",
+        background: "var(--app-danger-soft)",
         borderRadius: "8px",
         padding: "8px 10px",
         margin: 0,
     },
     emptyHistory: {
         fontSize: "12px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         textAlign: "center",
         padding: "24px 0",
         margin: 0,
@@ -1216,42 +1311,60 @@ Object.assign(styles, {
     historyItem: {
         display: "flex",
         alignItems: "center",
-        borderRadius: "8px",
+        borderRadius: "10px",
         overflow: "hidden",
         border: "1px solid transparent",
-        transition: "all 0.15s",
+        transition: "all 0.2s ease",
+        marginBottom: "4px",
+        cursor: "pointer",
     },
     historyItemActive: {
-        background: "#fffaf0",
-        border: "1px solid #d9c9b4",
+        background: "var(--app-panel)",
+        border: "1px solid var(--app-border-strong)",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+    },
+    historyItemMain: {
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        padding: "10px 12px",
+        background: "transparent",
+        border: "none",
+        cursor: "pointer",
+        textAlign: "left",
+        overflow: "hidden",
     },
     historyItemTitle: {
-        fontSize: "12px",
+        fontSize: "13px",
         fontWeight: "600",
-        color: "#4d4942",
+        color: "var(--app-text)",
         overflow: "hidden",
         textOverflow: "ellipsis",
         whiteSpace: "nowrap",
         display: "block",
+        width: "100%",
     },
     historyItemDate: {
-        fontSize: "10px",
-        color: "#8a8478",
+        fontSize: "11px",
+        color: "var(--app-muted)",
+        marginTop: "3px",
     },
     historyItemDelete: {
-        width: "32px",
-        height: "32px",
+        width: "28px",
+        height: "28px",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        background: "transparent",
+        background: "var(--app-danger-soft)",
         border: "none",
-        color: "#8a8478",
+        color: "var(--app-danger)",
         cursor: "pointer",
         flexShrink: 0,
-        borderRadius: "8px",
-        margin: "2px",
-        transition: "all 0.15s",
+        borderRadius: "6px",
+        marginRight: "8px",
+        opacity: 0.8,
+        transition: "all 0.2s",
     },
     userCard: {
         display: "flex",
@@ -1259,33 +1372,54 @@ Object.assign(styles, {
         justifyContent: "space-between",
         padding: "10px 12px",
         borderRadius: "8px",
-        background: "#e8e4da",
-        border: "1px solid #ded9cd",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border)",
         marginTop: "auto",
+        position: "relative",
+        cursor: "pointer",
+        transition: "background 0.15s",
     },
     userAvatar: {
         width: "28px",
         height: "28px",
         borderRadius: "8px",
-        background: "#fffaf0",
+        background: "var(--app-surface-muted)",
         border: "1px solid #d9c9b4",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     userName: { fontSize: "12px", fontWeight: "600", color: "#4d4942" },
-    logoutBtn: {
-        width: "28px",
-        height: "28px",
-        borderRadius: "8px",
-        border: "1px solid #d7d0c1",
-        background: "transparent",
-        color: "#8a8478",
+    userMenu: {
+        position: "absolute",
+        bottom: "calc(100% + 8px)",
+        left: 0,
+        right: 0,
+        background: "var(--app-surface-muted)",
+        borderRadius: "12px",
+        padding: "6px",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
+        border: "1px solid var(--app-border)",
+        zIndex: 100,
+        display: "flex",
+        flexDirection: "column",
+        gap: "2px",
+    },
+    userMenuItem: {
         display: "flex",
         alignItems: "center",
-        justifyContent: "center",
+        gap: "8px",
+        padding: "10px",
+        borderRadius: "8px",
+        border: "none",
+        background: "transparent",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        fontWeight: "500",
         cursor: "pointer",
+        textAlign: "left",
+        width: "100%",
     },
     panel: {
         flex: 1,
@@ -1293,15 +1427,15 @@ Object.assign(styles, {
         flexDirection: "column",
         minWidth: 0,
         overflow: "hidden",
-        background: "#faf9f5",
+        background: "var(--app-bg)",
     },
     panelHeader: {
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
         padding: "14px 24px",
-        borderBottom: "1px solid #e8e2d6",
-        background: "rgba(250,249,245,0.94)",
+        borderBottom: "1px solid var(--app-border)",
+        background: "var(--app-surface)",
         backdropFilter: "blur(14px)",
         gap: "12px",
     },
@@ -1313,9 +1447,9 @@ Object.assign(styles, {
         marginLeft: "auto",
         marginRight: "58px",
         padding: "5px",
-        border: "1px solid #ded9cd",
+        border: "1px solid var(--app-border)",
         borderRadius: "16px",
-        background: "#fffdf8",
+        background: "var(--app-surface)",
         flexShrink: 0,
         position: "relative",
         boxShadow: "0 10px 26px rgba(72, 61, 47, 0.08)",
@@ -1334,9 +1468,9 @@ Object.assign(styles, {
         alignItems: "center",
         justifyContent: "center",
         borderRadius: "12px",
-        border: "1px solid #d7d0c1",
-        background: "#fffaf0",
-        color: "#2b2925",
+        border: "1px solid var(--app-border-strong)",
+        background: "var(--app-surface-muted)",
+        color: "var(--app-text)",
         cursor: "pointer",
         transition: "border-color 0.15s, background 0.15s, transform 0.15s",
     },
@@ -1351,8 +1485,8 @@ Object.assign(styles, {
         gap: "6px",
         padding: "8px",
         borderRadius: "14px",
-        border: "1px solid #ded9cd",
-        background: "#fffdf8",
+        border: "1px solid var(--app-border)",
+        background: "var(--app-surface)",
         boxShadow: "0 18px 42px rgba(72, 61, 47, 0.16)",
     },
     accountMenuItem: {
@@ -1371,12 +1505,12 @@ Object.assign(styles, {
     accountMenuSecondary: {
         border: "1px solid transparent",
         background: "transparent",
-        color: "#4d4942",
+        color: "var(--app-text)",
     },
     accountMenuPrimary: {
-        border: "1px solid #2b2925",
-        background: "#2b2925",
-        color: "#fffaf0",
+        border: "1px solid var(--app-text)",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
     },
     headerAuthButton: {
         minHeight: "36px",
@@ -1395,35 +1529,35 @@ Object.assign(styles, {
     headerLoginButton: {
         border: "1px solid transparent",
         background: "transparent",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
     },
     headerCreateButton: {
-        border: "1px solid #2b2925",
-        background: "#2b2925",
-        color: "#fffaf0",
+        border: "1px solid var(--app-text)",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
     },
     panelHeaderIcon: {
         width: "46px",
         height: "46px",
         borderRadius: "50%",
         background: "#050505",
-        border: "1px solid #d8d1c3",
+        border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         overflow: "hidden",
     },
-    panelTitle: { fontSize: "17px", fontWeight: "800", color: "#2b2925", margin: 0, lineHeight: 1.1 },
-    panelSubtitle: { fontSize: "12px", color: "#8a8478", margin: "3px 0 0" },
+    panelTitle: { fontSize: "17px", fontWeight: "800", color: "var(--app-text)", margin: 0, lineHeight: 1.1 },
+    panelSubtitle: { fontSize: "12px", color: "var(--app-faint)", margin: "3px 0 0" },
     pillActive: {
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     pillGuest: {
-        background: "#f0eee7",
-        border: "1px solid #ded9cd",
-        color: "#6f6a61",
+        background: "var(--app-bg)",
+        border: "1px solid var(--app-border)",
+        color: "var(--app-muted)",
     },
     messageList: {
         flex: 1,
@@ -1453,7 +1587,7 @@ Object.assign(styles, {
         height: "92px",
         borderRadius: "50%",
         background: "#050505",
-        border: "1px solid #d8d1c3",
+        border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -1463,13 +1597,13 @@ Object.assign(styles, {
     emptyChatTitle: {
         fontSize: "clamp(30px, 5vw, 44px)",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
         letterSpacing: "-0.02em",
     },
     emptyChatSubtitle: {
         fontSize: "15px",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         margin: 0,
         maxWidth: "460px",
         lineHeight: 1.55,
@@ -1488,16 +1622,16 @@ Object.assign(styles, {
         gap: "10px",
         padding: "12px 16px",
         borderRadius: "12px",
-        border: "1px solid #ded9cd",
-        background: "#fffaf0",
-        color: "#4d4942",
+        border: "1px solid var(--app-border)",
+        background: "var(--app-surface-muted)",
+        color: "var(--app-text)",
         fontSize: "14px",
         cursor: "pointer",
         textAlign: "left",
         transition: "all 0.15s",
     },
     promptIcon: {
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         flexShrink: 0,
         display: "flex",
     },
@@ -1516,8 +1650,8 @@ Object.assign(styles, {
         padding: "20px",
     },
     modalContent: {
-        backgroundColor: "#131e2d",
-        border: "1px solid rgba(255,255,255,0.08)",
+        backgroundColor: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         borderRadius: "16px",
         padding: "24px",
         width: "100%",
@@ -1533,13 +1667,13 @@ Object.assign(styles, {
     modalTitle: {
         fontSize: "18px",
         fontWeight: "600",
-        color: "#fff",
+        color: "var(--app-text)",
         margin: 0,
     },
     modalCloseBtn: {
         background: "none",
         border: "none",
-        color: "#8a95a5",
+        color: "var(--app-text-muted)",
         cursor: "pointer",
         display: "flex",
         padding: "4px",
@@ -1553,9 +1687,9 @@ Object.assign(styles, {
     },
     modalInput: {
         width: "100%",
-        backgroundColor: "#0f1923",
-        border: "1px solid rgba(255,255,255,0.1)",
-        color: "#fff",
+        backgroundColor: "var(--app-bg)",
+        border: "1px solid var(--app-border)",
+        color: "var(--app-text)",
         padding: "12px 14px",
         borderRadius: "8px",
         fontSize: "14px",
@@ -1563,12 +1697,12 @@ Object.assign(styles, {
         transition: "border-color 0.2s",
     },
     modalError: {
-        color: "#ff6b6b",
+        color: "var(--app-danger)",
         fontSize: "13px",
         margin: 0,
     },
     modalSuccess: {
-        color: "#51cf66",
+        color: "var(--app-success)",
         fontSize: "13px",
         margin: 0,
     },
@@ -1582,8 +1716,8 @@ Object.assign(styles, {
         padding: "10px 16px",
         borderRadius: "8px",
         background: "transparent",
-        color: "#fff",
-        border: "1px solid rgba(255,255,255,0.2)",
+        color: "var(--app-text)",
+        border: "1px solid var(--app-border)",
         cursor: "pointer",
         fontSize: "14px",
         fontWeight: "500",
@@ -1591,7 +1725,7 @@ Object.assign(styles, {
     modalSubmitBtn: {
         padding: "10px 16px",
         borderRadius: "8px",
-        background: "#3b82f6",
+        background: "var(--app-primary)",
         color: "#fff",
         border: "none",
         cursor: "pointer",

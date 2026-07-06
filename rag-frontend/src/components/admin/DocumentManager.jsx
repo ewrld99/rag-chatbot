@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { deleteDocument, getDocuments, updateDocument } from "../../api/documentApi";
+import { deleteDocument, getDocuments, getDocument, updateDocument, deleteDocumentsBatch } from "../../api/documentApi";
 import { reindexAll } from "../../api/settingsApi";
 
 const emptyForm = { content: "", filename: "" };
@@ -119,7 +119,45 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const [isSaving, setIsSaving] = useState(false);
     const [isReindexing, setIsReindexing] = useState(false);
     const [focused, setFocused] = useState(null);
+    const [selectedIds, setSelectedIds] = useState(new Set());
     const pollRef = useRef(null);
+
+    const toggleSelection = (id) => {
+        const newSet = new Set(selectedIds);
+        if (newSet.has(id)) newSet.delete(id);
+        else newSet.add(id);
+        setSelectedIds(newSet);
+    };
+
+    const toggleSelectAll = () => {
+        if (selectedIds.size === documents.length) {
+            setSelectedIds(new Set());
+        } else {
+            setSelectedIds(new Set(documents.map(d => d.id)));
+        }
+    };
+
+    const handleDeleteSelected = async () => {
+        const count = selectedIds.size;
+        if (!count) return;
+        const confirmed = window.confirm(`Delete ${count} documents? This action cannot be undone.`);
+        if (!confirmed) return;
+        setIsLoading(true);
+        try {
+            await deleteDocumentsBatch(Array.from(selectedIds));
+            setSelectedIds(new Set());
+            if (selectedIds.has(editingId)) resetForm();
+            setStatus(`${count} document(s) deleted.`);
+            setStatusType("success");
+            await loadDocuments({ clearStatus: false });
+            onChanged?.();
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setIsLoading(false);
+        }
+    };
 
     const selectedDocument = useMemo(
         () => documents.find((d) => d.id === editingId),
@@ -203,11 +241,20 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         }
     };
 
-    const handleEdit = (doc) => {
-        setEditingId(doc.id);
-        setForm({ content: doc.content, filename: doc.title || doc.filename || "" });
+    const handleEdit = async (doc) => {
+        setIsLoading(true);
         setStatus("");
         setStatusType("");
+        try {
+            const fullDoc = await getDocument(doc.id);
+            setEditingId(doc.id);
+            setForm({ content: fullDoc.content || "", filename: fullDoc.title || fullDoc.filename || "" });
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setIsLoading(false);
+        }
     };
 
     const handleDelete = async (doc) => {
@@ -255,6 +302,23 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                     <h2 style={styles.title}>Manage Documents</h2>
                 </div>
                 <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                    {selectedIds.size > 0 && (
+                        <button
+                            type="button"
+                            style={{
+                                ...styles.ghostBtn,
+                                color: "var(--app-danger)",
+                                borderColor: "#f1c4b2",
+                                background: "var(--app-danger-soft)",
+                                ...(isLoading ? styles.disabledBtn : {})
+                            }}
+                            onClick={handleDeleteSelected}
+                            disabled={isLoading}
+                        >
+                            <TrashIcon />
+                            Delete Selected ({selectedIds.size})
+                        </button>
+                    )}
                     <button
                         type="button"
                         style={{
@@ -385,6 +449,17 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
 
             {/* Document List */}
             <div style={styles.docList}>
+                {documents.length > 0 && !isLoading && (
+                    <div style={{ display: "flex", alignItems: "center", padding: "0 18px", marginBottom: "8px", gap: "10px" }}>
+                        <input
+                            type="checkbox"
+                            checked={documents.length > 0 && selectedIds.size === documents.length}
+                            onChange={toggleSelectAll}
+                            style={{ cursor: "pointer", width: "16px", height: "16px" }}
+                        />
+                        <span style={{ fontSize: "13px", color: "#5f594f", fontWeight: "600" }}>Select All</span>
+                    </div>
+                )}
                 {documents.length === 0 && !isLoading ? (
                     <div style={styles.emptyList}>
                         <InboxIcon />
@@ -400,6 +475,14 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                                 ...(isNarrow ? styles.docRowNarrow : {}),
                             }}
                         >
+                            <div style={{ display: "flex", alignItems: "center", alignSelf: "flex-start", marginTop: "4px" }}>
+                                <input
+                                    type="checkbox"
+                                    checked={selectedIds.has(doc.id)}
+                                    onChange={() => toggleSelection(doc.id)}
+                                    style={{ cursor: "pointer", width: "16px", height: "16px" }}
+                                />
+                            </div>
                             <div style={styles.docRowInfo}>
                                 <div style={styles.docRowMeta}>
                                     <span style={styles.docRowSource}>
@@ -464,10 +547,10 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.5px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         marginBottom: "4px",
     },
-    title: { fontSize: "22px", fontWeight: "700", color: "#2b2925", margin: 0 },
+    title: { fontSize: "22px", fontWeight: "700", color: "var(--app-text)", margin: 0 },
     ghostBtn: {
         display: "flex",
         alignItems: "center",
@@ -475,7 +558,7 @@ const styles = {
         gap: "6px",
         padding: "8px 14px",
         borderRadius: "10px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "transparent",
         color: "#4d4942",
         fontSize: "13px",
@@ -508,8 +591,8 @@ const styles = {
         padding: "10px 18px",
         borderRadius: "10px",
         border: "none",
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         fontSize: "13px",
         fontWeight: "700",
         cursor: "pointer",
@@ -520,7 +603,7 @@ const styles = {
         minWidth: 0,
         maxWidth: "100%",
         boxSizing: "border-box",
-        background: "#fffdf8",
+        background: "var(--app-surface)",
         border: "1px solid #e8cdb8",
         borderRadius: "16px",
         padding: "24px",
@@ -548,7 +631,7 @@ const styles = {
     editTitle: {
         fontSize: "16px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
         display: "flex",
         alignItems: "center",
@@ -563,8 +646,8 @@ const styles = {
     chunksBadge: {
         fontSize: "11px",
         fontWeight: "600",
-        color: "#9a4f35",
-        background: "#f7eadf",
+        color: "var(--app-accent)",
+        background: "var(--app-accent-soft)",
         padding: "2px 8px",
         borderRadius: "10px",
     },
@@ -572,9 +655,9 @@ const styles = {
         width: "32px",
         height: "32px",
         borderRadius: "8px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "transparent",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -587,11 +670,11 @@ const styles = {
     input: {
         width: "100%",
         background: "#ffffff",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         borderRadius: "10px",
         padding: "11px 14px",
         fontSize: "14px",
-        color: "#2b2925",
+        color: "var(--app-text)",
         outline: "none",
         transition: "border-color 0.2s, box-shadow 0.2s",
         boxSizing: "border-box",
@@ -600,11 +683,11 @@ const styles = {
         width: "100%",
         maxWidth: "100%",
         background: "#ffffff",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         borderRadius: "10px",
         padding: "12px 14px",
         fontSize: "13px",
-        color: "#2b2925",
+        color: "var(--app-text)",
         outline: "none",
         resize: "vertical",
         lineHeight: 1.6,
@@ -613,7 +696,7 @@ const styles = {
         boxSizing: "border-box",
     },
     inputFocused: {
-        borderColor: "#d96c47",
+        borderColor: "var(--app-accent-strong)",
         boxShadow: "0 0 0 3px rgba(217,108,71,0.12)",
     },
     formActions: { display: "flex", gap: "10px", flexWrap: "wrap" },
@@ -627,14 +710,14 @@ const styles = {
         fontSize: "13px",
     },
     statusSuccess: {
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     statusError: {
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
     },
     emptyEditor: {
         display: "flex",
@@ -643,8 +726,8 @@ const styles = {
         gap: "8px",
         padding: "28px",
         borderRadius: "14px",
-        border: "1px dashed #d7d0c1",
-        background: "#fffaf0",
+        border: "1px dashed var(--app-border-strong)",
+        background: "var(--app-surface-muted)",
         textAlign: "center",
     },
     emptyEditorNarrow: {
@@ -654,14 +737,14 @@ const styles = {
         width: "40px",
         height: "40px",
         borderRadius: "10px",
-        background: "#f0eee7",
+        background: "var(--app-bg)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#8a8478",
+        color: "var(--app-faint)",
     },
     emptyEditorTitle: { fontSize: "15px", fontWeight: "600", color: "#4d4942", margin: 0 },
-    emptyEditorText: { fontSize: "13px", color: "#8a8478", margin: 0, maxWidth: "360px" },
+    emptyEditorText: { fontSize: "13px", color: "var(--app-faint)", margin: 0, maxWidth: "360px" },
     docList: { display: "flex", flexDirection: "column", gap: "10px" },
     docRow: {
         width: "100%",
@@ -674,8 +757,8 @@ const styles = {
         gap: "16px",
         padding: "16px 18px",
         borderRadius: "14px",
-        background: "#fffdf8",
-        border: "1px solid #ded9cd",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         transition: "border-color 0.15s",
     },
     docRowNarrow: {
@@ -685,7 +768,7 @@ const styles = {
     },
     docRowActive: {
         border: "1px solid #e8cdb8",
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
     },
     docRowInfo: {
         display: "flex",
@@ -718,14 +801,14 @@ const styles = {
     docRowChunks: {
         fontSize: "11px",
         fontWeight: "600",
-        color: "#9a4f35",
-        background: "#f7eadf",
+        color: "var(--app-accent)",
+        background: "var(--app-accent-soft)",
         padding: "2px 8px",
         borderRadius: "10px",
     },
     docRowPreview: {
         fontSize: "12px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         margin: 0,
         maxWidth: "100%",
         overflow: "hidden",
@@ -759,8 +842,8 @@ const styles = {
         padding: "6px 12px",
         borderRadius: "8px",
         border: "1px solid #e8cdb8",
-        background: "#f7eadf",
-        color: "#9a4f35",
+        background: "var(--app-accent-soft)",
+        color: "var(--app-accent)",
         fontSize: "12px",
         fontWeight: "600",
         cursor: "pointer",
@@ -777,8 +860,8 @@ const styles = {
         height: "32px",
         borderRadius: "8px",
         border: "1px solid #f1c4b2",
-        background: "#fff0e8",
-        color: "#a13f24",
+        background: "var(--app-danger-soft)",
+        color: "var(--app-danger)",
         cursor: "pointer",
     },
     deleteBtnNarrow: {
@@ -792,9 +875,9 @@ const styles = {
         gap: "12px",
         padding: "48px 20px",
         borderRadius: "14px",
-        border: "1px dashed #d7d0c1",
-        color: "#8a8478",
+        border: "1px dashed var(--app-border-strong)",
+        color: "var(--app-faint)",
         textAlign: "center",
     },
-    emptyListText: { fontSize: "13px", color: "#8a8478", margin: 0, maxWidth: "360px" },
+    emptyListText: { fontSize: "13px", color: "var(--app-faint)", margin: 0, maxWidth: "360px" },
 };

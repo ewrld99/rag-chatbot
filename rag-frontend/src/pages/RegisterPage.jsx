@@ -8,8 +8,8 @@ function navigate(to) {
 }
 
 export default function RegisterPage() {
-    const handleRegister = async (username, password) => {
-        const user = await registerUser(username, password);
+    const handleRegister = async (username, password, registrationNumber, programme, campus, admissionYear) => {
+        const user = await registerUser(username, password, registrationNumber, programme, campus, admissionYear);
 
         if (user.role === "admin") {
             window.localStorage.removeItem("ragUser");

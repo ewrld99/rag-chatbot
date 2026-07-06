@@ -29,8 +29,8 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-def serialize_document(document: DocumentModel) -> dict:
-    return {
+def serialize_document(document: DocumentModel, include_content: bool = False) -> dict:
+    data = {
         "id": str(document.id),
         "title": document.title,
         "filename": document.filename,
@@ -40,9 +40,10 @@ def serialize_document(document: DocumentModel) -> dict:
         "upload_date": document.upload_date,
         "status": document.status,
         "chunk_count": len(document.chunks),
-        # the frontend edit form expects content
-        "content": "\n\n".join(chunk.chunk_text for chunk in sorted(document.chunks, key=lambda c: c.chunk_index)),
     }
+    if include_content:
+        data["content"] = "\n\n".join(chunk.chunk_text for chunk in sorted(document.chunks, key=lambda c: c.chunk_index))
+    return data
 
 
 def get_document_or_404(document_id: str, db: Session) -> DocumentModel:
@@ -109,16 +110,37 @@ def rebuild_document_chunks(
 # ---------------------------------------
 # Document CRUD
 # ---------------------------------------
+from sqlalchemy import func
+from app.db.models import DocumentChunk
+
 @router.get("/documents/", response_model=list[DocumentResponse])
 def list_documents(db: Session = Depends(get_db)):
-    documents = db.query(DocumentModel).order_by(DocumentModel.upload_date.desc()).all()
-    return [serialize_document(doc) for doc in documents]
+    results = db.query(DocumentModel, func.count(DocumentChunk.id).label("chunk_count")) \
+        .outerjoin(DocumentChunk, DocumentModel.id == DocumentChunk.document_id) \
+        .group_by(DocumentModel.id) \
+        .order_by(DocumentModel.upload_date.desc()) \
+        .all()
+    
+    output = []
+    for doc, count in results:
+        output.append({
+            "id": str(doc.id),
+            "title": doc.title,
+            "filename": doc.filename,
+            "file_path": doc.file_path,
+            "category": doc.category,
+            "uploaded_by": doc.uploaded_by,
+            "upload_date": doc.upload_date,
+            "status": doc.status,
+            "chunk_count": count,
+        })
+    return output
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
 def read_document(document_id: str, db: Session = Depends(get_db)):
     document = get_document_or_404(document_id, db)
-    return serialize_document(document)
+    return serialize_document(document, include_content=True)
 
 
 @router.post("/documents/manual", response_model=DocumentResponse, status_code=201)
@@ -149,7 +171,7 @@ def create_document(payload: DocumentCreate, db: Session = Depends(get_db)):
         logger.exception("Database insert failed for manually created document")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    return serialize_document(document)
+    return serialize_document(document, include_content=True)
 
 
 @router.put("/documents/{document_id}", response_model=DocumentResponse)
@@ -182,7 +204,7 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
         logger.exception("Database update failed for document %s", document_id)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    return serialize_document(document)
+    return serialize_document(document, include_content=True)
 
 
 @router.delete("/documents/{document_id}")
@@ -204,6 +226,31 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
         "id": str(document.id),
         "chunks_deleted": chunk_count,
     }
+
+
+@router.post("/documents/delete-batch")
+def delete_documents_batch(document_ids: List[str], db: Session = Depends(get_db)):
+    if not document_ids:
+        return {"status": "ok", "deleted_count": 0}
+        
+    try:
+        # Convert valid UUID strings
+        valid_ids = []
+        for doc_id in document_ids:
+            try:
+                valid_ids.append(UUID(doc_id))
+            except ValueError:
+                pass
+                
+        if valid_ids:
+            deleted_count = db.query(DocumentModel).filter(DocumentModel.id.in_(valid_ids)).delete(synchronize_session=False)
+            db.commit()
+            return {"status": "ok", "deleted_count": deleted_count}
+        return {"status": "ok", "deleted_count": 0}
+    except Exception as e:
+        db.rollback()
+        logger.exception("Database batch delete failed")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 def get_admin_username(request: Request) -> str:
@@ -281,8 +328,8 @@ def upload_document(
 
     filename = os.path.basename(file.filename).lower()
 
-    if not filename.endswith((".pdf", ".docx", ".txt")):
-        raise HTTPException(status_code=400, detail="Only PDF, DOCX, and TXT allowed")
+    if not filename.endswith((".pdf", ".docx", ".txt", ".md")):
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, TXT, and MD allowed")
 
     file_ext = filename.split(".")[-1]
 
@@ -709,6 +756,9 @@ def timetable_get_data_options(
         svc.close()
 
 
+TIMETABLE_TASKS = {}
+
+
 def _fetch_timetable_task(
     year: str,
     semester: str,
@@ -718,6 +768,7 @@ def _fetch_timetable_task(
     label: str,
     admin_username: str,
     strategy: str = "timetable",
+    task_id: str = None,
 ):
     """Background task: download PDF from UDOM and ingest into RAG pipeline."""
     from app.db.session import SessionLocal
@@ -730,13 +781,48 @@ def _fetch_timetable_task(
         admin_id = admin_user.id if admin_user else None
 
         svc = TimetableFetcherService(db)
-        pdf_bytes = svc.download_pdf(year, semester, category, option, data)
-        result = svc.ingest_pdf(pdf_bytes, label, admin_id=admin_id, strategy=strategy)
-        logger.info("Timetable fetch+ingest completed: %s", result)
-    except TimetableFetchError as e:
-        logger.error("Timetable fetch failed: %s", e)
+        
+        # UDOM's site only generates a single PDF for the first ID if sent as an array.
+        # To batch download, we must iterate through each selected ID and fetch individually.
+        for index, data_id in enumerate(data):
+            try:
+                # Append an index if there are multiple to distinguish the documents
+                doc_label = f"{label} (Part {index+1})" if len(data) > 1 else label
+                
+                if task_id and task_id in TIMETABLE_TASKS:
+                    TIMETABLE_TASKS[task_id]["progress"] = {
+                        "message": f"Downloading PDF for {doc_label}...",
+                        "percentage": int((index / len(data)) * 100)
+                    }
+
+                def progress_cb(msg: str, step_pct: int):
+                    if task_id and task_id in TIMETABLE_TASKS:
+                        base_pct = int((index / len(data)) * 100)
+                        item_pct = int((step_pct / 100) * (100 / len(data)))
+                        TIMETABLE_TASKS[task_id]["progress"] = {
+                            "message": f"{msg} (Part {index+1}/{len(data)})",
+                            "percentage": base_pct + item_pct
+                        }
+
+                pdf_bytes = svc.download_pdf(year, semester, category, option, [data_id], progress_cb)
+                result = svc.ingest_pdf(pdf_bytes, doc_label, admin_id=admin_id, strategy=strategy, progress_cb=progress_cb)
+                logger.info("Timetable fetch+ingest completed for ID %s: %s", data_id, result)
+            except Exception as e:
+                logger.error("Failed to fetch/ingest timetable ID %s: %s", data_id, e)
+                if task_id and task_id in TIMETABLE_TASKS:
+                    TIMETABLE_TASKS[task_id]["status"] = "error"
+                    TIMETABLE_TASKS[task_id]["progress"] = {"message": f"Error: {e}", "percentage": 100}
+                    return
+                
+        if task_id and task_id in TIMETABLE_TASKS:
+            TIMETABLE_TASKS[task_id]["status"] = "success"
+            TIMETABLE_TASKS[task_id]["progress"] = {"message": "All timetables processed successfully.", "percentage": 100}
+            
     except Exception as e:
-        logger.exception("Unexpected error during timetable fetch: %s", e)
+        logger.exception("Unexpected error during timetable batch fetch: %s", e)
+        if task_id and task_id in TIMETABLE_TASKS:
+            TIMETABLE_TASKS[task_id]["status"] = "error"
+            TIMETABLE_TASKS[task_id]["progress"] = {"message": f"Unexpected error: {e}", "percentage": 100}
     finally:
         if svc is not None:
             svc.close()
@@ -759,6 +845,15 @@ def fetch_timetable(
 
     label = payload.label or f"Timetable {payload.year} Sem{payload.semester} {payload.option.title()}"
 
+    task_id = str(uuid4())
+    TIMETABLE_TASKS[task_id] = {
+        "status": "processing",
+        "progress": {
+            "message": "Starting fetch in background...",
+            "percentage": 0
+        }
+    }
+
     background_tasks.add_task(
         _fetch_timetable_task,
         payload.year,
@@ -769,10 +864,95 @@ def fetch_timetable(
         label,
         admin_username,
         payload.strategy,
+        task_id,
     )
 
     return {
         "message": "Timetable fetch started in background.",
         "label": label,
         "status": "processing",
+        "task_id": task_id,
     }
+
+
+@router.get("/timetable/progress/{task_id}")
+def get_timetable_progress(
+    task_id: str,
+    admin_username: str = Depends(require_admin)
+):
+    if task_id not in TIMETABLE_TASKS:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TIMETABLE_TASKS[task_id]
+
+# -----------------------------------------------
+# CRAWLER ROUTES
+# -----------------------------------------------
+
+from app.db.models import CrawlerJob
+
+@router.get("/crawler/status")
+def get_crawler_status(db: Session = Depends(get_db), admin_username: str = Depends(require_admin)):
+    jobs = db.query(CrawlerJob).all()
+    job_dict = {job.job_type: job for job in jobs}
+    
+    status = {}
+    for jtype in ["full", "announcements"]:
+        if jtype in job_dict:
+            j = job_dict[jtype]
+            status[jtype] = {
+                "status": j.status,
+                "crawled": j.crawled_count,
+                "max": j.max_pages,
+                "current_url": j.current_url or "",
+                "last_run": j.last_run.isoformat() if j.last_run else None
+            }
+        else:
+            status[jtype] = {
+                "status": "idle", "crawled": 0, "max": 0, "current_url": "", "last_run": None
+            }
+    return status
+
+@router.post("/crawler/cancel/{job_type}")
+def cancel_crawler(
+    job_type: str,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin)
+):
+    if job_type not in ["full", "announcements"]:
+        raise HTTPException(status_code=400, detail="Invalid job type")
+        
+    job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
+    if job:
+        job.status = "cancelled"
+        
+    from app.db.models import CrawlerQueue
+    db.query(CrawlerQueue).filter_by(job_type=job_type).delete()
+    db.commit()
+    
+    return {"message": f"{job_type} crawler cancellation requested."}
+
+def _trigger_full_crawler_task():
+    from app.core.scheduler import run_full_crawler
+    import asyncio
+    asyncio.run(run_full_crawler())
+
+def _trigger_announcement_crawler_task():
+    from app.core.scheduler import run_announcement_crawler
+    import asyncio
+    asyncio.run(run_announcement_crawler())
+
+@router.post("/crawler/trigger-full")
+def trigger_full_crawler(
+    background_tasks: BackgroundTasks,
+    admin_username: str = Depends(require_admin)
+):
+    background_tasks.add_task(_trigger_full_crawler_task)
+    return {"message": "Full crawler started in the background."}
+
+@router.post("/crawler/trigger-announcements")
+def trigger_announcement_crawler(
+    background_tasks: BackgroundTasks,
+    admin_username: str = Depends(require_admin)
+):
+    background_tasks.add_task(_trigger_announcement_crawler_task)
+    return {"message": "Announcement crawler started in the background."}

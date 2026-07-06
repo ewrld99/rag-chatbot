@@ -170,7 +170,7 @@ def load_document(file_path: str, file_type: str, strategy: str = "auto") -> str
         return load_pdf(file_path)
     elif file_type == "docx":
         return load_docx(file_path)
-    elif file_type == "txt":
+    elif file_type in ("txt", "md"):
         return load_txt(file_path)
     else:
         raise ValueError("Unsupported file type")

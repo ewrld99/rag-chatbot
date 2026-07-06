@@ -6,13 +6,16 @@ from pgvector.sqlalchemy import Vector
 from app.core.config import settings
 from app.db.session import Base
 
-
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(Text, nullable=False, unique=True, index=True)
     password_hash = Column(Text, nullable=False)
+    registration_number = Column(Text, nullable=True)
+    programme = Column(Text, nullable=True)
+    campus = Column(Text, nullable=True)
+    admission_year = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     chat_sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
@@ -60,6 +63,9 @@ class DocumentModel(Base):
     uploaded_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     upload_date = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     status = Column(Text, nullable=True, default="active")
+    source_url = Column(Text, nullable=True, unique=True, index=True)
+    content_hash = Column(Text, nullable=True)
+    last_crawled_at = Column(DateTime(timezone=True), nullable=True)
 
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
 
@@ -119,3 +125,35 @@ class FAQModel(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     creator = relationship("User")
+
+
+class ExternalLinkModel(Base):
+    __tablename__ = "external_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    url = Column(Text, nullable=False, unique=True, index=True)
+    found_on = Column(Text, nullable=True)
+    discovered_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CrawlerJob(Base):
+    __tablename__ = "crawler_jobs"
+
+    job_type = Column(Text, primary_key=True) # "full" or "announcements"
+    status = Column(Text, nullable=False, default="idle")
+    crawled_count = Column(Integer, default=0)
+    max_pages = Column(Integer, default=0)
+    current_url = Column(Text, nullable=True)
+    last_run = Column(DateTime(timezone=True), nullable=True)
+
+
+class CrawlerQueue(Base):
+    __tablename__ = "crawler_queue"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_type = Column(Text, ForeignKey("crawler_jobs.job_type", ondelete="CASCADE"), nullable=False, index=True)
+    url = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, default="pending") # pending, processing, completed, failed
+    
+    from sqlalchemy import UniqueConstraint
+    __table_args__ = (UniqueConstraint('job_type', 'url', name='uq_crawler_queue_job_url'),)

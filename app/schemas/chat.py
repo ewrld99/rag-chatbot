@@ -18,6 +18,7 @@ class Source(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     sources: List[Source]
+    debug: Optional[Dict[str, Any]] = None
 
 
 class MessageFeedbackRequest(BaseModel):

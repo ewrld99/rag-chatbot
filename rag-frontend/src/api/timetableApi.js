@@ -49,3 +49,7 @@ export function fetchTimetable(payload) {
         body: JSON.stringify(payload),
     });
 }
+
+export function getFetchProgress(taskId) {
+    return requestTimetable(`/progress/${encodeURIComponent(taskId)}`);
+}

@@ -14,6 +14,7 @@ Fusion (RRF).
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.documents import Document
@@ -105,7 +106,21 @@ class RetrievalService:
 
         formatted_chunks: List[str] = []
         for i, doc in enumerate(documents):
-            source = doc.metadata.get("source", "unknown")
+            source = doc.metadata.get("source_url") or doc.metadata.get("source") or "unknown"
+            
+            # If the source is just a local PDF filename, convert it to a full URL
+            if source.endswith(".pdf") and not source.startswith("http"):
+                # Clean up path if it includes 'uploads/' or backslashes
+                filename = source.split("/")[-1].split("\\")[-1]
+                local_path = os.path.join("uploads", filename)
+                
+                # Double-check that the file actually exists on disk! If someone deleted it
+                # manually, we shouldn't feed it to the LLM to avoid broken links.
+                if not os.path.exists(local_path):
+                    pass # Keep source as filename to avoid broken links
+                else:
+                    source = f"http://localhost:8000/uploads/{filename}"
+
             chunk_index = doc.metadata.get("chunk_index", i)
             chunk_text = (
                 f'  <document id="[Doc {i+1}]" source="{source}" chunk="{chunk_index}">\n'

@@ -24,6 +24,7 @@ class DocumentResponse(DocumentBase):
     uploaded_by: Optional[int] = None
     upload_date: datetime
     chunk_count: int = 0
+    content: Optional[str] = None
 
     class Config:
         from_attributes = True

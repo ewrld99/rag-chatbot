@@ -51,6 +51,22 @@ export default function LoginForm({ onLogin }) {
         window.dispatchEvent(new PopStateEvent("popstate"));
     };
 
+    const handleRegisterClick = (event) => {
+        if (
+            event.metaKey ||
+            event.ctrlKey ||
+            event.shiftKey ||
+            event.altKey ||
+            event.button !== 0
+        ) {
+            return;
+        }
+
+        event.preventDefault();
+        window.history.pushState({}, "", "/register");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+    };
+
     const handleSubmit = async (event) => {
         event.preventDefault();
         setError("");
@@ -157,10 +173,18 @@ export default function LoginForm({ onLogin }) {
                     </button>
                 </form>
 
-                <div style={styles.chatLinkWrap}>
-                    <a href="/chat" style={styles.chatLink} onClick={handleChatLinkClick}>
-                        Continue to chat
-                    </a>
+                <div style={styles.linksContainer}>
+                    <p style={styles.registerText}>
+                        Don't have an account?{" "}
+                        <a href="/register" style={styles.registerLink} onClick={handleRegisterClick}>
+                            Create one
+                        </a>
+                    </p>
+                    <div style={styles.chatLinkWrap}>
+                        <a href="/chat" style={styles.chatLink} onClick={handleChatLinkClick}>
+                            Continue to chat as guest
+                        </a>
+                    </div>
                 </div>
             </div>
         </div>
@@ -177,11 +201,11 @@ const styles = {
     card: {
         width: "100%",
         maxWidth: "420px",
-        background: "rgba(255, 253, 248, 0.96)",
-        border: "1px solid #ded6c8",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         borderRadius: "18px",
         padding: "34px",
-        boxShadow: "0 24px 70px rgba(47, 43, 37, 0.16)",
+        boxShadow: "0 24px 70px rgba(0, 0, 0, 0.16)",
     },
     header: {
         display: "flex",
@@ -195,8 +219,8 @@ const styles = {
         width: "78px",
         height: "78px",
         borderRadius: "50%",
-        background: "#050505",
-        border: "1px solid #d8d1c3",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -214,12 +238,12 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.2px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     title: {
         fontSize: "28px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
         letterSpacing: 0,
     },
@@ -241,27 +265,27 @@ const styles = {
     label: {
         fontSize: "13px",
         fontWeight: "600",
-        color: "#5f594f",
+        color: "var(--app-text)",
         letterSpacing: "0.2px",
     },
     inputWrapper: {
         display: "flex",
         alignItems: "center",
-        background: "#ffffff",
-        border: "1px solid #d7d0c1",
+        background: "var(--app-bg)",
+        border: "1px solid var(--app-border-strong)",
         borderRadius: "12px",
         transition: "border-color 0.2s, box-shadow 0.2s",
         overflow: "hidden",
     },
     inputWrapperFocused: {
-        borderColor: "#d96c47",
+        borderColor: "var(--app-accent-strong)",
         boxShadow: "0 0 0 3px rgba(217,108,71,0.12)",
     },
     inputIcon: {
         display: "flex",
         alignItems: "center",
         paddingLeft: "14px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         flexShrink: 0,
     },
     input: {
@@ -271,7 +295,7 @@ const styles = {
         outline: "none",
         padding: "13px 14px",
         fontSize: "14px",
-        color: "#2b2925",
+        color: "var(--app-text)",
         width: "100%",
     },
     errorBox: {
@@ -280,9 +304,9 @@ const styles = {
         gap: "8px",
         padding: "12px 14px",
         borderRadius: "10px",
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
         fontSize: "13px",
     },
     button: {
@@ -290,8 +314,8 @@ const styles = {
         padding: "14px",
         borderRadius: "12px",
         border: "none",
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         fontSize: "14px",
         fontWeight: "700",
         cursor: "pointer",
@@ -312,17 +336,37 @@ const styles = {
         width: "16px",
         height: "16px",
         border: "2px solid rgba(255,250,240,0.35)",
-        borderTop: "2px solid #fffaf0",
+        borderTop: "2px solid var(--app-surface-muted)",
         borderRadius: "50%",
         animation: "spin 0.8s linear infinite",
         display: "inline-block",
     },
-    chatLinkWrap: {
-        marginTop: "18px",
+    linksContainer: {
+        marginTop: "24px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "12px",
+        alignItems: "center",
+    },
+    registerText: {
+        fontSize: "13px",
+        color: "var(--app-muted)",
+        margin: 0,
         textAlign: "center",
     },
+    registerLink: {
+        color: "var(--app-text)",
+        fontWeight: "700",
+        textDecoration: "underline",
+        textUnderlineOffset: "4px",
+        textDecorationColor: "var(--app-border-strong)",
+    },
+    chatLinkWrap: {
+        textAlign: "center",
+        marginTop: "4px",
+    },
     chatLink: {
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         fontSize: "13px",
         fontWeight: "700",
         textDecoration: "none",

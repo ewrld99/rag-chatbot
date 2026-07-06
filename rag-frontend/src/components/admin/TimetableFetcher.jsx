@@ -6,6 +6,7 @@ import {
     getOptionTypes,
     getDataOptions,
     fetchTimetable,
+    getFetchProgress,
 } from "../../api/timetableApi";
 
 /* ----------  SVG Icons  ---------- */
@@ -72,6 +73,8 @@ export default function TimetableFetcher() {
 
     const [loading, setLoading] = useState({ years: true, semesters: false, categories: false, optionTypes: false, dataOptions: false });
     const [status, setStatus] = useState({ type: "", message: "" }); // type: success | error | processing
+    const [taskId, setTaskId] = useState(null);
+    const [progressPct, setProgressPct] = useState(0);
     const [fetchHistory, setFetchHistory] = useState(() => {
         try { return JSON.parse(localStorage.getItem("tt_history") || "[]"); }
         catch { return []; }
@@ -143,6 +146,34 @@ export default function TimetableFetcher() {
             .finally(() => setLoading(l => ({ ...l, dataOptions: false })));
     }, [form.option]);
 
+    /* ---- Progress Polling ---- */
+    useEffect(() => {
+        if (!taskId) return;
+        
+        let interval = setInterval(async () => {
+            try {
+                const res = await getFetchProgress(taskId);
+                if (res.status === "error") {
+                    setStatus({ type: "error", message: res.progress?.message || "An error occurred." });
+                    setTaskId(null);
+                    clearInterval(interval);
+                } else if (res.status === "success") {
+                    setStatus({ type: "success", message: res.progress?.message || "Completed successfully." });
+                    setProgressPct(100);
+                    setTaskId(null);
+                    clearInterval(interval);
+                } else {
+                    setStatus({ type: "processing", message: res.progress?.message || "Processing..." });
+                    setProgressPct(res.progress?.percentage || 0);
+                }
+            } catch (err) {
+                console.error("Failed to fetch progress:", err);
+            }
+        }, 1000);
+        
+        return () => clearInterval(interval);
+    }, [taskId]);
+
     const handleFetch = useCallback(async () => {
         if (!form.year || !form.semester || !form.category || !form.option || form.data.length === 0) {
             setStatus({ type: "error", message: "Please complete all selections before fetching." });
@@ -150,6 +181,7 @@ export default function TimetableFetcher() {
         }
 
         setStatus({ type: "processing", message: "Starting fetch in background..." });
+        setProgressPct(0);
 
         const yearLabel = years.find(y => y.value === form.year)?.label || form.year;
         const semLabel = semesters.find(s => s.value === form.semester)?.label || `Sem ${form.semester}`;
@@ -159,7 +191,7 @@ export default function TimetableFetcher() {
         const autoLabel = form.label || `${catLabel} — ${dataLabels} (${yearLabel}, ${semLabel})`;
 
         try {
-            await fetchTimetable({
+            const res = await fetchTimetable({
                 year: form.year,
                 semester: form.semester,
                 category: form.category,
@@ -169,17 +201,18 @@ export default function TimetableFetcher() {
                 strategy: form.strategy,
             });
 
+            if (res.task_id) {
+                setTaskId(res.task_id);
+            }
+
             const entry = { label: autoLabel, time: new Date().toLocaleString(), status: "ingesting" };
             const newHistory = [entry, ...fetchHistory].slice(0, 20);
             setFetchHistory(newHistory);
             localStorage.setItem("tt_history", JSON.stringify(newHistory));
-
-            setStatus({
-                type: "success",
-                message: `✓ "${autoLabel}" is being downloaded and ingested. It will appear in Documents once complete.`,
-            });
+            
         } catch (err) {
             setStatus({ type: "error", message: err.message });
+            setTaskId(null);
         }
     }, [form, years, semesters, categories, dataOptions, fetchHistory]);
 
@@ -197,52 +230,52 @@ export default function TimetableFetcher() {
             <style>{`
                 .timetable-fetcher { display: flex; flex-direction: column; gap: 28px; }
                 .tt-header { display: flex; align-items: flex-start; gap: 16px; }
-                .tt-header-icon { width: 48px; height: 48px; background: linear-gradient(135deg, #1e40af, #3b82f6); border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #fff; flex-shrink: 0; }
-                .tt-header-text h2 { font-size: 20px; font-weight: 700; color: #f1f5f9; margin: 0 0 4px; }
-                .tt-header-text p { font-size: 13px; color: #64748b; margin: 0; }
+                .tt-header-icon { width: 48px; height: 48px; background: linear-gradient(135deg, var(--app-accent-strong), var(--app-accent)); border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #fff; flex-shrink: 0; }
+                .tt-header-text h2 { font-size: 20px; font-weight: 700; color: var(--app-text); margin: 0 0 4px; }
+                .tt-header-text p { font-size: 13px; color: var(--app-muted); margin: 0; }
 
-                .tt-card { background: #0f1923; border: 1px solid rgba(255,255,255,0.07); border-radius: 14px; padding: 24px; }
-                .tt-card-title { font-size: 13px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 20px; }
+                .tt-card { background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 14px; padding: 24px; box-shadow: var(--app-shadow); }
+                .tt-card-title { font-size: 13px; font-weight: 600; color: var(--app-muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 20px; }
 
                 .tt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
                 @media(max-width: 640px) { .tt-grid { grid-template-columns: 1fr; } }
 
                 .tt-field { display: flex; flex-direction: column; gap: 6px; }
-                .tt-field label { font-size: 12px; font-weight: 600; color: #94a3b8; letter-spacing: .04em; }
-                .tt-select { width: 100%; background: #131e2d; border: 1px solid rgba(255,255,255,0.09); color: #e2e8f0; padding: 10px 14px; border-radius: 9px; font-size: 14px; appearance: none; cursor: pointer; outline: none; transition: border-color .2s; }
-                .tt-select:focus { border-color: #3b82f6; }
+                .tt-field label { font-size: 12px; font-weight: 600; color: var(--app-muted); letter-spacing: .04em; }
+                .tt-select { width: 100%; background: var(--app-bg); border: 1px solid var(--app-border); color: var(--app-text); padding: 10px 14px; border-radius: 9px; font-size: 14px; appearance: none; cursor: pointer; outline: none; transition: border-color .2s; }
+                .tt-select:focus { border-color: var(--app-accent); }
                 .tt-select:disabled { opacity: .4; cursor: not-allowed; }
 
-                .tt-loading-hint { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #64748b; margin-top: 4px; }
+                .tt-loading-hint { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--app-muted); margin-top: 4px; }
                 .spin-icon { animation: spin .8s linear infinite; }
                 @keyframes spin { to { transform: rotate(360deg); } }
 
                 .tt-data-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; max-height: 260px; overflow-y: auto; padding-right: 4px; }
-                .tt-data-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; cursor: pointer; transition: all .15s; background: #131e2d; }
-                .tt-data-item:hover { border-color: #3b82f6; background: rgba(59,130,246,0.06); }
-                .tt-data-item.selected { border-color: #3b82f6; background: rgba(59,130,246,0.12); }
-                .tt-data-check { width: 18px; height: 18px; border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all .15s; }
-                .tt-data-item.selected .tt-data-check { background: #3b82f6; border-color: #3b82f6; color: #fff; }
-                .tt-data-label { font-size: 13px; color: #cbd5e1; line-height: 1.3; }
+                .tt-data-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--app-border); border-radius: 8px; cursor: pointer; transition: all .15s; background: var(--app-bg); }
+                .tt-data-item:hover { border-color: var(--app-accent); background: var(--app-panel); }
+                .tt-data-item.selected { border-color: var(--app-accent); background: var(--app-accent-soft); }
+                .tt-data-check { width: 18px; height: 18px; border: 1px solid var(--app-border-strong); border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all .15s; }
+                .tt-data-item.selected .tt-data-check { background: var(--app-accent); border-color: var(--app-accent); color: #fff; }
+                .tt-data-label { font-size: 13px; color: var(--app-text); line-height: 1.3; }
 
-                .tt-input { width: 100%; background: #131e2d; border: 1px solid rgba(255,255,255,0.09); color: #e2e8f0; padding: 10px 14px; border-radius: 9px; font-size: 14px; outline: none; box-sizing: border-box; transition: border-color .2s; }
-                .tt-input:focus { border-color: #3b82f6; }
-                .tt-input::placeholder { color: #4b5563; }
+                .tt-input { width: 100%; background: var(--app-bg); border: 1px solid var(--app-border); color: var(--app-text); padding: 10px 14px; border-radius: 9px; font-size: 14px; outline: none; box-sizing: border-box; transition: border-color .2s; }
+                .tt-input:focus { border-color: var(--app-accent); }
+                .tt-input::placeholder { color: var(--app-faint); }
 
-                .tt-btn { display: flex; align-items: center; gap: 10px; justify-content: center; padding: 13px 28px; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; border: none; transition: all .2s; background: linear-gradient(135deg, #1e40af, #3b82f6); color: #fff; box-shadow: 0 4px 16px rgba(59,130,246,0.25); }
-                .tt-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 24px rgba(59,130,246,0.35); }
+                .tt-btn { display: flex; align-items: center; gap: 10px; justify-content: center; padding: 13px 28px; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; border: none; transition: all .2s; background: var(--app-text); color: var(--app-bg); }
+                .tt-btn:hover:not(:disabled) { transform: translateY(-1px); opacity: 0.9; }
                 .tt-btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
 
                 .tt-status { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px; border-radius: 10px; font-size: 13px; line-height: 1.5; }
-                .tt-status.success { background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.2); color: #34d399; }
-                .tt-status.error { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #f87171; }
-                .tt-status.processing { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #60a5fa; }
+                .tt-status.success { background: var(--app-panel); border: 1px solid var(--app-border); color: var(--app-text); }
+                .tt-status.error { background: var(--app-danger-soft); border: 1px solid var(--app-danger); color: var(--app-danger); }
+                .tt-status.processing { background: var(--app-accent-soft); border: 1px solid var(--app-accent); color: var(--app-accent); }
 
                 .tt-history { display: flex; flex-direction: column; gap: 8px; }
-                .tt-history-item { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: #131e2d; border: 1px solid rgba(255,255,255,0.06); border-radius: 9px; }
-                .tt-history-label { font-size: 13px; color: #cbd5e1; font-weight: 500; }
-                .tt-history-time { font-size: 11px; color: #475569; }
-                .tt-empty { font-size: 13px; color: #475569; text-align: center; padding: 24px; }
+                .tt-history-item { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--app-bg); border: 1px solid var(--app-border); border-radius: 9px; }
+                .tt-history-label { font-size: 13px; color: var(--app-text); font-weight: 500; }
+                .tt-history-time { font-size: 11px; color: var(--app-faint); }
+                .tt-empty { font-size: 13px; color: var(--app-faint); text-align: center; padding: 24px; }
             `}</style>
 
             {/* Header */}
@@ -250,7 +283,7 @@ export default function TimetableFetcher() {
                 <div className="tt-header-icon"><CalendarIcon /></div>
                 <div className="tt-header-text">
                     <h2>UDOM Timetable Fetcher</h2>
-                    <p>Select a timetable from ratiba.udom.ac.tz and ingest it into the RAG knowledge base automatically.</p>
+                    <p>Automatically fetch and sync timetables from ratiba.udom.ac.tz.</p>
                 </div>
             </div>
 
@@ -320,10 +353,45 @@ export default function TimetableFetcher() {
                     ) : dataOptions.length === 0 ? (
                         <p className="tt-empty">No options found. Try a different selection above.</p>
                     ) : (
-                        <div className="tt-data-grid">
-                            {dataOptions.map(opt => (
+                        <>
+                            <div style={{ display: "flex", gap: "10px", marginBottom: "16px", alignItems: "center" }}>
+                                <input 
+                                    type="text" 
+                                    placeholder="Filter programmes (e.g. Computer Science)..." 
+                                    style={{ flex: 1, padding: "8px 12px", background: "#131e2d", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "6px", color: "white" }}
+                                    onChange={(e) => {
+                                        const term = e.target.value.toLowerCase();
+                                        document.querySelectorAll('.tt-data-item').forEach(el => {
+                                            const label = el.querySelector('.tt-data-label').innerText.toLowerCase();
+                                            el.style.display = label.includes(term) ? "flex" : "none";
+                                        });
+                                    }}
+                                />
+                                <button 
+                                    className="tt-btn-secondary" 
+                                    style={{ padding: "8px 16px" }}
+                                    onClick={() => {
+                                        const visibleOptions = Array.from(document.querySelectorAll('.tt-data-item'))
+                                            .filter(el => el.style.display !== 'none')
+                                            .map(el => el.getAttribute('data-value'));
+                                        setForm(f => ({ ...f, data: [...new Set([...f.data, ...visibleOptions])] }));
+                                    }}
+                                >
+                                    Select All Visible
+                                </button>
+                                <button 
+                                    className="tt-btn-secondary" 
+                                    style={{ padding: "8px 16px" }}
+                                    onClick={() => setForm(f => ({ ...f, data: [] }))}
+                                >
+                                    Clear Selection
+                                </button>
+                            </div>
+                            <div className="tt-data-grid">
+                                {dataOptions.map(opt => (
                                 <div
                                     key={opt.value}
+                                    data-value={opt.value}
                                     className={`tt-data-item${form.data.includes(opt.value) ? " selected" : ""}`}
                                     onClick={() => toggleDataItem(opt.value)}
                                     role="checkbox"
@@ -338,6 +406,7 @@ export default function TimetableFetcher() {
                                 </div>
                             ))}
                         </div>
+                        </>
                     )}
                 </div>
             )}
@@ -386,9 +455,16 @@ export default function TimetableFetcher() {
 
             {/* Status */}
             {status.message && (
-                <div className={`tt-status ${status.type}`}>
-                    {status.type === "processing" ? <SpinnerIcon /> : <AlertIcon />}
-                    <span>{status.message}</span>
+                <div className={`tt-status ${status.type}`} style={{ flexDirection: "column" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                        {status.type === "processing" ? <SpinnerIcon /> : <AlertIcon />}
+                        <span>{status.message}</span>
+                    </div>
+                    {status.type === "processing" && (
+                        <div style={{ width: "100%", height: "4px", background: "var(--app-border)", borderRadius: "2px", marginTop: "10px", overflow: "hidden" }}>
+                            <div style={{ width: `${progressPct}%`, height: "100%", background: "var(--app-accent)", transition: "width 0.3s ease" }} />
+                        </div>
+                    )}
                 </div>
             )}
 

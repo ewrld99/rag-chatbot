@@ -47,3 +47,19 @@ export function updateSetting(key, value) {
 export function reindexAll() {
     return requestSettings("/documents/reindex-all", { method: "POST" });
 }
+
+export function getCrawlerStatus() {
+    return requestSettings("/crawler/status");
+}
+
+export function triggerFullCrawler() {
+    return requestSettings("/crawler/trigger-full", { method: "POST" });
+}
+
+export function triggerAnnouncementCrawler() {
+    return requestSettings("/crawler/trigger-announcements", { method: "POST" });
+}
+
+export function cancelCrawler(jobType) {
+    return requestSettings(`/crawler/cancel/${encodeURIComponent(jobType)}`, { method: "POST" });
+}

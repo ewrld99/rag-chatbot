@@ -56,10 +56,17 @@ async function request(path, options = {}) {
     return data;
 }
 
-export function registerUser(username, password) {
+export function registerUser(username, password, registrationNumber = null, programme = null, campus = null, admissionYear = null) {
     return request("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ 
+            username, 
+            password,
+            registration_number: registrationNumber,
+            programme: programme,
+            campus: campus,
+            admission_year: admissionYear ? parseInt(admissionYear, 10) : null
+        }),
     });
 }
 

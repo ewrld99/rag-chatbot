@@ -120,7 +120,8 @@ def test_bulk_import_batched(mock_log, mock_get_embeddings, mock_db_session):
 @patch("app.services.sparse_retriever.SparseRetriever.retrieve")
 def test_hybrid_retrieval_rrf(mock_sparse, mock_dense, mock_db_session):
     # Mocking that Dense returns an FAQ high up, and Sparse returns a Document
-    from app.schemas.query import DenseResult, SparseResult
+    from app.services.dense_retriever import DenseResult
+    from app.services.sparse_retriever import SparseResult
     
     mock_dense.return_value = [
         DenseResult(chunk_id="faq1", document_id="faq1", similarity_score=0.9, text="FAQ Answer", metadata={"source_type": "faq"}),

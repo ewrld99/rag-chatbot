@@ -6,6 +6,38 @@ from app.core.config import settings as env_settings
 # Keys that require all documents to be reindexed when changed
 REINDEX_REQUIRED_KEYS = {"chunk_size", "chunk_overlap", "embedding_model"}
 
+DEFAULT_SETTINGS = [
+    {"key": "chunk_size", "value": "800", "description": "Size of each text chunk (characters)", "category": "rag"},
+    {"key": "chunk_overlap", "value": "100", "description": "Character overlap between consecutive chunks", "category": "rag"},
+    {"key": "top_k_dense", "value": "20", "description": "Candidate pool size for dense (vector) retrieval", "category": "retrieval"},
+    {"key": "top_k_sparse", "value": "20", "description": "Candidate pool size for sparse (FTS) retrieval", "category": "retrieval"},
+    {"key": "top_k_final", "value": "5", "description": "Final number of chunks passed to the LLM", "category": "retrieval"},
+    {"key": "rrf_k", "value": "60", "description": "RRF smoothing constant — higher values reduce top-rank influence", "category": "retrieval"},
+    {"key": "enable_reranker", "value": "false", "description": "Enable cross-encoder reranking after fusion", "category": "retrieval"},
+    {"key": "embedding_model", "value": env_settings.EMBEDDING_MODEL, "description": "Model used to generate embeddings", "category": "embeddings"},
+    {"key": "similarity_metric", "value": "cosine", "description": "Vector similarity metric", "category": "retrieval"},
+    {"key": "max_upload_size_mb", "value": "20", "description": "Maximum allowed upload size in megabytes", "category": "upload"},
+    {"key": "allowed_extensions", "value": "pdf,docx,txt", "description": "Comma-separated list of allowed file extensions", "category": "upload"},
+    {"key": "crawler_allowlist", "value": "www.udom.ac.tz,portal.udom.ac.tz,coi.udom.ac.tz,oas.udom.ac.tz,sr2.udom.ac.tz", "description": "Comma-separated domains allowed for crawling", "category": "crawler"},
+    {"key": "crawler_blocklist", "value": "twitter.com,facebook.com,instagram.com,/university_documents/,/login,/logout,/admin,/search,/profile", "description": "Comma-separated domains or paths strictly blocked from crawling", "category": "crawler"},
+    {"key": "crawler_max_age_days", "value": "90", "description": "Maximum age of announcements in days (0 to disable)", "category": "crawler"},
+]
+
+def seed_default_settings(db: Session):
+    """Seed default system settings into the DB if they don't exist."""
+    for setting_data in DEFAULT_SETTINGS:
+        existing = db.query(SystemSetting).filter_by(key=setting_data["key"]).first()
+        if not existing:
+            setting = SystemSetting(
+                key=setting_data["key"],
+                value=setting_data["value"],
+                description=setting_data["description"],
+                category=setting_data["category"]
+            )
+            db.add(setting)
+    db.commit()
+
+
 
 class SettingsService:
     """
@@ -124,7 +156,23 @@ class SettingsService:
 
     @property
     def allowed_extensions(self) -> List[str]:
-        return self._list("allowed_extensions", ["pdf", "docx", "txt"])
+        return self._list("allowed_extensions", ["pdf", "docx", "txt", "md"])
+
+    # ------------------------------------------------------------------
+    # Typed properties – Crawler
+    # ------------------------------------------------------------------
+
+    @property
+    def crawler_allowlist(self) -> List[str]:
+        return self._list("crawler_allowlist", ["www.udom.ac.tz", "portal.udom.ac.tz", "coi.udom.ac.tz", "oas.udom.ac.tz", "sr2.udom.ac.tz"])
+
+    @property
+    def crawler_blocklist(self) -> List[str]:
+        return self._list("crawler_blocklist", ["twitter.com", "facebook.com", "instagram.com", "/university_documents/", "/login", "/logout", "/admin", "/search", "/profile"])
+
+    @property
+    def crawler_max_age_days(self) -> int:
+        return self._int("crawler_max_age_days", 90)
 
     # ------------------------------------------------------------------
     # Legacy generic accessor (kept for backwards compat)
@@ -200,6 +248,14 @@ class SettingsService:
                     raise ValueError(
                         "allowed_extensions must be a comma-separated list (e.g., pdf,docx,txt)"
                     )
+            elif key in ("crawler_allowlist", "crawler_blocklist"):
+                import re
+                value = value.replace(" ", "")
+                if value and not re.match(r"^[a-zA-Z0-9.\-_/]+(,[a-zA-Z0-9.\-_/]+)*$", value):
+                    raise ValueError(f"{key} must be a comma-separated list of domains or paths")
+            elif key == "crawler_max_age_days":
+                if not (0 <= int(value) <= 3650):
+                    raise ValueError("crawler_max_age_days must be between 0 and 3650")
         except ValueError as e:
             if "invalid literal for int()" in str(e):
                 raise ValueError(f"{key} must be an integer")

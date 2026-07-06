@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import Dashboard from "../components/admin/Dashboard.jsx";
 import DocumentManager from "../components/admin/DocumentManager.jsx";
 import UploadCard from "../components/admin/UploadCard.jsx";
@@ -52,19 +52,18 @@ export default function AdminDashboardPage() {
         };
     }, [refreshKey]);
 
-    const stats = {
+    const stats = useMemo(() => ({
         documents: documents.length,
         chunks: documents.reduce((total, document) => total + (document.chunk_count ?? 1), 0),
-        sources: new Set(documents.map((document) => document.source).filter(Boolean)).size,
+        sources: new Set(documents.map((document) => document.filename).filter(Boolean)).size,
         isLoading: status.isLoading,
         error: status.error,
-    };
+    }), [documents, status.isLoading, status.error]);
 
     return (
         <div className="admin-dashboard-page">
             <header className="admin-page-header">
                 <div>
-                    <p className="eyebrow">Admin frontend</p>
                     <h2>Dashboard</h2>
                 </div>
                 <span className={`system-pill ${status.error ? "warning" : "healthy"}`}>

@@ -1,10 +1,31 @@
+import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import admin, auth, chat, query, ws_chat
 from app.db.session import init_db
+from app.core.scheduler import start_scheduler, stop_scheduler
 
-app = FastAPI(title="RAG Chatbot")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    from app.db.session import SessionLocal
+    from app.services.settings_service import seed_default_settings
+    db = SessionLocal()
+    try:
+        seed_default_settings(db)
+    finally:
+        db.close()
+    start_scheduler()
+    yield
+    stop_scheduler()
+
+app = FastAPI(title="RAG Chatbot", lifespan=lifespan)
+
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,

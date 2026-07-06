@@ -111,16 +111,36 @@ async def websocket_chat(
             assistant_response = ""
             chat_history = normalize_payload_history(payload.get("history"))
 
-            if session_id:
+            user_profile = None
+            if session_id or user_id:
                 db = SessionLocal()
                 try:
-                    chat_history = load_chat_history(db, int(user_id), int(session_id))
+                    from app.db.models import User
+                    from datetime import datetime
+                    if session_id:
+                        chat_history = load_chat_history(db, int(user_id), int(session_id))
+                    
+                    user = db.query(User).filter(User.id == int(user_id)).first()
+                    if user:
+                        year = None
+                        if user.admission_year:
+                            now = datetime.now()
+                            current_academic_year_start = now.year if now.month >= 9 else now.year - 1
+                            year = max(1, (current_academic_year_start - user.admission_year) + 1)
+                        
+                        user_profile = {
+                            "registration_number": user.registration_number,
+                            "programme": user.programme,
+                            "campus": user.campus,
+                            "year_of_study": year,
+                        }
                 except (TypeError, ValueError):
-                    chat_history = []
+                    if session_id:
+                        chat_history = []
                 finally:
                     db.close()
 
-            async for token in rag_pipeline.stream(message, chat_history=chat_history):
+            async for token in rag_pipeline.stream(message, chat_history=chat_history, user_profile=user_profile):
                 assistant_response += token
                 await websocket.send_json({
                     "type": "stream",

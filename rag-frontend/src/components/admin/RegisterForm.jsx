@@ -29,6 +29,10 @@ const AlertIcon = () => (
 export default function RegisterForm({ onRegister, onLoginClick }) {
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
+    const [registrationNumber, setRegistrationNumber] = useState("");
+    const [programme, setProgramme] = useState("");
+    const [campus, setCampus] = useState("");
+    const [admissionYear, setAdmissionYear] = useState("");
     const [error, setError] = useState("");
     const [isLoading, setIsLoading] = useState(false);
     const [focused, setFocused] = useState(null);
@@ -44,7 +48,7 @@ export default function RegisterForm({ onRegister, onLoginClick }) {
 
         setIsLoading(true);
         try {
-            await onRegister(username, password);
+            await onRegister(username, password, registrationNumber, programme, campus, admissionYear);
         } catch (registerError) {
             setError(registerError.message || "Could not create account. Please try again.");
         } finally {
@@ -82,6 +86,83 @@ export default function RegisterForm({ onRegister, onLoginClick }) {
                                     autoComplete="username"
                                     placeholder="Username"
                                     required
+                                />
+                            </div>
+                        </div>
+
+                        <div style={styles.fieldGroup}>
+                            <label style={styles.label} htmlFor="register-reg">Registration Number</label>
+                            <div style={{
+                                ...styles.inputWrapper,
+                                ...(focused === "reg" ? styles.inputWrapperFocused : {}),
+                            }}>
+                                <span style={styles.inputIcon}><UserPlusIcon /></span>
+                                <input
+                                    id="register-reg"
+                                    style={styles.input}
+                                    value={registrationNumber}
+                                    onChange={(e) => { setRegistrationNumber(e.target.value); setError(""); }}
+                                    onFocus={() => setFocused("reg")}
+                                    onBlur={() => setFocused(null)}
+                                    placeholder="e.g. T21-03-0000"
+                                />
+                            </div>
+                        </div>
+
+                        <div style={styles.fieldGroup}>
+                            <label style={styles.label} htmlFor="register-prog">Programme</label>
+                            <div style={{
+                                ...styles.inputWrapper,
+                                ...(focused === "prog" ? styles.inputWrapperFocused : {}),
+                            }}>
+                                <span style={styles.inputIcon}><UserPlusIcon /></span>
+                                <input
+                                    id="register-prog"
+                                    style={styles.input}
+                                    value={programme}
+                                    onChange={(e) => { setProgramme(e.target.value); setError(""); }}
+                                    onFocus={() => setFocused("prog")}
+                                    onBlur={() => setFocused(null)}
+                                    placeholder="e.g. Computer Science"
+                                />
+                            </div>
+                        </div>
+
+                        <div style={styles.fieldGroup}>
+                            <label style={styles.label} htmlFor="register-campus">Campus</label>
+                            <div style={{
+                                ...styles.inputWrapper,
+                                ...(focused === "campus" ? styles.inputWrapperFocused : {}),
+                            }}>
+                                <span style={styles.inputIcon}><UserPlusIcon /></span>
+                                <input
+                                    id="register-campus"
+                                    style={styles.input}
+                                    value={campus}
+                                    onChange={(e) => { setCampus(e.target.value); setError(""); }}
+                                    onFocus={() => setFocused("campus")}
+                                    onBlur={() => setFocused(null)}
+                                    placeholder="e.g. CIVE"
+                                />
+                            </div>
+                        </div>
+
+                        <div style={styles.fieldGroup}>
+                            <label style={styles.label} htmlFor="register-year">Admission Year</label>
+                            <div style={{
+                                ...styles.inputWrapper,
+                                ...(focused === "year" ? styles.inputWrapperFocused : {}),
+                            }}>
+                                <span style={styles.inputIcon}><UserPlusIcon /></span>
+                                <input
+                                    id="register-year"
+                                    style={styles.input}
+                                    type="number"
+                                    value={admissionYear}
+                                    onChange={(e) => { setAdmissionYear(e.target.value); setError(""); }}
+                                    onFocus={() => setFocused("year")}
+                                    onBlur={() => setFocused(null)}
+                                    placeholder="e.g. 2025"
                                 />
                             </div>
                         </div>
@@ -183,12 +264,12 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.2px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     title: {
         fontSize: "28px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
         letterSpacing: 0,
     },
@@ -217,20 +298,20 @@ const styles = {
         display: "flex",
         alignItems: "center",
         background: "#ffffff",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         borderRadius: "12px",
         transition: "border-color 0.2s, box-shadow 0.2s",
         overflow: "hidden",
     },
     inputWrapperFocused: {
-        borderColor: "#d96c47",
+        borderColor: "var(--app-accent-strong)",
         boxShadow: "0 0 0 3px rgba(217,108,71,0.12)",
     },
     inputIcon: {
         display: "flex",
         alignItems: "center",
         paddingLeft: "14px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         flexShrink: 0,
     },
     input: {
@@ -240,7 +321,7 @@ const styles = {
         outline: "none",
         padding: "13px 14px",
         fontSize: "14px",
-        color: "#2b2925",
+        color: "var(--app-text)",
         width: "100%",
     },
     errorBox: {
@@ -249,9 +330,9 @@ const styles = {
         gap: "8px",
         padding: "12px 14px",
         borderRadius: "10px",
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
         fontSize: "13px",
     },
     button: {
@@ -259,8 +340,8 @@ const styles = {
         padding: "14px",
         borderRadius: "12px",
         border: "none",
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         fontSize: "14px",
         fontWeight: "700",
         cursor: "pointer",
@@ -280,7 +361,7 @@ const styles = {
     linkButton: {
         border: "none",
         background: "transparent",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         fontSize: "13px",
         fontWeight: "700",
         cursor: "pointer",
@@ -290,7 +371,7 @@ const styles = {
         width: "16px",
         height: "16px",
         border: "2px solid rgba(255,250,240,0.35)",
-        borderTop: "2px solid #fffaf0",
+        borderTop: "2px solid var(--app-surface-muted)",
         borderRadius: "50%",
         animation: "spin 0.8s linear infinite",
         display: "inline-block",

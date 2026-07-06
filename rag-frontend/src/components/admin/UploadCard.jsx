@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { uploadDocument } from "../../api/documentApi";
 
-const acceptedExtensions = [".pdf", ".docx", ".txt"];
+const acceptedExtensions = [".pdf", ".docx", ".txt", ".md"];
 
 function isAcceptedFile(file) {
     return acceptedExtensions.some((ext) => file.name.toLowerCase().endsWith(ext));
@@ -52,7 +52,7 @@ export default function UploadCard({ onUploaded }) {
     const [strategy, setStrategy] = useState("auto");
 
     const fileMeta = useMemo(() => {
-        if (!file) return "PDF, DOCX, or TXT · up to your backend limit";
+        if (!file) return "PDF, DOCX, TXT, or MD · up to your backend limit";
         return `${Math.max(file.size / 1024 / 1024, 0.01).toFixed(2)} MB`;
     }, [file]);
 
@@ -60,7 +60,7 @@ export default function UploadCard({ onUploaded }) {
         if (!nextFile) return;
         if (!isAcceptedFile(nextFile)) {
             setFile(null);
-            setMsg("Please choose a PDF, DOCX, or TXT file.");
+            setMsg("Please choose a PDF, DOCX, TXT, or MD file.");
             setStatusType("error");
             return;
         }
@@ -123,7 +123,7 @@ export default function UploadCard({ onUploaded }) {
             >
                 <input
                     type="file"
-                    accept=".pdf,.docx,.txt"
+                    accept=".pdf,.docx,.txt,.md"
                     style={{ display: "none" }}
                     onChange={(e) => selectFile(e.target.files[0])}
                 />
@@ -201,8 +201,8 @@ export default function UploadCard({ onUploaded }) {
 
 const styles = {
     card: {
-        background: "#fffdf8",
-        border: "1px solid #ded9cd",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border)",
         borderRadius: "20px",
         padding: "28px",
         display: "flex",
@@ -221,13 +221,13 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.5px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         marginBottom: "4px",
     },
     title: {
         fontSize: "20px",
         fontWeight: "700",
-        color: "#2b2925",
+        color: "var(--app-text)",
         margin: 0,
     },
     badge: {
@@ -235,15 +235,15 @@ const styles = {
         borderRadius: "20px",
         fontSize: "12px",
         fontWeight: "600",
-        background: "#f0eee7",
-        border: "1px solid #ded9cd",
-        color: "#6f6a61",
+        background: "var(--app-bg)",
+        border: "1px solid var(--app-border)",
+        color: "var(--app-muted)",
         whiteSpace: "nowrap",
     },
     badgeActive: {
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     dropzone: {
         display: "flex",
@@ -253,34 +253,34 @@ const styles = {
         gap: "8px",
         padding: "36px 24px",
         borderRadius: "14px",
-        border: "2px dashed #d7d0c1",
-        background: "#fffaf0",
+        border: "2px dashed var(--app-border-strong)",
+        background: "var(--app-surface-muted)",
         cursor: "pointer",
         transition: "all 0.2s",
         textAlign: "center",
     },
     dropzoneDragging: {
-        border: "2px dashed #d96c47",
+        border: "2px dashed var(--app-accent-strong)",
         background: "#fff4ec",
     },
     dropzoneHasFile: {
         border: "2px dashed #e8cdb8",
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
     },
     dropzoneIcon: {
         width: "56px",
         height: "56px",
         borderRadius: "14px",
-        background: "#f0eee7",
+        background: "var(--app-bg)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#8a8478",
+        color: "var(--app-faint)",
         marginBottom: "4px",
     },
     dropzoneIconActive: {
-        background: "#fffaf0",
-        color: "#9a4f35",
+        background: "var(--app-surface-muted)",
+        color: "var(--app-accent)",
     },
     dropzoneTitle: {
         fontSize: "14px",
@@ -290,7 +290,7 @@ const styles = {
     },
     dropzoneMeta: {
         fontSize: "12px",
-        color: "#8a8478",
+        color: "var(--app-faint)",
     },
     strategyContainer: {
         display: "flex",
@@ -300,14 +300,14 @@ const styles = {
     strategyLabel: {
         fontSize: "12px",
         fontWeight: "600",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
     },
     strategySelect: {
         padding: "10px 12px",
         borderRadius: "10px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "#ffffff",
-        color: "#2b2925",
+        color: "var(--app-text)",
         fontSize: "13px",
         outline: "none",
         cursor: "pointer",
@@ -321,19 +321,19 @@ const styles = {
     progressFill: {
         height: "100%",
         borderRadius: "4px",
-        background: "linear-gradient(90deg, #d96c47, #c89122)",
+        background: "linear-gradient(90deg, var(--app-accent-strong), #c89122)",
         transition: "width 0.4s ease",
     },
     progressComplete: {
-        background: "linear-gradient(90deg, #d96c47, #c89122)",
+        background: "linear-gradient(90deg, var(--app-accent-strong), #c89122)",
     },
     button: {
         width: "100%",
         padding: "13px",
         borderRadius: "12px",
         border: "none",
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         fontSize: "14px",
         fontWeight: "700",
         cursor: "pointer",
@@ -353,7 +353,7 @@ const styles = {
         width: "14px",
         height: "14px",
         border: "2px solid rgba(255,250,240,0.35)",
-        borderTop: "2px solid #fffaf0",
+        borderTop: "2px solid var(--app-surface-muted)",
         borderRadius: "50%",
         animation: "spin 0.8s linear infinite",
         display: "inline-block",
@@ -368,18 +368,18 @@ const styles = {
         lineHeight: 1.4,
     },
     status_success: {
-        background: "#f7eadf",
+        background: "var(--app-accent-soft)",
         border: "1px solid #e8cdb8",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
     },
     status_error: {
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
     },
     status_info: {
-        background: "#f7f2e8",
+        background: "var(--app-panel)",
         border: "1px solid #e3ded2",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
     },
 };

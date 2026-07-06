@@ -93,6 +93,7 @@ export default function AdminLayout({ children }) {
     const [isSidebarOpen, setIsSidebarOpen] = useState(true);
     const [currentSection, setCurrentSection] = useState(() => window.location.hash.replace("#", "") || "overview");
     const session = getAdminSession();
+    const [isAdminMenuOpen, setIsAdminMenuOpen] = useState(false);
 
     // Password Change State
     const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
@@ -190,19 +191,21 @@ export default function AdminLayout({ children }) {
                             ))}
                         </nav>
 
-                        <div className="admin-user-card">
+                        <div className="admin-user-card" onClick={() => setIsAdminMenuOpen(!isAdminMenuOpen)}>
                             <div className="admin-user-info">
                                 <span className="admin-user-avatar"><UserIcon /></span>
                                 <span>{session?.username || "Admin"}</span>
                             </div>
-                            <div style={{ display: 'flex', gap: '8px' }}>
-                                <button type="button" onClick={() => setIsPasswordModalOpen(true)} aria-label="Change Password" title="Change Password">
-                                    <KeyIcon />
-                                </button>
-                                <button type="button" onClick={handleLogout} aria-label="Logout" title="Logout">
-                                    <LogoutIcon />
-                                </button>
-                            </div>
+                            {isAdminMenuOpen && (
+                                <div className="admin-user-menu">
+                                    <button type="button" className="admin-user-menu-item" onClick={(e) => { e.stopPropagation(); setIsAdminMenuOpen(false); setIsPasswordModalOpen(true); }}>
+                                        <KeyIcon /> Change Password
+                                    </button>
+                                    <button type="button" className="admin-user-menu-item danger" onClick={(e) => { e.stopPropagation(); setIsAdminMenuOpen(false); handleLogout(); }}>
+                                        <LogoutIcon /> Log Out
+                                    </button>
+                                </div>
+                            )}
                         </div>
 
                         <NavigationLink to="/" className="admin-public-link" onNavigate={clearAdminSession}>
@@ -223,13 +226,13 @@ export default function AdminLayout({ children }) {
                     zIndex: 1000, padding: "20px"
                 }}>
                     <div style={{
-                        backgroundColor: "#131e2d", border: "1px solid rgba(255,255,255,0.08)",
+                        backgroundColor: "var(--app-surface)", border: "1px solid var(--app-border)",
                         borderRadius: "16px", padding: "24px", width: "100%", maxWidth: "400px",
-                        boxShadow: "0 24px 48px rgba(0,0,0,0.4)"
+                        boxShadow: "var(--app-shadow)"
                     }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "20px" }}>
-                            <h3 style={{ fontSize: "18px", fontWeight: "600", color: "#fff", margin: 0 }}>Change Password</h3>
-                            <button type="button" style={{ background: "none", border: "none", color: "#8a95a5", cursor: "pointer", display: "flex", padding: "4px", borderRadius: "6px" }} onClick={() => setIsPasswordModalOpen(false)}>
+                            <h3 style={{ fontSize: "18px", fontWeight: "600", color: "var(--app-text)", margin: 0 }}>Change Password</h3>
+                            <button type="button" style={{ background: "none", border: "none", color: "var(--app-faint)", cursor: "pointer", display: "flex", padding: "4px", borderRadius: "6px" }} onClick={() => setIsPasswordModalOpen(false)}>
                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                                     <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
                                 </svg>
@@ -241,7 +244,7 @@ export default function AdminLayout({ children }) {
                                 placeholder="Current Password"
                                 value={pwdOld}
                                 onChange={(e) => setPwdOld(e.target.value)}
-                                style={{ width: "100%", backgroundColor: "#0f1923", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", padding: "12px 14px", borderRadius: "8px", fontSize: "14px", outline: "none" }}
+                                style={{ width: "100%", backgroundColor: "var(--app-bg)", border: "1px solid var(--app-border)", color: "var(--app-text)", padding: "12px 14px", borderRadius: "8px", fontSize: "14px", outline: "none" }}
                                 required
                             />
                             <input
@@ -249,16 +252,16 @@ export default function AdminLayout({ children }) {
                                 placeholder="New Password (min 6 chars)"
                                 value={pwdNew}
                                 onChange={(e) => setPwdNew(e.target.value)}
-                                style={{ width: "100%", backgroundColor: "#0f1923", border: "1px solid rgba(255,255,255,0.1)", color: "#fff", padding: "12px 14px", borderRadius: "8px", fontSize: "14px", outline: "none" }}
+                                style={{ width: "100%", backgroundColor: "var(--app-bg)", border: "1px solid var(--app-border)", color: "var(--app-text)", padding: "12px 14px", borderRadius: "8px", fontSize: "14px", outline: "none" }}
                                 required
                             />
-                            {pwdError && <p style={{ color: "#ff6b6b", fontSize: "13px", margin: 0 }}>{pwdError}</p>}
-                            {pwdSuccess && <p style={{ color: "#51cf66", fontSize: "13px", margin: 0 }}>{pwdSuccess}</p>}
+                            {pwdError && <p style={{ color: "var(--app-danger)", fontSize: "13px", margin: 0 }}>{pwdError}</p>}
+                            {pwdSuccess && <p style={{ color: "#34d399", fontSize: "13px", margin: 0 }}>{pwdSuccess}</p>}
                             <div style={{ display: "flex", justifyContent: "flex-end", gap: "12px", marginTop: "8px" }}>
-                                <button type="button" onClick={() => setIsPasswordModalOpen(false)} style={{ padding: "10px 16px", borderRadius: "8px", background: "transparent", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: "14px", fontWeight: "500" }}>
+                                <button type="button" onClick={() => setIsPasswordModalOpen(false)} style={{ padding: "10px 16px", borderRadius: "8px", background: "transparent", color: "var(--app-text)", border: "1px solid var(--app-border-strong)", cursor: "pointer", fontSize: "14px", fontWeight: "500" }}>
                                     Cancel
                                 </button>
-                                <button type="submit" disabled={isChangingPwd} style={{ padding: "10px 16px", borderRadius: "8px", background: "#3b82f6", color: "#fff", border: "none", cursor: "pointer", fontSize: "14px", fontWeight: "500" }}>
+                                <button type="submit" disabled={isChangingPwd} style={{ padding: "10px 16px", borderRadius: "8px", background: "var(--app-accent)", color: "#fff", border: "none", cursor: "pointer", fontSize: "14px", fontWeight: "500" }}>
                                     {isChangingPwd ? "Updating..." : "Update Password"}
                                 </button>
                             </div>

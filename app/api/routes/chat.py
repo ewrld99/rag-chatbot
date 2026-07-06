@@ -92,10 +92,31 @@ def chat(
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
+    user_profile = None
+    if request.user_id:
+        from app.db.session import SessionLocal
+        from app.db.models import User
+        from datetime import datetime
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == request.user_id).first()
+            if user:
+                year = None
+                if user.admission_year:
+                    now = datetime.now()
+                    current_academic_year_start = now.year if now.month >= 9 else now.year - 1
+                    year = max(1, (current_academic_year_start - user.admission_year) + 1)
+                
+                user_profile = {
+                    "registration_number": user.registration_number,
+                    "programme": user.programme,
+                    "campus": user.campus,
+                    "year_of_study": year,
+                }
+
     try:
         # ✅ Debug Mode
         if debug:
-            result = rag_pipeline.run_debug(request.message, chat_history=request.history)
+            result = rag_pipeline.run_debug(request.message, chat_history=request.history, user_profile=user_profile)
 
             return {
                 "response": result["answer"],
@@ -104,7 +125,7 @@ def chat(
             }
 
         # ✅ Normal Mode
-        result = rag_pipeline.run(request.message, chat_history=request.history)
+        result = rag_pipeline.run(request.message, chat_history=request.history, user_profile=user_profile)
 
         return ChatResponse(
             response=result["answer"],
@@ -144,6 +165,28 @@ async def chat_stream(
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
+    user_profile = None
+    if request.user_id:
+        from app.db.session import SessionLocal
+        from app.db.models import User
+        from datetime import datetime
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == request.user_id).first()
+            if user:
+                year = None
+                if user.admission_year:
+                    now = datetime.now()
+                    # Academic year starts in September
+                    current_academic_year_start = now.year if now.month >= 9 else now.year - 1
+                    year = max(1, (current_academic_year_start - user.admission_year) + 1)
+                
+                user_profile = {
+                    "registration_number": user.registration_number,
+                    "programme": user.programme,
+                    "campus": user.campus,
+                    "year_of_study": year,
+                }
+
     async def event_stream():
         full_response = ""
         assistant_message_id = None
@@ -153,6 +196,7 @@ async def chat_stream(
             async for token in rag_pipeline.stream(
                 request.message,
                 chat_history=request.history,
+                user_profile=user_profile,
             ):
                 full_response += token
                 payload = json.dumps({"type": "stream", "token": token}, ensure_ascii=False)

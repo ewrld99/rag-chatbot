@@ -1,7 +1,6 @@
 import pytest
 from app.db.models import User, SystemSetting
 from app.core.security import hash_password
-from rag_frontend.src.utils.adminAuth import base64UrlEncode  # wait, backend can't import frontend JS
 import base64
 import json
 

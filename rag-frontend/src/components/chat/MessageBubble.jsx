@@ -1,3 +1,4 @@
+import { memo } from "react";
 import udomLogo from "../../assets/udom-logo.svg";
 
 const BotLogo = () => (
@@ -23,7 +24,62 @@ const ThumbsDownIcon = ({ filled }) => (
     </svg>
 );
 
-export default function MessageBubble({ id, role, content, feedback, onFeedback }) {
+const renderMarkdown = (text) => {
+    if (typeof text !== 'string') return text;
+    
+    // Step 1: Parse links
+    const linkRegex = /\[(.*?)\]\((.*?)\)/g;
+    const partsWithLinks = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = linkRegex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            partsWithLinks.push(text.substring(lastIndex, match.index));
+        }
+        partsWithLinks.push(
+            <a key={`link-${match.index}`} href={match[2]} target="_blank" rel="noopener noreferrer" style={{ color: "#63b3a4", textDecoration: "underline", fontWeight: "600" }}>
+                {match[1]}
+            </a>
+        );
+        lastIndex = linkRegex.lastIndex;
+    }
+    if (lastIndex < text.length) {
+        partsWithLinks.push(text.substring(lastIndex));
+    }
+
+    // Step 2: Parse bold within string chunks
+    const finalParts = [];
+    const boldRegex = /\*\*(.*?)\*\*/g;
+
+    partsWithLinks.forEach((part, i) => {
+        if (typeof part !== 'string') {
+            finalParts.push(part);
+            return;
+        }
+
+        let lastBIndex = 0;
+        let bMatch;
+        while ((bMatch = boldRegex.exec(part)) !== null) {
+            if (bMatch.index > lastBIndex) {
+                finalParts.push(part.substring(lastBIndex, bMatch.index));
+            }
+            finalParts.push(
+                <strong key={`bold-${i}-${bMatch.index}`} style={{ fontWeight: "700" }}>
+                    {bMatch[1]}
+                </strong>
+            );
+            lastBIndex = boldRegex.lastIndex;
+        }
+        if (lastBIndex < part.length) {
+            finalParts.push(part.substring(lastBIndex));
+        }
+    });
+
+    return finalParts;
+};
+
+const MessageBubble = memo(function MessageBubble({ id, role, content, feedback, onFeedback }) {
     const isUser = role === "user";
 
     return (
@@ -36,8 +92,8 @@ export default function MessageBubble({ id, role, content, feedback, onFeedback 
 
             <div style={{ ...styles.content, ...(isUser ? styles.contentUser : styles.contentAssistant) }}>
                 {!isUser && <span style={styles.author}>Assistant</span>}
-                <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant) }}>
-                    {content}
+                <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant), whiteSpace: "pre-wrap" }}>
+                    {isUser ? content : renderMarkdown(content)}
                 </div>
                 {!isUser && id && (
                     <div style={styles.feedbackActions}>
@@ -70,7 +126,9 @@ export default function MessageBubble({ id, role, content, feedback, onFeedback 
             )}
         </article>
     );
-}
+});
+
+export default MessageBubble;
 
 export function TypingBubble() {
     return (
@@ -197,7 +255,7 @@ const styles = {
     feedbackBtn: {
         background: "transparent",
         border: "none",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         cursor: "pointer",
         padding: "4px",
         borderRadius: "4px",
@@ -231,8 +289,8 @@ Object.assign(styles, {
         width: "32px",
         height: "32px",
         borderRadius: "50%",
-        background: "#050505",
-        border: "1px solid #d8d1c3",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -244,12 +302,12 @@ Object.assign(styles, {
         width: "32px",
         height: "32px",
         borderRadius: "10px",
-        background: "#eee9de",
-        border: "1px solid #d8d1c3",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         flexShrink: 0,
         marginTop: "2px",
     },
@@ -268,7 +326,7 @@ Object.assign(styles, {
     author: {
         fontSize: "12px",
         fontWeight: "700",
-        color: "#6f6a61",
+        color: "var(--app-muted)",
         letterSpacing: 0,
         textTransform: "none",
         paddingLeft: "2px",
@@ -283,15 +341,15 @@ Object.assign(styles, {
     },
     bubbleUser: {
         padding: "10px 15px",
-        background: "#efeae0",
-        color: "#2b2925",
+        background: "var(--app-surface-muted)",
+        color: "var(--app-text)",
         fontWeight: "500",
         borderBottomRightRadius: "6px",
     },
     bubbleAssistant: {
         background: "transparent",
         border: "none",
-        color: "#2b2925",
+        color: "var(--app-text)",
         borderBottomLeftRadius: "16px",
     },
     typingBubble: {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getSettings, updateSetting } from "../../api/settingsApi";
+import { getSettings, updateSetting, triggerFullCrawler, triggerAnnouncementCrawler, getCrawlerStatus } from "../../api/settingsApi";
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
 const SaveIcon = () => (
@@ -44,6 +44,9 @@ const SETTING_META = {
                           ], reindex: true  },
     max_upload_size_mb: { label: "Max Upload Size (MB)", type: "number", min: 1,    max: 100,  step: 1,   reindex: false },
     allowed_extensions: { label: "Allowed Extensions",  type: "text",                                    reindex: false },
+    crawler_allowlist:  { label: "Crawler Allowlist (Domains)", type: "text",                            reindex: false },
+    crawler_blocklist:  { label: "Crawler Blocklist (Domains)", type: "text",                            reindex: false },
+    crawler_max_age_days:{ label: "Max Announcement Age (Days)", type: "number", min: 0, max: 3650, step: 1, reindex: false },
 };
 
 const GROUPS = [
@@ -74,6 +77,13 @@ const GROUPS = [
         eyebrow: "File Ingestion",
         description: "Constraints on file uploads accepted by the system.",
         keys: ["max_upload_size_mb", "allowed_extensions"],
+    },
+    {
+        id: "crawler",
+        label: "Web Crawler",
+        eyebrow: "Crawling Restrictions",
+        description: "Configure which domains the web crawler is allowed or blocked from visiting. Comma-separated.",
+        keys: ["crawler_allowlist", "crawler_blocklist", "crawler_max_age_days"],
     },
 ];
 
@@ -246,6 +256,8 @@ function SettingGroup({ group, settingMap, onSaved }) {
     );
 }
 
+import CrawlerDashboard from "./CrawlerDashboard";
+
 // ─── Main component ────────────────────────────────────────────────────────────
 let toastId = 0;
 
@@ -254,6 +266,23 @@ export default function RagSettings() {
     const [isLoading, setIsLoading] = useState(true);
     const [loadError, setLoadError] = useState("");
     const [toasts, setToasts] = useState([]);
+    const [crawlerStatus, setCrawlerStatus] = useState(null);
+
+    // Poll crawler status
+    const fetchCrawlerStatus = useCallback(async () => {
+        try {
+            const status = await getCrawlerStatus();
+            setCrawlerStatus(status);
+        } catch (e) {
+            // Ignore silent errors for polling
+        }
+    }, []);
+
+    useEffect(() => {
+        fetchCrawlerStatus();
+        const interval = setInterval(fetchCrawlerStatus, 3000);
+        return () => clearInterval(interval);
+    }, [fetchCrawlerStatus]);
 
     const addToast = useCallback((message, type = "success") => {
         const id = ++toastId;
@@ -293,6 +322,40 @@ export default function RagSettings() {
         addToast(`"${SETTING_META[key]?.label || key}" saved successfully.`, "success");
     }, [addToast, loadSettings]);
 
+    const handleTriggerFull = async () => {
+        try {
+            await triggerFullCrawler();
+            addToast("Full crawler triggered in the background.", "success");
+            fetchCrawlerStatus();
+        } catch (e) {
+            addToast(e.message, "error");
+        }
+    };
+
+    const handleTriggerAnnouncements = async () => {
+        setIsLoading(true);
+        try {
+            await triggerAnnouncementCrawler();
+            addToast("Announcement crawler triggered in the background.", "success");
+            fetchCrawlerStatus();
+        } catch (e) {
+            addToast(e.message, "error");
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleCancel = async (jobType) => {
+        try {
+            const { cancelCrawler } = await import("../../api/settingsApi");
+            await cancelCrawler(jobType);
+            addToast(`${jobType} crawler stop requested. It will reset shortly.`, "success");
+            fetchCrawlerStatus();
+        } catch (e) {
+            addToast(e.message, "error");
+        }
+    };
+
     const settingMap = Object.fromEntries(settings.map((s) => [s.key, s]));
 
     return (
@@ -308,21 +371,80 @@ export default function RagSettings() {
                         Configure the retrieval-augmented generation pipeline. Changes take effect immediately.
                     </p>
                 </div>
-                <button
-                    type="button"
-                    style={{ ...styles.ghostBtn, ...(isLoading ? styles.ghostBtnDisabled : {}) }}
-                    onClick={loadSettings}
-                    disabled={isLoading}
-                >
-                    <RefreshIcon />
-                    {isLoading ? "Loading…" : "Refresh"}
-                </button>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                        type="button"
+                        style={{ ...styles.ghostBtn, ...((isLoading || crawlerStatus?.announcements?.status === "running") ? styles.ghostBtnDisabled : {}) }}
+                        onClick={handleTriggerAnnouncements}
+                        disabled={isLoading || crawlerStatus?.announcements?.status === "running"}
+                    >
+                        Trigger Announcement Crawler
+                    </button>
+                    <button
+                        type="button"
+                        style={{ ...styles.ghostBtn, ...((isLoading || crawlerStatus?.full?.status === "running") ? styles.ghostBtnDisabled : {}) }}
+                        onClick={handleTriggerFull}
+                        disabled={isLoading || crawlerStatus?.full?.status === "running"}
+                    >
+                        Trigger Full Crawler
+                    </button>
+                    <button
+                        type="button"
+                        style={{ ...styles.ghostBtn, ...(isLoading ? styles.ghostBtnDisabled : {}) }}
+                        onClick={loadSettings}
+                        disabled={isLoading}
+                    >
+                        <RefreshIcon />
+                        {isLoading ? "Loading…" : "Refresh"}
+                    </button>
+                </div>
             </div>
 
             {loadError && (
                 <div style={styles.errorBanner}>
                     <AlertTriangleIcon />
                     <span>{loadError}</span>
+                </div>
+            )}
+
+            {crawlerStatus && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
+                    {[
+                        { key: "announcements", title: "Announcement Crawler" },
+                        { key: "full", title: "Full Domain Crawler" }
+                    ].map(job => {
+                        const rawData = crawlerStatus[job.key];
+                        if (!rawData) return null;
+                        
+                        // Bridge to new UI model if backend still sends old format
+                        const mappedData = rawData.overallProgress !== undefined ? rawData : {
+                            status: rawData.status || "idle",
+                            overallProgress: rawData.max > 0 ? Math.min(100, Math.round((rawData.crawled / rawData.max) * 100)) : 0,
+                            stage: rawData.status === "running" ? "Crawling Website" : "",
+                            stageProgress: rawData.max > 0 ? Math.min(100, Math.round((rawData.crawled / rawData.max) * 100)) : 0,
+                            pagesDiscovered: rawData.crawled || 0,
+                            pagesCrawled: rawData.crawled || 0,
+                            filesDownloaded: 0,
+                            documentsProcessed: 0,
+                            chunksCreated: 0,
+                            embeddingsGenerated: 0,
+                            databaseInserted: 0,
+                            currentItem: rawData.current_url || "",
+                            recentEvents: [],
+                            warnings: [],
+                            errors: [],
+                            elapsed: rawData.last_run ? new Date(rawData.last_run).toLocaleString() : ""
+                        };
+
+                        return (
+                            <CrawlerDashboard 
+                                key={job.key}
+                                title={job.title} 
+                                data={mappedData} 
+                                onCancel={() => handleCancel(job.key)}
+                            />
+                        );
+                    })}
                 </div>
             )}
 
@@ -372,18 +494,18 @@ const styles = {
         fontWeight: "700",
         letterSpacing: "1.5px",
         textTransform: "uppercase",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         marginBottom: "4px",
     },
     pageTitle: {
         fontSize: "22px",
         fontWeight: "700",
-        color: "var(--text-primary, #2b2925)",
+        color: "var(--text-primary, var(--app-text))",
         margin: "0 0 6px",
     },
     pageSubtitle: {
         fontSize: "13px",
-        color: "var(--text-muted, #8a8478)",
+        color: "var(--text-muted, var(--app-faint))",
         margin: 0,
         maxWidth: "480px",
     },
@@ -393,7 +515,7 @@ const styles = {
         gap: "6px",
         padding: "8px 14px",
         borderRadius: "10px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "transparent",
         color: "#4d4942",
         fontSize: "13px",
@@ -412,9 +534,9 @@ const styles = {
         gap: "8px",
         padding: "12px 16px",
         borderRadius: "10px",
-        background: "#fff0e8",
+        background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
-        color: "#a13f24",
+        color: "var(--app-danger)",
         fontSize: "13px",
     },
     groupGrid: {
@@ -423,8 +545,8 @@ const styles = {
         gap: "20px",
     },
     card: {
-        background: "var(--card-bg, #fffdf8)",
-        border: "1px solid var(--card-border, #ded9cd)",
+        background: "var(--card-bg, var(--app-surface))",
+        border: "1px solid var(--card-border, var(--app-border))",
         borderRadius: "16px",
         overflow: "hidden",
         boxShadow: "0 4px 16px rgba(72, 61, 47, 0.06)",
@@ -436,12 +558,12 @@ const styles = {
     cardTitle: {
         fontSize: "16px",
         fontWeight: "700",
-        color: "var(--text-primary, #2b2925)",
+        color: "var(--text-primary, var(--app-text))",
         margin: "0 0 4px",
     },
     cardDescription: {
         fontSize: "12px",
-        color: "var(--text-muted, #8a8478)",
+        color: "var(--text-muted, var(--app-faint))",
         margin: 0,
     },
     settingList: {
@@ -469,7 +591,7 @@ const styles = {
     settingLabel: {
         fontSize: "14px",
         fontWeight: "600",
-        color: "var(--text-primary, #2b2925)",
+        color: "var(--text-primary, var(--app-text))",
         cursor: "pointer",
     },
     reindexBadge: {
@@ -478,7 +600,7 @@ const styles = {
         gap: "4px",
         fontSize: "11px",
         fontWeight: "600",
-        color: "#9a4f35",
+        color: "var(--app-accent)",
         background: "#fef3cd",
         border: "1px solid #f5d878",
         padding: "2px 7px",
@@ -486,13 +608,13 @@ const styles = {
     },
     settingDescription: {
         fontSize: "12px",
-        color: "var(--text-muted, #8a8478)",
+        color: "var(--text-muted, var(--app-faint))",
         margin: 0,
         lineHeight: 1.5,
     },
     errorText: {
         fontSize: "12px",
-        color: "#a13f24",
+        color: "var(--app-danger)",
         margin: "4px 0 0",
     },
     settingControl: {
@@ -505,16 +627,16 @@ const styles = {
         width: "180px",
         padding: "9px 12px",
         borderRadius: "9px",
-        border: "1px solid #d7d0c1",
+        border: "1px solid var(--app-border-strong)",
         background: "var(--input-bg, #ffffff)",
-        color: "var(--text-primary, #2b2925)",
+        color: "var(--text-primary, var(--app-text))",
         fontSize: "14px",
         outline: "none",
         transition: "border-color 0.15s, box-shadow 0.15s",
         boxSizing: "border-box",
     },
     inputDirty: {
-        borderColor: "#d96c47",
+        borderColor: "var(--app-accent-strong)",
         boxShadow: "0 0 0 3px rgba(217,108,71,0.12)",
     },
     inputError: {
@@ -535,8 +657,8 @@ const styles = {
         whiteSpace: "nowrap",
     },
     saveBtnActive: {
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
     },
     saveBtnDisabled: {
         background: "#e8e3d9",
@@ -554,10 +676,10 @@ const styles = {
         flexShrink: 0,
     },
     toggleOn: {
-        background: "#9a4f35",
+        background: "var(--app-accent)",
     },
     toggleOff: {
-        background: "#d7d0c1",
+        background: "var(--app-border-strong)",
     },
     toggleThumb: {
         position: "absolute",
@@ -614,12 +736,12 @@ const styles = {
         pointerEvents: "auto",
     },
     toastSuccess: {
-        background: "#2b2925",
-        color: "#fffaf0",
+        background: "var(--app-text)",
+        color: "var(--app-surface-muted)",
         border: "1px solid rgba(255,255,255,0.08)",
     },
     toastError: {
-        background: "#a13f24",
+        background: "var(--app-danger)",
         color: "#fff",
         border: "1px solid rgba(255,255,255,0.1)",
     },

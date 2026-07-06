@@ -66,6 +66,10 @@ export function getDocuments() {
     return requestDocument("/documents/");
 }
 
+export function getDocument(id) {
+    return requestDocument(`/documents/${encodeURIComponent(id)}`);
+}
+
 export function updateDocument(id, payload) {
     return requestDocument(`/documents/${encodeURIComponent(id)}`, {
         method: "PUT",
@@ -76,5 +80,12 @@ export function updateDocument(id, payload) {
 export function deleteDocument(id) {
     return requestDocument(`/documents/${encodeURIComponent(id)}`, {
         method: "DELETE",
+    });
+}
+
+export function deleteDocumentsBatch(ids) {
+    return requestDocument(`/documents/delete-batch`, {
+        method: "POST",
+        body: JSON.stringify(ids),
     });
 }

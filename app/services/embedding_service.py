@@ -3,6 +3,7 @@ import math
 import re
 import time
 from typing import List, Union
+from collections import OrderedDict
 from openai import APIStatusError, OpenAI, RateLimitError
 
 from app.core.config import settings
@@ -12,6 +13,10 @@ class EmbeddingServiceError(RuntimeError):
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
         self.status_code = status_code
+
+
+_QUERY_EMBEDDING_CACHE = OrderedDict()
+CACHE_MAX_SIZE = 2000
 
 
 from sqlalchemy.orm import Session
@@ -44,6 +49,7 @@ class EmbeddingService:
             self.client = OpenAI(
                 api_key=settings.JINA_API_KEY,
                 base_url=settings.JINA_API_BASE_URL,
+                timeout=15.0
             )
             return
 
@@ -53,7 +59,7 @@ class EmbeddingService:
         if not settings.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is missing in environment variables")
 
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=15.0)
 
     # ---------------------------------------
     # 1. Single Text Embedding
@@ -66,24 +72,33 @@ class EmbeddingService:
         if not text or not text.strip():
             raise ValueError("Input text for embedding cannot be empty")
 
+        cache_key = f"{self.provider}_{self.model}_{hashlib.md5(text.encode('utf-8')).hexdigest()}"
+        if cache_key in _QUERY_EMBEDDING_CACHE:
+            _QUERY_EMBEDDING_CACHE.move_to_end(cache_key)
+            return _QUERY_EMBEDDING_CACHE[cache_key]
+
         if self.provider == "local":
-            return self._embed_local(text)
+            result = self._embed_local(text)
+        elif self.provider == "jina":
+            result = self._embed_jina(text)[0]
+        else:
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=text
+                )
 
-        if self.provider == "jina":
-            return self._embed_jina(text)[0]
+                embedding = response.data[0].embedding
+                self._validate_dimension(embedding)
+                result = embedding
+            except Exception as e:
+                raise self._to_embedding_error(e)
 
-        try:
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=text
-            )
-
-            embedding = response.data[0].embedding
-            self._validate_dimension(embedding)
-            return embedding
-
-        except Exception as e:
-            raise self._to_embedding_error(e)
+        _QUERY_EMBEDDING_CACHE[cache_key] = result
+        if len(_QUERY_EMBEDDING_CACHE) > CACHE_MAX_SIZE:
+            _QUERY_EMBEDDING_CACHE.popitem(last=False)
+            
+        return result
 
     # ---------------------------------------
     # 2. Batch Embedding (IMPORTANT)
@@ -166,14 +181,14 @@ class EmbeddingService:
             except APIStatusError as error:
                 code = getattr(error, "code", None)
                 if (code == "RATE_TOKEN_LIMIT_EXCEEDED" or error.status_code == 429) and attempt < retries - 1:
-                    sleep_time = 20 * (attempt + 1)
+                    sleep_time = 2 * (attempt + 1)
                     print(f"Jina API rate limit hit. Retrying in {sleep_time}s...")
                     time.sleep(sleep_time)
                     continue
                 return self._raise_jina_status_error(error)
             except Exception as error:
                 if attempt < retries - 1:
-                    time.sleep(5)
+                    time.sleep(1)
                     continue
                 raise EmbeddingServiceError(f"Jina embedding request failed: {str(error)}")
 

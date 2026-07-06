@@ -1,21 +1,21 @@
 
 try:
-    from pydantic_settings import BaseSettings
+    from pydantic_settings import BaseSettings, SettingsConfigDict
 except ImportError:
     from pydantic import BaseSettings
+    SettingsConfigDict = None
 
 class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     JINA_API_KEY: str = ""
     JINA_API_BASE_URL: str = "https://api.jina.ai/v1"
     DATABASE_URL: str = "postgresql://postgres:password@localhost:5432/rag_db"
-    EMBEDDING_PROVIDER: str = "local"
-    EMBEDDING_MODEL: str = "local-hashing-v1"
+    EMBEDDING_PROVIDER: str = "jina"
+    EMBEDDING_MODEL: str = "jina-embeddings-v3"
     EMBEDDING_DIMENSION: int = 1024
-    EMBEDDING_BATCH_SIZE: int = 64
+    EMBEDDING_BATCH_SIZE: int = 15
     DOCUMENT_CHUNK_SIZE: int = 1800
     DOCUMENT_CHUNK_OVERLAP: int = 120
-    CHAT_MODEL: str = "gpt-4o-mini"
     ADMIN_USERNAMES: str = "admin"
 
     # --- Admin seed (used only by scripts/create_admin.py) ---
@@ -31,8 +31,11 @@ class Settings(BaseSettings):
     RRF_K: int = 60             # RRF constant (higher = smoother rank decay)
     HYBRID_TOP_K: int = 5       # final chunks passed to the LLM
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    if SettingsConfigDict:
+        model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+    else:
+        class Config:
+            env_file = ".env"
+            case_sensitive = False
 
 settings = Settings()

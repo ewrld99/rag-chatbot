@@ -14,7 +14,7 @@ Flow:
 import io
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from uuid import uuid4
 
 import httpx
@@ -239,12 +239,15 @@ class TimetableFetcherService:
         category: str,
         option: str,
         data: List[str],
+        progress_cb: Optional[Callable[[str, int], None]] = None,
     ) -> bytes:
         """
         Submit the timetable download form and return raw PDF bytes.
         Always refreshes the CSRF token right before submitting.
         """
         # Refresh session to get a fresh CSRF token
+        if progress_cb:
+            progress_cb("Connecting to UDOM Timetable system...", 5)
         self._bootstrap_session()
 
         form_data: Dict[str, Any] = {
@@ -262,6 +265,8 @@ class TimetableFetcherService:
             form_data["data[]"] = data
 
         try:
+            if progress_cb:
+                progress_cb("Downloading PDF...", 10)
             response = self.client.post(DOWNLOAD_URL, data=form_data)
             response.raise_for_status()
         except httpx.RequestError as e:
@@ -293,6 +298,7 @@ class TimetableFetcherService:
         document_label: str,
         admin_id: Optional[int] = None,
         strategy: str = "timetable",
+        progress_cb: Optional[Callable[[str, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Save PDF bytes to a temp file, extract text, chunk, embed, and persist
@@ -308,6 +314,9 @@ class TimetableFetcherService:
         try:
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
+
+            if progress_cb:
+                progress_cb("Extracting text from PDF...", 30)
 
             if strategy == "timetable":
                 # Row-per-sentence extraction — keeps time/course/venue/lecturer together
@@ -328,6 +337,9 @@ class TimetableFetcherService:
             os.remove(tmp_path)
             raise TimetableFetchError("No text could be extracted from the timetable PDF.")
 
+        if progress_cb:
+            progress_cb("Chunking text...", 50)
+
         if strategy == "timetable":
             # Each line is already a complete, self-contained sentence — keep them as chunks
             raw_chunks = [line.strip() for line in text.splitlines() if line.strip()]
@@ -340,6 +352,9 @@ class TimetableFetcherService:
             os.remove(tmp_path)
             raise TimetableFetchError("Text could not be chunked.")
 
+        if progress_cb:
+            progress_cb(f"Generating embeddings for {len(chunks)} chunks...", 70)
+
         try:
             embeddings = get_embeddings(chunks, self.db)
         except EmbeddingServiceError as e:
@@ -349,6 +364,9 @@ class TimetableFetcherService:
         if len(embeddings) != len(chunks):
             os.remove(tmp_path)
             raise TimetableFetchError("Embedding count mismatch — check embedding service.")
+
+        if progress_cb:
+            progress_cb("Saving document and chunks to database...", 90)
 
         # Persist document record
         document = DocumentModel(
@@ -370,7 +388,7 @@ class TimetableFetcherService:
                     "chunk_text": chunk,
                     "embedding": embedding,
                     "chunk_index": i,
-                    "metadata": {"source": "timetable"},  # stored in metadata_ column
+                    "metadata": {"source_url": f"http://localhost:8000/uploads/{os.path.basename(tmp_path)}"},  # stored in metadata_ column
                 }
                 for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
             ],

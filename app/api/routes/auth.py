@@ -32,7 +32,15 @@ def get_user_role(username: str) -> str:
 
 
 def serialize_user(user: User) -> UserResponse:
-    return UserResponse(id=user.id, username=user.username, role=get_user_role(user.username))
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        role=get_user_role(user.username),
+        registration_number=user.registration_number,
+        programme=user.programme,
+        campus=user.campus,
+        admission_year=user.admission_year,
+    )
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
@@ -41,7 +49,14 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     if not username:
         raise HTTPException(status_code=400, detail="Username is required")
 
-    user = User(username=username, password_hash=hash_password(payload.password))
+    user = User(
+        username=username,
+        password_hash=hash_password(payload.password),
+        registration_number=payload.registration_number,
+        programme=payload.programme,
+        campus=payload.campus,
+        admission_year=payload.admission_year,
+    )
 
     try:
         db.add(user)
