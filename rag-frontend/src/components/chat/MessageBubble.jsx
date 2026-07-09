@@ -24,60 +24,8 @@ const ThumbsDownIcon = ({ filled }) => (
     </svg>
 );
 
-const renderMarkdown = (text) => {
-    if (typeof text !== 'string') return text;
-    
-    // Step 1: Parse links
-    const linkRegex = /\[(.*?)\]\((.*?)\)/g;
-    const partsWithLinks = [];
-    let lastIndex = 0;
-    let match;
-
-    while ((match = linkRegex.exec(text)) !== null) {
-        if (match.index > lastIndex) {
-            partsWithLinks.push(text.substring(lastIndex, match.index));
-        }
-        partsWithLinks.push(
-            <a key={`link-${match.index}`} href={match[2]} target="_blank" rel="noopener noreferrer" style={{ color: "#63b3a4", textDecoration: "underline", fontWeight: "600" }}>
-                {match[1]}
-            </a>
-        );
-        lastIndex = linkRegex.lastIndex;
-    }
-    if (lastIndex < text.length) {
-        partsWithLinks.push(text.substring(lastIndex));
-    }
-
-    // Step 2: Parse bold within string chunks
-    const finalParts = [];
-    const boldRegex = /\*\*(.*?)\*\*/g;
-
-    partsWithLinks.forEach((part, i) => {
-        if (typeof part !== 'string') {
-            finalParts.push(part);
-            return;
-        }
-
-        let lastBIndex = 0;
-        let bMatch;
-        while ((bMatch = boldRegex.exec(part)) !== null) {
-            if (bMatch.index > lastBIndex) {
-                finalParts.push(part.substring(lastBIndex, bMatch.index));
-            }
-            finalParts.push(
-                <strong key={`bold-${i}-${bMatch.index}`} style={{ fontWeight: "700" }}>
-                    {bMatch[1]}
-                </strong>
-            );
-            lastBIndex = boldRegex.lastIndex;
-        }
-        if (lastBIndex < part.length) {
-            finalParts.push(part.substring(lastBIndex));
-        }
-    });
-
-    return finalParts;
-};
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const MessageBubble = memo(function MessageBubble({ id, role, content, feedback, onFeedback }) {
     const isUser = role === "user";
@@ -92,8 +40,24 @@ const MessageBubble = memo(function MessageBubble({ id, role, content, feedback,
 
             <div style={{ ...styles.content, ...(isUser ? styles.contentUser : styles.contentAssistant) }}>
                 {!isUser && <span style={styles.author}>Assistant</span>}
-                <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant), whiteSpace: "pre-wrap" }}>
-                    {isUser ? content : renderMarkdown(content)}
+                <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant), whiteSpace: isUser ? "pre-wrap" : "normal" }}>
+                    {isUser ? content : (
+                        <ReactMarkdown 
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                                a: ({node, ...props}) => <a {...props} target="_blank" rel="noopener noreferrer" style={{ color: "#63b3a4", textDecoration: "underline", fontWeight: "600" }} />,
+                                p: ({node, ...props}) => <p style={{ margin: "0 0 12px 0", ...(node.parent && node.parent.tagName === 'li' ? { margin: 0 } : {}) }} {...props} />,
+                                ul: ({node, ...props}) => <ul style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
+                                ol: ({node, ...props}) => <ol style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
+                                li: ({node, ...props}) => <li style={{ margin: "2px 0" }} {...props} />,
+                                table: ({node, ...props}) => <table style={{ borderCollapse: "collapse", width: "100%", marginBottom: "16px" }} {...props} />,
+                                th: ({node, ...props}) => <th style={{ border: "1px solid var(--app-border)", padding: "8px", backgroundColor: "var(--app-bg)" }} {...props} />,
+                                td: ({node, ...props}) => <td style={{ border: "1px solid var(--app-border)", padding: "8px" }} {...props} />
+                            }}
+                        >
+                            {content}
+                        </ReactMarkdown>
+                    )}
                 </div>
                 {!isUser && id && (
                     <div style={styles.feedbackActions}>
