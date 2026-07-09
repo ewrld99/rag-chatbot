@@ -1,22 +1,54 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg2-binary
-pgvector
-pydantic-settings
-python-dotenv
-python-multipart
-openai
-groq
-langchain-core
-langchain-openai
-pypdf
-pdfplumber
-python-docx
-alembic
-pandas
-openpyxl
-httpx
-beautifulsoup4
-apscheduler
-markdownify
+# ==============================================================================
+# requirements.txt — pinned with minimum-version lower bounds
+# ==============================================================================
+# To generate a fully-locked file for reproducible deployments run:
+#   pip install -r requirements.txt
+#   pip freeze > requirements-lock.txt
+# Then use requirements-lock.txt in your Dockerfile / CI pipeline.
+# ==============================================================================
+
+# --- Web framework ---
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# --- Database ---
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+pgvector>=0.2.0
+alembic>=1.12.0
+
+# --- Settings / env ---
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# --- File uploads ---
+python-multipart>=0.0.7
+
+# --- LLM providers ---
+openai>=1.0.0
+groq>=0.4.0
+
+# --- LangChain ---
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+
+# --- Document parsing ---
+pypdf>=4.0.0
+pdfplumber>=0.10.0
+python-docx>=1.0.0
+
+# --- Data processing ---
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# --- HTTP client / web crawling ---
+httpx>=0.26.0
+beautifulsoup4>=4.12.0
+markdownify>=0.11.0
+
+# --- Scheduling ---
+apscheduler>=3.10.0
+
+# --- Rate limiting ---
+# Implemented in app/api/limiter.py using stdlib only (time, collections).
+# No third-party package required.

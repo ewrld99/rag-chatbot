@@ -1,3 +1,5 @@
+import time
+from collections import defaultdict
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Session
@@ -9,6 +11,26 @@ from app.db.session import SessionLocal
 from app.services.rag_pipeline import RAGPipeline
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Simple sliding-window rate limiter for WebSocket messages.
+# slowapi only covers HTTP endpoints, so we track per-user_id timestamps here.
+# ---------------------------------------------------------------------------
+_WS_LIMIT = 20          # max messages per window
+_WS_WINDOW = 60.0       # window size in seconds
+_ws_timestamps: Dict[str, List[float]] = defaultdict(list)
+
+
+def _ws_is_allowed(user_id: str) -> bool:
+    """Return True if the user is within the rate limit, False otherwise."""
+    now = time.monotonic()
+    bucket = _ws_timestamps[user_id]
+    # Evict timestamps outside the current window
+    _ws_timestamps[user_id] = [t for t in bucket if now - t < _WS_WINDOW]
+    if len(_ws_timestamps[user_id]) >= _WS_LIMIT:
+        return False
+    _ws_timestamps[user_id].append(now)
+    return True
 
 
 def save_chat_exchange(
@@ -105,6 +127,14 @@ async def websocket_chat(
                 await websocket.send_json({
                     "type": "error",
                     "message": "Message cannot be empty",
+                })
+                continue
+
+            # ── Rate limit check ────────────────────────────────────────────
+            if not _ws_is_allowed(str(user_id)):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Rate limit exceeded: max {_WS_LIMIT} messages per {int(_WS_WINDOW)}s. Please slow down.",
                 })
                 continue
 

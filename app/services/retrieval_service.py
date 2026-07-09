@@ -99,35 +99,58 @@ class RetrievalService:
     # -----------------------------------------------------------------------
     # 4. Format Context
     # -----------------------------------------------------------------------
-    def format_context(self, documents: List[Document]) -> str:
+    def format_context(self, documents: List[Document], max_chars: int = 12000) -> str:
         """Convert retrieved documents into structured LLM context."""
         if not documents:
             return "No relevant context found."
 
         formatted_chunks: List[str] = []
+        current_length = 0
+        
         for i, doc in enumerate(documents):
             source = doc.metadata.get("source_url") or doc.metadata.get("source") or "unknown"
             
+            # Clean up path for display name securely
+            doc_name = os.path.basename(source.replace("\\", "/"))
+
             # If the source is just a local PDF filename, convert it to a full URL
-            if source.endswith(".pdf") and not source.startswith("http"):
-                # Clean up path if it includes 'uploads/' or backslashes
-                filename = source.split("/")[-1].split("\\")[-1]
-                local_path = os.path.join("uploads", filename)
+            if source.endswith((".pdf", ".docx", ".doc", ".txt", ".xlsx", ".csv")) and not source.startswith("http"):
+                uploads_dir_abs = os.path.abspath(settings.UPLOADS_DIR)
+                local_path_abs = os.path.abspath(os.path.join(settings.UPLOADS_DIR, doc_name))
                 
-                # Double-check that the file actually exists on disk! If someone deleted it
-                # manually, we shouldn't feed it to the LLM to avoid broken links.
-                if not os.path.exists(local_path):
+                # Path traversal protection & file existence check
+                if not local_path_abs.startswith(uploads_dir_abs) or not os.path.exists(local_path_abs):
                     pass # Keep source as filename to avoid broken links
                 else:
-                    source = f"http://localhost:8000/uploads/{filename}"
+                    base_url = settings.BASE_URL.rstrip('/')
+                    source = f"{base_url}/uploads/{doc_name}"
 
-            chunk_index = doc.metadata.get("chunk_index", i)
+            chunk_index = doc.metadata.get("chunk_index", "unknown")
             chunk_text = (
-                f'  <document id="[Doc {i+1}]" source="{source}" chunk="{chunk_index}">\n'
+                f'  <document id="[Doc {i+1}]" name="{doc_name}" source="{source}" chunk="{chunk_index}">\n'
                 f'    {doc.page_content.strip()}\n'
                 f'  </document>'
             )
+            
+            if current_length + len(chunk_text) > max_chars:
+                overhead = len(chunk_text) - len(doc.page_content.strip())
+                remaining_for_content = max_chars - current_length - overhead - 20 # For "... [TRUNCATED]"
+
+                if remaining_for_content > 0:
+                    truncated_content = doc.page_content.strip()[:remaining_for_content] + "... [TRUNCATED]"
+                    chunk_text = (
+                        f'  <document id="[Doc {i+1}]" name="{doc_name}" source="{source}" chunk="{chunk_index}">\n'
+                        f'    {truncated_content}\n'
+                        f'  </document>'
+                    )
+                    formatted_chunks.append(chunk_text)
+                break  # current_length update omitted — we exit immediately
+
             formatted_chunks.append(chunk_text)
+            current_length += len(chunk_text)
+
+        if not formatted_chunks:
+            return "No relevant context found."
 
         return "\n".join(formatted_chunks)
 

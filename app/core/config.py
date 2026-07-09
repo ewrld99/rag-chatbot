@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
+    # --- CORS ---
+    # Comma-separated list of allowed frontend origins.
+    # Example: ALLOWED_ORIGINS=https://chat.udom.ac.tz,https://www.udom.ac.tz
+    ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    # --- File Uploads & Server ---
+    BASE_URL: str = "http://localhost:8000"
+    UPLOADS_DIR: str = "uploads"
+
     # --- Hybrid Retrieval ---
     DENSE_TOP_K: int = 20       # candidate pool from pgvector
     SPARSE_TOP_K: int = 20      # candidate pool from FTS

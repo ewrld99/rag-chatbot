@@ -65,19 +65,24 @@ class SparseResult:
 _FTS_QUERY = text(
     """
     SELECT
-        dc.id::text                           AS chunk_id,
-        d.id::text                            AS document_id,
-        d.filename                            AS source,
-        dc.chunk_text                         AS text,
-        dc.chunk_index                        AS chunk_index,
-        ts_rank_cd(dc.tsv, tsq, 32)           AS fts_score
+        dc.id::text                                     AS chunk_id,
+        d.id::text                                      AS document_id,
+        d.filename                                      AS source,
+        dc.chunk_text                                   AS text,
+        dc.chunk_index                                  AS chunk_index,
+        GREATEST(
+            ts_rank_cd(dc.tsv, tsq_s, 34),
+            ts_rank_cd(dc.tsv, tsq_e, 34)
+        )                                               AS fts_score
     FROM
         document_chunks dc
     JOIN
         documents d ON d.id = dc.document_id,
-        websearch_to_tsquery('english', :query) AS tsq
+        websearch_to_tsquery('simple',  :query) AS tsq_s,
+        websearch_to_tsquery('english', :query) AS tsq_e
     WHERE
-        dc.tsv @@ tsq
+        (dc.tsv @@ tsq_s OR dc.tsv @@ tsq_e)
+        AND d.status = 'active'
     ORDER BY
         fts_score DESC
     LIMIT :top_k
@@ -87,18 +92,23 @@ _FTS_QUERY = text(
 _FTS_FAQ_QUERY = text(
     """
     SELECT
-        f.id::text                            AS chunk_id,
-        f.id::text                            AS document_id,
-        COALESCE('FAQ - ' || f.category, 'FAQ') AS source,
-        f.question || E'\n\n' || f.answer     AS text,
-        0                                     AS chunk_index,
-        f.category                            AS category,
-        ts_rank_cd(f.fts_vector, tsq, 32)     AS fts_score
+        f.id::text                                      AS chunk_id,
+        f.id::text                                      AS document_id,
+        COALESCE('FAQ - ' || f.category, 'FAQ')         AS source,
+        f.question || E'\n\n' || f.answer              AS text,
+        0                                               AS chunk_index,
+        f.category                                      AS category,
+        GREATEST(
+            ts_rank_cd(f.fts_vector, tsq_s, 34),
+            ts_rank_cd(f.fts_vector, tsq_e, 34)
+        )                                               AS fts_score
     FROM
         faqs f,
-        websearch_to_tsquery('english', :query) AS tsq
+        websearch_to_tsquery('simple',  :query) AS tsq_s,
+        websearch_to_tsquery('english', :query) AS tsq_e
     WHERE
-        f.is_active = true AND f.fts_vector @@ tsq
+        f.is_active = true
+        AND (f.fts_vector @@ tsq_s OR f.fts_vector @@ tsq_e)
     ORDER BY
         fts_score DESC
     LIMIT :top_k
@@ -162,7 +172,8 @@ class SparseRetriever:
             combined.append((row.fts_score, row, "faq"))
             
         combined.sort(key=lambda x: x[0], reverse=True)
-        combined = combined[:top_k]
+        # Do NOT slice to top_k here — return the full merged pool so RRF
+        # has richer candidates from both document chunks and FAQs.
 
         results: list[SparseResult] = []
         for score, row, type_ in combined:

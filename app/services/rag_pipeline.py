@@ -49,7 +49,7 @@ class RAGPipeline:
         if intent == "conversational":
             return {
                 "query": query,
-                "answer": self.generator.generate_conversational(query, chat_history),
+                "answer": self.generator.generate_conversational(query, chat_history, user_profile=user_profile),
                 "sources": [],
                 "context_used": False
             }
@@ -100,7 +100,7 @@ class RAGPipeline:
         intent = await run_in_threadpool(self.generator.classify_intent, query, chat_history, user_profile)
 
         if intent == "conversational":
-            async for token in self.generator.stream_conversational(query, chat_history):
+            async for token in self.generator.stream_conversational(query, chat_history, user_profile=user_profile):
                 yield token
             return
         elif intent == "out_of_domain":

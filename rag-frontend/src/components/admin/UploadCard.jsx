@@ -81,7 +81,7 @@ export default function UploadCard({ onUploaded }) {
         setStatusType("info");
         setProgress(8);
         try {
-            const res = await uploadDocument(file, setProgress, strategy);
+            const res = await uploadDocument(file, setProgress, setMsg, strategy);
             setMsg(`✓ Uploaded ${res.filename} — ${res.chunks_stored ?? 0} searchable chunks added.`);
             setStatusType("success");
             setProgress(100);

@@ -84,9 +84,17 @@ class CrawlerService:
                 db.rollback()
 
     def process_pdf(self, url: str, content: bytes, source_url: str, title_hint: str = "", db: Session = None):
-        # Check if we already indexed this PDF based on source_url
-        doc = db.query(DocumentModel).filter(DocumentModel.source_url == url).first()
         file_hash = get_content_hash(content.hex())
+        
+        # Check if we already indexed this PDF based on content hash. 
+        # This prevents duplicates from S3 pre-signed URLs which change on every crawl due to signatures.
+        doc_by_hash = db.query(DocumentModel).filter(DocumentModel.content_hash == file_hash).first()
+        if doc_by_hash:
+            logger.info(f"PDF already exists with same content hash. Skipping {url}.")
+            return
+
+        # Fallback check based on source_url
+        doc = db.query(DocumentModel).filter(DocumentModel.source_url == url).first()
         
         if doc and doc.content_hash == file_hash:
             logger.info(f"PDF {url} has not changed. Skipping.")
@@ -199,7 +207,7 @@ class CrawlerService:
             return response
         except Exception as e:
             logger.error(f"Failed to fetch {url}: {type(e).__name__} - {e}")
-            return None
+            raise  # Let the actual error bubble up to the queue result
 
     def _process_pdf_sync(self, url, content, source_url, link_text):
         with SessionLocal() as db:

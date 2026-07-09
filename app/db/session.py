@@ -40,7 +40,11 @@ def init_db():
             CREATE OR REPLACE FUNCTION document_chunks_fts_update()
             RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
-                NEW.tsv := to_tsvector('english', NEW.chunk_text);
+                -- Combined tsvector: 'simple' preserves Swahili words and exact
+                -- English forms; 'english' adds stemmed English lexemes so that
+                -- e.g. "register" matches "registration" in queries.
+                NEW.tsv := to_tsvector('simple', NEW.chunk_text)
+                        || to_tsvector('english', NEW.chunk_text);
                 RETURN NEW;
             END;
             $$
@@ -69,7 +73,9 @@ def init_db():
             CREATE OR REPLACE FUNCTION faqs_fts_update()
             RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
-                NEW.fts_vector := to_tsvector('english', NEW.question || ' ' || NEW.answer);
+                -- Same bilingual strategy: simple (exact) + english (stemmed)
+                NEW.fts_vector := to_tsvector('simple', NEW.question || ' ' || NEW.answer)
+                               || to_tsvector('english', NEW.question || ' ' || NEW.answer);
                 RETURN NEW;
             END;
             $$

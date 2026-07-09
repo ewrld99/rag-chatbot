@@ -11,11 +11,13 @@ without importing LangChain types.
 from __future__ import annotations
 
 from typing import Any
+import logging
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import DocumentChunk, FAQModel
 from app.services.embedding_service import get_embedding
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -85,30 +87,35 @@ class DenseRetriever:
         if not query or not query.strip():
             return []
 
-        query_embedding = get_embedding(query, self.db)
+        try:
+            query_embedding = get_embedding(query, self.db)
 
-        # cosine_distance ∈ [0, 2]; smaller = more similar
-        rows = (
-            self.db.query(
-                DocumentChunk,
-                DocumentChunk.embedding.cosine_distance(query_embedding).label("dist"),
+            # cosine_distance ∈ [0, 2]; smaller = more similar
+            rows = (
+                self.db.query(
+                    DocumentChunk,
+                    DocumentChunk.embedding.cosine_distance(query_embedding).label("dist"),
+                )
+                .filter(DocumentChunk.document.has(status="active"))
+                .options(joinedload(DocumentChunk.document))
+                .order_by("dist")
+                .limit(top_k)
+                .all()
             )
-            .options(joinedload(DocumentChunk.document))
-            .order_by("dist")
-            .limit(top_k)
-            .all()
-        )
-        
-        faq_rows = (
-            self.db.query(
-                FAQModel,
-                FAQModel.embedding.cosine_distance(query_embedding).label("dist"),
+            
+            faq_rows = (
+                self.db.query(
+                    FAQModel,
+                    FAQModel.embedding.cosine_distance(query_embedding).label("dist"),
+                )
+                .filter(FAQModel.is_active == True)
+                .order_by("dist")
+                .limit(top_k)
+                .all()
             )
-            .filter(FAQModel.is_active == True)
-            .order_by("dist")
-            .limit(top_k)
-            .all()
-        )
+        except Exception as exc:
+            logger.warning("DenseRetriever query failed: %s", exc)
+            return []
 
         # Merge and sort
         combined = []
@@ -119,7 +126,8 @@ class DenseRetriever:
             combined.append((dist, faq, "faq"))
             
         combined.sort(key=lambda x: x[0])
-        combined = combined[:top_k]
+        # Do NOT slice to top_k here — return the full merged pool so RRF
+        # has richer candidates from both document chunks and FAQs.
 
         results: list[DenseResult] = []
         for dist, item, type_ in combined:
@@ -133,7 +141,7 @@ class DenseRetriever:
                     DenseResult(
                         chunk_id=chunk_id,
                         document_id=doc_id,
-                        similarity_score=round(1.0 - float(dist) / 2.0, 6),
+                        similarity_score=round(max(0.0, 1.0 - float(dist)), 6),
                         text=chunk.chunk_text,
                         metadata={
                             "source": doc_filename,
@@ -148,7 +156,7 @@ class DenseRetriever:
                     DenseResult(
                         chunk_id=str(faq.id),
                         document_id=str(faq.id),
-                        similarity_score=round(1.0 - float(dist) / 2.0, 6),
+                        similarity_score=round(max(0.0, 1.0 - float(dist)), 6),
                         text=f"{faq.question}\n\n{faq.answer}",
                         metadata={
                             "source": f"FAQ - {faq.category}" if faq.category else "FAQ",

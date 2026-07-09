@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import difflib
 
 from langchain_core.documents import Document
 from sqlalchemy.orm import Session
@@ -73,11 +74,20 @@ class HybridRetriever:
         rrf_k: int | None = None,
     ) -> None:
         self.db = db
-        settings_svc = SettingsService(db)
-        self.top_k = top_k if top_k is not None else settings_svc.top_k_final
-        self.dense_top_k = dense_top_k if dense_top_k is not None else settings_svc.top_k_dense
-        self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_svc.top_k_sparse
-        self.rrf_k = rrf_k if rrf_k is not None else settings_svc.rrf_k
+        # Only hit the DB for settings when at least one param is missing.
+        # RetrievalService always passes all four explicitly, so in normal
+        # operation SettingsService is never instantiated per request.
+        if any(v is None for v in [top_k, dense_top_k, sparse_top_k, rrf_k]):
+            settings_svc = SettingsService(db)
+            self.top_k = top_k if top_k is not None else settings_svc.top_k_final
+            self.dense_top_k = dense_top_k if dense_top_k is not None else settings_svc.top_k_dense
+            self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_svc.top_k_sparse
+            self.rrf_k = rrf_k if rrf_k is not None else settings_svc.rrf_k
+        else:
+            self.top_k = top_k
+            self.dense_top_k = dense_top_k
+            self.sparse_top_k = sparse_top_k
+            self.rrf_k = rrf_k
 
     # -----------------------------------------------------------------------
     # Core: RRF fusion, returns raw results
@@ -102,7 +112,25 @@ class HybridRetriever:
         )
 
         fused = rrf.fuse(dense_results, sparse_results)
-        return fused[: self.top_k]
+        
+        # Semantic/content-overlap deduplication
+        deduped = []
+        for result in fused:
+            is_duplicate = False
+            for existing in deduped:
+                # Use quick_ratio for fast overlap estimation (threshold > 80% overlap)
+                ratio = difflib.SequenceMatcher(None, existing.text, result.text).ratio()
+                if ratio > 0.8:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                deduped.append(result)
+                
+            if len(deduped) >= self.top_k:
+                break
+                
+        return deduped
 
     # -----------------------------------------------------------------------
     # LangChain-compatible public interfaces

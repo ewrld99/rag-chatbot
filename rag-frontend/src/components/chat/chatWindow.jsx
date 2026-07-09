@@ -369,7 +369,7 @@ export default function ChatWindow() {
 
                             {/* Auth / Sessions */}
                             <div style={styles.sessionSection}>
-                                {user ? (
+                                {user && (
                                     <>
                                         {historyError && <p style={styles.historyError}>{historyError}</p>}
 
@@ -407,41 +407,43 @@ export default function ChatWindow() {
                                                 ))
                                             )}
                                         </div>
-
-                                        {/* User card */}
-                                        <div style={styles.userCard} onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}>
-                                            <div style={styles.userInfo}>
-                                                <div style={styles.userAvatar}><UserIcon /></div>
-                                                <span style={styles.userName}>{user.username}</span>
-                                            </div>
-                                            {isUserMenuOpen && (
-                                                <div style={styles.userMenu}>
-                                                    <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsProfileModalOpen(true); }}>
-                                                        <InfoIcon /> View Profile
-                                                    </button>
-                                                    <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsPasswordModalOpen(true); }}>
-                                                        <KeyIcon /> Change Password
-                                                    </button>
-                                                    <button type="button" style={{ ...styles.userMenuItem, color: "var(--app-danger)" }} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); handleLogout(); }}>
-                                                        <LogOutIcon /> Log Out
-                                                    </button>
-                                                </div>
-                                            )}
-                                        </div>
                                     </>
-                                ) : (
-                                    <div style={styles.guestAuthCard}>
-                                        <div style={styles.guestAuthText}>
-                                            <h3 style={styles.guestAuthTitle}>Sign in for more</h3>
-                                            <p style={styles.guestAuthSubtitle}>Save your chat history, personalize your assistant, and more.</p>
-                                        </div>
-                                        <div style={styles.guestAuthButtons}>
-                                            <button type="button" style={styles.guestLoginBtn} onClick={() => navigate("/login")}>Log in</button>
-                                            <button type="button" style={styles.guestSignupBtn} onClick={() => navigate("/register")}>Create account</button>
-                                        </div>
-                                    </div>
                                 )}
                             </div>
+
+                            {/* Bottom Card */}
+                            {user ? (
+                                <div style={styles.userCard} onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}>
+                                    <div style={styles.userInfo}>
+                                        <div style={styles.userAvatar}><UserIcon /></div>
+                                        <span style={styles.userName}>{user.username}</span>
+                                    </div>
+                                    {isUserMenuOpen && (
+                                        <div style={styles.userMenu}>
+                                            <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsProfileModalOpen(true); }}>
+                                                <InfoIcon /> View Profile
+                                            </button>
+                                            <button type="button" style={styles.userMenuItem} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); setIsPasswordModalOpen(true); }}>
+                                                <KeyIcon /> Change Password
+                                            </button>
+                                            <button type="button" style={{ ...styles.userMenuItem, color: "var(--app-danger)" }} onClick={(e) => { e.stopPropagation(); setIsUserMenuOpen(false); handleLogout(); }}>
+                                                <LogOutIcon /> Log Out
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            ) : (
+                                <div style={styles.guestAuthCard}>
+                                    <div style={styles.guestAuthText}>
+                                        <h3 style={styles.guestAuthTitle}>Sign in for more</h3>
+                                        <p style={styles.guestAuthSubtitle}>Save your chat history, personalize your assistant, and more.</p>
+                                    </div>
+                                    <div style={styles.guestAuthButtons}>
+                                        <button type="button" style={styles.guestLoginBtn} onClick={() => navigate("/login")}>Log in</button>
+                                        <button type="button" style={styles.guestSignupBtn} onClick={() => navigate("/register")}>Create account</button>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>
@@ -613,6 +615,8 @@ const styles = {
     sidebarInner: {
         width: "100%",
         height: "100%",
+        flex: 1,
+        minHeight: 0,
         display: "flex",
         flexDirection: "column",
         position: "relative",
@@ -637,6 +641,7 @@ const styles = {
     },
     sidebarContent: {
         flex: 1,
+        minHeight: 0,
         display: "flex",
         flexDirection: "column",
         gap: "8px",
@@ -801,6 +806,7 @@ const styles = {
         display: "flex",
         flexDirection: "column",
         flex: 1,
+        minHeight: 0,
         gap: "8px",
         overflow: "hidden",
     },
@@ -814,6 +820,7 @@ const styles = {
     },
     historyList: {
         flex: 1,
+        minHeight: 0,
         overflowY: "auto",
         display: "flex",
         flexDirection: "column",
@@ -833,6 +840,8 @@ const styles = {
         overflow: "hidden",
         border: "1px solid transparent",
         transition: "all 0.15s",
+        flexShrink: 0,
+        minHeight: "48px",
     },
     historyItemActive: {
         background: "rgba(99,179,164,0.08)",
@@ -1317,6 +1326,8 @@ Object.assign(styles, {
         transition: "all 0.2s ease",
         marginBottom: "4px",
         cursor: "pointer",
+        flexShrink: 0,
+        minHeight: "48px",
     },
     historyItemActive: {
         background: "var(--app-panel)",

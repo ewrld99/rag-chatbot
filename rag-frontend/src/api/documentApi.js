@@ -1,47 +1,73 @@
 import { API_BASE } from "./chatApi";
 import { getAdminToken } from "../utils/adminAuth";
 
-export async function uploadDocument(file, onProgress, strategy = "auto") {
+export async function uploadDocument(file, onProgress, onStatus, strategy = "auto") {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("strategy", strategy);
 
-    return new Promise((resolve, reject) => {
-        const request = new XMLHttpRequest();
-        request.open("POST", `${API_BASE}/api/admin/documents/`);
+    const headers = {};
+    const token = getAdminToken();
+    if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+    }
 
-        const token = getAdminToken();
-        if (token) {
-            request.setRequestHeader("Authorization", `Bearer ${token}`);
+    try {
+        const response = await fetch(`${API_BASE}/api/admin/documents/`, {
+            method: "POST",
+            headers,
+            body: formData,
+        });
+
+        if (!response.ok) {
+            let errorMsg = "Document upload failed";
+            try {
+                const errData = await response.json();
+                errorMsg = errData.detail || errorMsg;
+            } catch (e) {}
+            throw new Error(errorMsg);
         }
 
-        request.upload.onprogress = (event) => {
-            if (!event.lengthComputable) return;
-            const nextProgress = Math.round((event.loaded / event.total) * 80);
-            onProgress?.(Math.max(8, nextProgress));
-        };
+        // Read NDJSON stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let done = false;
+        let finalData = null;
 
-        request.onload = () => {
-            let data;
-
-            try {
-                data = JSON.parse(request.responseText);
-            } catch {
-                data = { detail: request.responseText };
+        while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            done = readerDone;
+            if (value) {
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\\n').filter(Boolean);
+                for (const line of lines) {
+                    try {
+                        const data = JSON.parse(line);
+                        if (data.error) {
+                            throw new Error(data.error);
+                        }
+                        if (data.progress !== undefined) {
+                            onProgress?.(data.progress);
+                        }
+                        if (data.status) {
+                            onStatus?.(data.status);
+                        }
+                        if (data.progress === 100 && data.chunks_stored !== undefined) {
+                            finalData = data;
+                        }
+                    } catch (e) {
+                        if (e.message !== "Unexpected end of JSON input") {
+                            // If it's the error thrown by `data.error`, re-throw it
+                            if (line.includes('"error"')) throw e;
+                        }
+                    }
+                }
             }
-
-            if (request.status >= 200 && request.status < 300) {
-                onProgress?.(100);
-                resolve(data);
-                return;
-            }
-
-            reject(new Error(data.detail || "Document upload failed"));
-        };
-
-        request.onerror = () => reject(new Error("Document upload failed. Make sure the backend server is running."));
-        request.send(formData);
-    });
+        }
+        return finalData || { message: "Document processed successfully" };
+    } catch (error) {
+        throw new Error(error.message || "Document upload failed. Make sure the backend server is running.");
+    }
 }
 
 async function requestDocument(path, options = {}) {

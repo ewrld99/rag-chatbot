@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
+from app.api.limiter import RateLimiter
 from app.schemas.chat import ChatRequest, ChatResponse, MessageFeedbackRequest
 from app.schemas.history import ChatSessionCreate, ChatSessionDetail, ChatSessionResponse
 from app.services.rag_pipeline import RAGPipeline
@@ -79,9 +80,10 @@ def delete_chat_session(user_id: int, session_id: int, db: Session = Depends(get
 # ---------------------------------------
 @router.post("/", response_model=ChatResponse)
 def chat(
-    request: ChatRequest,
+    body: ChatRequest,
     debug: bool = Query(False, description="Enable debug mode"),
-    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline)
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    _: None = Depends(RateLimiter(limit=20, window=60)),
 ):
     """
     Chat endpoint for RAG system:
@@ -89,16 +91,16 @@ def chat(
     - Debug mode → includes retrieval insights
     """
 
-    if not request.message or not request.message.strip():
+    if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     user_profile = None
-    if request.user_id:
+    if body.user_id:
         from app.db.session import SessionLocal
         from app.db.models import User
         from datetime import datetime
         with SessionLocal() as db:
-            user = db.query(User).filter(User.id == request.user_id).first()
+            user = db.query(User).filter(User.id == body.user_id).first()
             if user:
                 year = None
                 if user.admission_year:
@@ -116,7 +118,7 @@ def chat(
     try:
         # ✅ Debug Mode
         if debug:
-            result = rag_pipeline.run_debug(request.message, chat_history=request.history, user_profile=user_profile)
+            result = rag_pipeline.run_debug(body.message, chat_history=body.history, user_profile=user_profile)
 
             return {
                 "response": result["answer"],
@@ -125,7 +127,7 @@ def chat(
             }
 
         # ✅ Normal Mode
-        result = rag_pipeline.run(request.message, chat_history=request.history, user_profile=user_profile)
+        result = rag_pipeline.run(body.message, chat_history=body.history, user_profile=user_profile)
 
         return ChatResponse(
             response=result["answer"],
@@ -147,8 +149,9 @@ def chat(
 # -----------------------------------------------------------------------
 @router.post("/stream")
 async def chat_stream(
-    request: ChatRequest,
+    body: ChatRequest,
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    _: None = Depends(RateLimiter(limit=20, window=60)),
 ):
     """
     Server-Sent Events (SSE) streaming endpoint.
@@ -162,16 +165,16 @@ async def chat_stream(
     If `user_id` and `session_id` are provided the full exchange is
     persisted to the database after the stream completes.
     """
-    if not request.message or not request.message.strip():
+    if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     user_profile = None
-    if request.user_id:
+    if body.user_id:
         from app.db.session import SessionLocal
         from app.db.models import User
         from datetime import datetime
         with SessionLocal() as db:
-            user = db.query(User).filter(User.id == request.user_id).first()
+            user = db.query(User).filter(User.id == body.user_id).first()
             if user:
                 year = None
                 if user.admission_year:
@@ -194,8 +197,8 @@ async def chat_stream(
         try:
             # ── Stream tokens from RAG pipeline ────────────────────────────
             async for token in rag_pipeline.stream(
-                request.message,
-                chat_history=request.history,
+                body.message,
+                chat_history=body.history,
                 user_profile=user_profile,
             ):
                 full_response += token
@@ -209,34 +212,34 @@ async def chat_stream(
             return
 
         # ── Persist to DB if caller supplied session context ────────────────
-        if request.user_id and request.session_id and full_response:
+        if body.user_id and body.session_id and full_response:
             db: Session = SessionLocal()
             try:
                 session = (
                     db.query(ChatSession)
                     .filter(
-                        ChatSession.id == request.session_id,
-                        ChatSession.user_id == request.user_id,
+                        ChatSession.id == body.session_id,
+                        ChatSession.user_id == body.user_id,
                     )
                     .first()
                 )
                 if session:
                     user_msg = ChatMessage(
-                        session_id=request.session_id,
+                        session_id=body.session_id,
                         role="user",
-                        content=request.message,
+                        content=body.message,
                     )
                     db.add(user_msg)
-                    
+
                     asst_msg = ChatMessage(
-                        session_id=request.session_id,
+                        session_id=body.session_id,
                         role="assistant",
                         content=full_response,
                     )
                     db.add(asst_msg)
-                    
+
                     if session.title == "New chat":
-                        session.title = request.message[:80]
+                        session.title = body.message[:80]
                     session.updated_at = func.now()
                     db.commit()
                     db.refresh(asst_msg)

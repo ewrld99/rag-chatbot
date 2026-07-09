@@ -223,7 +223,7 @@ const styles = {
     bubbleUser: {
         background: "linear-gradient(135deg, #63b3a4, #4a9080)",
         color: "#0d1520",
-        fontWeight: "500",
+        fontWeight: "400",
         borderBottomRightRadius: "4px",
     },
     bubbleAssistant: {
@@ -343,7 +343,7 @@ Object.assign(styles, {
         padding: "10px 15px",
         background: "var(--app-surface-muted)",
         color: "var(--app-text)",
-        fontWeight: "500",
+        fontWeight: "400",
         borderBottomRightRadius: "6px",
     },
     bubbleAssistant: {

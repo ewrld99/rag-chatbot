@@ -80,7 +80,7 @@ def query(
     try:
         generator = GenerationService()
         if not context or context.strip() == "No relevant context found.":
-            answer = generator.generate_fallback(payload.question)
+            answer = generator.DOCUMENT_REFUSAL
         else:
             answer = generator.generate(payload.question, context)
     except Exception as exc:

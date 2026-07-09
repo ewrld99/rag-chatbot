@@ -5,6 +5,7 @@ import time
 from uuid import UUID, uuid4
 from typing import Optional, List
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File, HTTPException, Depends, Request, Form
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 import base64
@@ -310,153 +311,140 @@ def upload_document(
     db: Session = Depends(get_db)
 ):
     """
-    Full ingestion pipeline:
+    Streaming ingestion pipeline:
     - Save file
     - Extract text
     - Chunk text
-    - Generate embeddings
+    - Generate embeddings (with progress)
     - Store in PostgreSQL (pgvector)
+    Yields NDJSON progress updates.
     """
-
-    started_at = time.perf_counter()
-
-    # ---------------------------------------
-    # Validate file
-    # ---------------------------------------
     if not file.filename:
         raise HTTPException(status_code=400, detail="File must have a name")
 
     filename = os.path.basename(file.filename).lower()
-
     if not filename.endswith((".pdf", ".docx", ".txt", ".md")):
         raise HTTPException(status_code=400, detail="Only PDF, DOCX, TXT, and MD allowed")
-
+    
     file_ext = filename.split(".")[-1]
-
-    # ---------------------------------------
-    # Prevent overwrite (IMPORTANT)
-    # ---------------------------------------
-    file_path = os.path.join(UPLOAD_DIR, filename)
     name_without_ext = os.path.splitext(filename)[0]
 
+    # Pre-save the file directly in the main thread to avoid holding UploadFile open in the generator
+    file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(file_path):
         copy_index = 1
-
         while os.path.exists(file_path):
             suffix = f"_copy{copy_index}"
             filename = f"{name_without_ext}{suffix}.{file_ext}"
             file_path = os.path.join(UPLOAD_DIR, filename)
             copy_index += 1
 
-    # ---------------------------------------
-    # Save file
-    # ---------------------------------------
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
 
-    # ---------------------------------------
-    # Extract text
-    # ---------------------------------------
-    try:
-        text = load_document(file_path, file_ext, strategy)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
+    def ingest_generator():
+        try:
+            yield json.dumps({"progress": 15, "status": "Extracting text..."}) + "\\n"
+            
+            try:
+                text = load_document(file_path, file_ext, strategy)
+            except Exception as e:
+                yield json.dumps({"error": f"Error reading file: {str(e)}"}) + "\\n"
+                return
 
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="No text extracted from document")
+            if not text or not text.strip():
+                yield json.dumps({"error": "No text extracted from document"}) + "\\n"
+                return
 
-    # ---------------------------------------
-    # Split into chunks
-    # ---------------------------------------
-    extracted_at = time.perf_counter()
+            yield json.dumps({"progress": 25, "status": "Splitting text into chunks..."}) + "\\n"
+            
+            settings_svc = SettingsService(db)
+            chunks = split_text(
+                text,
+                chunk_size=settings_svc.chunk_size,
+                overlap=settings_svc.chunk_overlap,
+            )
 
-    settings_svc = SettingsService(db)
-    chunk_size = settings_svc.chunk_size
-    chunk_overlap = settings_svc.chunk_overlap
+            if not chunks:
+                yield json.dumps({"error": "Text could not be chunked"}) + "\\n"
+                return
 
-    chunks = split_text(
-        text,
-        chunk_size=chunk_size,
-        overlap=chunk_overlap,
-    )
+            yield json.dumps({"progress": 35, "status": f"Generating embeddings for {len(chunks)} chunks..."}) + "\\n"
+            
+            embeddings = []
+            batch_size = 15 # default
+            from app.services.embedding_service import EmbeddingService
+            embedding_svc = EmbeddingService(db)
+            
+            # Determine provider batch size
+            if embedding_svc.provider != "local":
+                batch_size = embedding_svc.batch_size
+            
+            total_batches = (len(chunks) + batch_size - 1) // batch_size
+            
+            for i in range(total_batches):
+                start = i * batch_size
+                batch_chunks = chunks[start:start + batch_size]
+                
+                pct = 35 + int(((i + 1) / total_batches) * 50)
+                yield json.dumps({
+                    "progress": pct, 
+                    "status": f"Generating embeddings (batch {i + 1}/{total_batches})..."
+                }) + "\\n"
+                
+                try:
+                    batch_embeddings = embedding_svc.embed_batch(batch_chunks)
+                    embeddings.extend(batch_embeddings)
+                except Exception as e:
+                    logger.warning("Embedding failed for uploaded document %s: %s", filename, str(e))
+                    yield json.dumps({"error": f"Embedding service error: {str(e)}"}) + "\\n"
+                    return
 
-    if not chunks:
-        raise HTTPException(status_code=400, detail="Text could not be chunked")
+            if len(embeddings) != len(chunks):
+                yield json.dumps({"error": "Embedding service returned an unexpected number of vectors"}) + "\\n"
+                return
 
-    # ---------------------------------------
-    # Embed + Store
-    # ---------------------------------------
-    chunked_at = time.perf_counter()
+            yield json.dumps({"progress": 90, "status": "Saving document to database..."}) + "\\n"
 
-    try:
-        embeddings = get_embeddings(chunks, db)
-    except EmbeddingServiceError as e:
-        logger.warning("Embedding failed for uploaded document %s: %s", filename, str(e))
-        raise HTTPException(status_code=e.status_code, detail=str(e))
-    except Exception as e:
-        logger.exception("Embedding failed for uploaded document %s", filename)
-        raise HTTPException(status_code=502, detail=f"Embedding service error: {str(e)}")
+            document = DocumentModel(
+                title=name_without_ext,
+                filename=filename,
+                file_path=file_path,
+                category=file_ext,
+                status="active"
+            )
+            db.add(document)
+            db.flush() 
+            
+            db.bulk_insert_mappings(
+                DocumentChunk,
+                [
+                    {
+                        "document_id": document.id,
+                        "chunk_text": chunk,
+                        "embedding": embedding,
+                        "chunk_index": i,
+                    }
+                    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+                ]
+            )
+            db.commit()
 
-    if len(embeddings) != len(chunks):
-        raise HTTPException(
-            status_code=502,
-            detail="Embedding service returned an unexpected number of vectors",
-        )
+            yield json.dumps({
+                "progress": 100, 
+                "status": "Done",
+                "filename": filename,
+                "chunks_stored": len(chunks)
+            }) + "\\n"
 
-    embedded_at = time.perf_counter()
+        except Exception as e:
+            logger.exception("Error during document ingestion generator")
+            yield json.dumps({"error": f"Internal Server Error: {str(e)}"}) + "\\n"
 
-    try:
-        document = DocumentModel(
-            title=name_without_ext,
-            filename=filename,
-            file_path=file_path,
-            category=file_ext,
-            status="active"
-        )
-        db.add(document)
-        db.flush() # flush to get document.id
-        
-        db.bulk_insert_mappings(
-            DocumentChunk,
-            [
-                {
-                    "document_id": document.id,
-                    "chunk_text": chunk,
-                    "embedding": embedding,
-                    "chunk_index": i,
-                }
-                for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-            ],
-        )
-        db.commit()
-
-    except Exception as e:
-        db.rollback()
-        logger.exception("Database insert failed for uploaded document %s", filename)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-    finished_at = time.perf_counter()
-    logger.info(
-        "Uploaded %s: %d chunks, extract=%.2fs chunk=%.2fs embed=%.2fs db=%.2fs total=%.2fs",
-        filename,
-        len(chunks),
-        extracted_at - started_at,
-        chunked_at - extracted_at,
-        embedded_at - chunked_at,
-        finished_at - embedded_at,
-        finished_at - started_at,
-    )
-
-    return {
-        "message": "Document processed successfully",
-        "filename": filename,
-        "documents_stored": 1,
-        "chunks_stored": len(chunks)
-    }
-
+    return StreamingResponse(ingest_generator(), media_type="application/x-ndjson")
 
 # ---------------------------------------
 # Reindex All

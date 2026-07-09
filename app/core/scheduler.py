@@ -25,7 +25,7 @@ async def run_announcement_crawler():
     try:
         svc = CrawlerService(db)
         start_urls = [
-            "https://portal.udom.ac.tz/announcements"
+            "https://www.udom.ac.tz/announcements"
         ]
         # Only check the first 2 announcements (3 pages total) for testing
         await svc.run_crawler(start_urls, max_pages=21, job_type="announcements")

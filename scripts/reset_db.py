@@ -1,42 +1,45 @@
 import os
 import sys
+import subprocess
 from sqlalchemy import text
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from app.db.session import engine, Base
-from app.db.models import DocumentModel, DocumentChunk, User, ChatSession, ChatMessage
+from app.db.session import engine, init_db
 
 def reset_db():
-    print("Dropping documents and document_chunks tables...")
+    print("WARNING: This will delete ALL data, users, and documents in the database.")
+    confirm = input("Are you sure you want to proceed? (yes/no): ")
+    if confirm.lower() != "yes":
+        print("Aborted.")
+        sys.exit(0)
+
+    print("Dropping the public schema to clear all tables and data...")
     with engine.connect() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS document_chunks CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS documents CASCADE;"))
+        # Drop and recreate the public schema (wipes all tables, triggers, types)
+        conn.execute(text("DROP SCHEMA public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+        
+        # Ensure extensions are re-created since they might be dropped
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto;"))
+        
         conn.commit()
+
+    print("Database cleared successfully.")
     
-    print("Creating tables...")
-    Base.metadata.create_all(bind=engine)
-    
-    print("Creating TSVECTOR trigger on document_chunks...")
-    with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE OR REPLACE FUNCTION document_chunks_tsv_trigger() RETURNS trigger AS $$
-            begin
-                new.tsv := to_tsvector('english', new.chunk_text);
-                return new;
-            end
-            $$ LANGUAGE plpgsql;
-        """))
-        conn.execute(text("""
-            DROP TRIGGER IF EXISTS tsvectorupdate ON document_chunks;
-        """))
-        conn.execute(text("""
-            CREATE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE
-            ON document_chunks FOR EACH ROW EXECUTE FUNCTION document_chunks_tsv_trigger();
-        """))
-        # Create an index on the tsvector column
-        conn.execute(text("CREATE INDEX IF NOT EXISTS document_chunks_tsv_idx ON document_chunks USING GIN(tsv);"))
-        conn.commit()
-    print("Database schema successfully reset.")
+    print("Re-creating all base tables and triggers...")
+    init_db()
+
+    print("Stamping Alembic migrations to current head...")
+    # Because init_db() creates all tables defined in models.py, we just tell Alembic
+    # that the DB is already fully up to date to prevent duplicate creation errors.
+    try:
+        subprocess.run(["alembic", "stamp", "head"], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error stamping alembic migrations: {e}")
+        sys.exit(1)
+
+    print("Database schema successfully reset and fully up to date.")
 
 if __name__ == "__main__":
     reset_db()

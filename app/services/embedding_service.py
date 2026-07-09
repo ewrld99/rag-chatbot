@@ -103,9 +103,10 @@ class EmbeddingService:
     # ---------------------------------------
     # 2. Batch Embedding (IMPORTANT)
     # ---------------------------------------
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+    def embed_batch(self, texts: List[str], progress_callback=None) -> List[List[float]]:
         """
         Generate embeddings for multiple texts efficiently.
+        progress_callback: Optional callable that receives (current_batch, total_batches)
         """
 
         if not texts or not isinstance(texts, list):
@@ -122,7 +123,14 @@ class EmbeddingService:
 
         if len(clean_texts) > self.batch_size:
             embeddings = []
+            total_batches = (len(clean_texts) + self.batch_size - 1) // self.batch_size
+            current_batch = 0
+            
             for start in range(0, len(clean_texts), self.batch_size):
+                current_batch += 1
+                if progress_callback:
+                    progress_callback(current_batch, total_batches)
+                    
                 batch = clean_texts[start:start + self.batch_size]
                 embeddings.extend(self.embed_batch(batch))
             return embeddings
@@ -260,5 +268,5 @@ def get_embedding(text: str, db: Session) -> List[float]:
     return EmbeddingService(db).embed(text)
 
 
-def get_embeddings(texts: List[str], db: Session) -> List[List[float]]:
-    return EmbeddingService(db).embed_batch(texts)
+def get_embeddings(texts: List[str], db: Session, progress_callback=None) -> List[List[float]]:
+    return EmbeddingService(db).embed_batch(texts, progress_callback=progress_callback)
