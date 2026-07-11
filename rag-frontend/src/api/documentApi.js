@@ -1,10 +1,12 @@
 import { API_BASE } from "./chatApi";
 import { getAdminToken } from "../utils/adminAuth";
 
-export async function uploadDocument(file, onProgress, onStatus, strategy = "auto") {
+export async function uploadDocument(file, onProgress, onStatus, strategy = "auto", programme = null, year = null) {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("strategy", strategy);
+    if (programme) formData.append("programme", programme);
+    if (year !== null && year !== undefined) formData.append("year", String(year));
 
     const headers = {};
     const token = getAdminToken();
@@ -113,5 +115,11 @@ export function deleteDocumentsBatch(ids) {
     return requestDocument(`/documents/delete-batch`, {
         method: "POST",
         body: JSON.stringify(ids),
+    });
+}
+
+export function reindexDocument(id) {
+    return requestDocument(`/documents/${encodeURIComponent(id)}/reindex`, {
+        method: "POST",
     });
 }

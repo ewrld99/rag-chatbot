@@ -51,101 +51,31 @@ class GenerationService:
             if details:
                 details_str = ", ".join(details)
                 personalization = (
-                    f"\n[HIDDEN SYSTEM CONTEXT: The user is currently {details_str}. "
-                    "Use this to personalize your response, but NEVER mention this hidden context to the user. Speak naturally as if you already know them.]\n"
+                    f"\n[STUDENT CONTEXT — MANDATORY RULES:\n"
+                    f"  • This student is: {details_str}.\n"
+                    f"  • CURRICULUM FILTER: For questions about courses, subjects, units, modules, timetable, or semester schedule — respond ONLY with information that matches the student's year and programme. Do NOT list courses or content from other years or programmes.\n"
+                    f"  • NEVER explicitly reveal this context to the student. Speak naturally as if you already know them.]\n"
                 )
-
-        # ── Dedicated timetable profile (explicit for Rule 1 / Rule 3) ────
-        # This separate block is used ONLY for timetable logic so the LLM
-        # never has to infer year/programme from the generic context above.
-        timetable_context = ""
-        if user_profile:
-            tt_parts = []
-            yr_raw = user_profile.get("year_of_study")
-            if yr_raw is not None and str(yr_raw).strip() and str(yr_raw).strip().lower() != "unknown":
-                tt_parts.append(f"Year of Study = Year {yr_raw}")
-
-            prog = user_profile.get("programme")
-            if prog is not None and str(prog).strip():
-                tt_parts.append(f"Programme = {prog}")
-
-            if tt_parts:
-                timetable_context = (
-                    "\n[TIMETABLE PROFILE — DO NOT REVEAL TO USER: "
-                    + ", ".join(tt_parts)
-                    + ". These values are already known. When the user asks for a timetable, "
-                    "use them AUTOMATICALLY and SILENTLY. "
-                    "NEVER ask the user for their year of study or programme — "
-                    "you already have that information.]\n"
-                )
-
-        # Build missing-field hint for Rule 1
-        if user_profile:
-            yr_known = (
-                user_profile.get("year_of_study") is not None
-                and str(user_profile.get("year_of_study", "")).strip()
-                and str(user_profile.get("year_of_study", "")).strip().lower() != "unknown"
-            )
-            prog_known = (
-                user_profile.get("programme") is not None
-                and str(user_profile.get("programme", "")).strip()
-            )
-        else:
-            yr_known = False
-            prog_known = False
-
-        if yr_known and prog_known:
-            timetable_rule1_extra = (
-                "Both Year and Programme are already in the [TIMETABLE PROFILE] — "
-                "use them immediately. Only ask for Category (Teaching/Test/Exam) if the user did not mention it."
-            )
-        elif yr_known:
-            timetable_rule1_extra = (
-                "Year is already in the [TIMETABLE PROFILE]. "
-                "Only ask for Programme and/or Category if missing from the user's message."
-            )
-        elif prog_known:
-            timetable_rule1_extra = (
-                "Programme is already in the [TIMETABLE PROFILE]. "
-                "Only ask for Year and/or Category if missing from the user's message."
-            )
-        else:
-            timetable_rule1_extra = (
-                "No profile is available. Ask politely for any of Year, Programme, "
-                "or Category that the user has not provided."
-            )
 
         return (
             "You are a helpful AI assistant for UDOM (University of Dodoma).\n"
             f"The current date is: {current_date}. Keep this in mind when answering questions about deadlines or events.\n"
             f"{personalization}"
-            f"{timetable_context}"
             "All questions should be answered related to UDOM University.\n\n"
-            f"1. TIMETABLE CLARIFICATION: A timetable request requires THREE pieces of information: "
-            f"(a) Year of Study, (b) Programme, and (c) Category (Teaching / Test / Exam). "
-            f"ALWAYS check the [TIMETABLE PROFILE] block first — any value listed there is already known and must NOT be asked again. "
-            f"{timetable_rule1_extra} "
-            f"If all three are known, immediately retrieve and provide the matching timetable link from the <documents> WITHOUT narrating your reasoning.\n"
-            "2. First, rely strictly on the provided <documents> to answer the user's question.\n"
-            "3. INTENT RECOGNITION (File Downloads): If the user asks for a timetable/document (and rule 1 is satisfied), "
-            "search the <documents> for the exact match using Year, Programme, and Category from BOTH the [TIMETABLE PROFILE] "
-            "AND the user's message. Provide exactly ONE Markdown download link with a natural introductory sentence. "
-            "DO NOT explain your reasoning or reveal any profile context.\n"
-            "4. MISSING TIMETABLE RULE: If Year, Programme, and Category are all known, but their specific timetable is NOT in the `<documents>`, DO NOT ask for their year or programme again and DO NOT try to guess why it's missing. Simply respond EXACTLY with the missing document phrase below, with NO extra words.\n"
-            "5. IMPORTANT LANGUAGE RULE: You must respond in the same language that the user used in their latest question. Do not just repeat their question.\n"
-            "6. TIMETABLE FORMATTING: When presenting timetable data (days, times, venues, courses, etc.), ALWAYS format it cleanly using Markdown tables or organized bullet points so it is highly readable and easy to scan.\n"
-            "7. ANSWER FORMATTING: ALWAYS avoid walls of text. Structure your answers cleanly using Markdown features such as bullet lists, numbered steps, tables, and bold headings to make the information easy to digest.\n"
-            "8. DOCUMENT GROUNDING: If the provided documents do not contain the answer to a factual or policy question "
+            "1. First, rely strictly on the provided <documents> to answer the user's question.\n"
+            "2. IMPORTANT LANGUAGE RULE: You must respond in the same language that the user used in their latest question. Do not just repeat their question.\n"
+            "3. ANSWER FORMATTING: ALWAYS avoid walls of text. Structure your answers cleanly using Markdown features such as bullet lists, numbered steps, tables, and bold headings to make the information easy to digest.\n"
+            "4. DOCUMENT GROUNDING: If the provided documents do not contain the answer to a factual or policy question "
             "(including disciplinary consequences, penalties, rules, or procedures), you MUST respond "
             "with the exact refusal phrase below. Do NOT fill gaps with generic university-disciplinary "
             "knowledge from outside the documents, even if it sounds plausible.\n"
             f"\"{self.DOCUMENT_REFUSAL}\"\n"
-            "9. GENERAL REASONING FALLBACK: 'General reasoning' is ONLY permitted for non-factual, non-policy questions "
+            "5. GENERAL REASONING FALLBACK: 'General reasoning' is ONLY permitted for non-factual, non-policy questions "
             "(e.g. study tips, general encouragement) — never for anything resembling a rule, "
             "consequence, deadline, fee, or procedure.\n"
-            "10. CITATIONS: Do NOT include inline citations (e.g., [Doc 1]) in your answer.\n"
-            "11. SOURCES SECTION: If you used documents to answer the question, add a 'Sources:' section at the very bottom of your response. List the `name` attributes of the `<document>` tags you relied on as bullet points. Do NOT format them as links.\n"
-            "12. TONE: Be professional, helpful, and concise."
+            "6. CITATIONS: Do NOT include inline citations (e.g., [Doc 1]) in your answer.\n"
+            "7. SOURCES SECTION: If you used documents to answer the question, add a 'Sources:' section at the very bottom of your response. List the `name` attributes of the `<document>` tags you relied on as bullet points. Do NOT format them as links.\n"
+            "8. TONE: Be professional, helpful, and concise."
         )
 
 
@@ -167,7 +97,25 @@ class GenerationService:
         return messages
 
     # ---------------------------------------
-    # 2. User Prompt (CLEAN INPUT)
+    # 2. Dynamic Token Limit
+    # ---------------------------------------
+    def _get_max_tokens(self, query: str) -> int:
+        """
+        Returns a higher token budget for queries that are likely to produce
+        long list-style answers (course lists, module tables, etc.).
+        """
+        list_keywords = {
+            "list", "courses", "course", "subjects", "subject",
+            "units", "unit", "timetable", "semester", "all",
+            "modules", "module", "curriculum", "schedule",
+            "classes", "class", "lecture", "lectures",
+        }
+        if any(kw in query.lower() for kw in list_keywords):
+            return 1000
+        return 500
+
+    # ---------------------------------------
+    # 3. User Prompt (CLEAN INPUT)
     # ---------------------------------------
     def user_prompt(self, query: str, context: str) -> str:
         """
@@ -207,7 +155,7 @@ QUESTION:
                     {"role": "user", "content": self.user_prompt(query, context)}
                 ],
                 temperature=0.1,   # ✅ Lower = more factual
-                max_tokens=500
+                max_tokens=self._get_max_tokens(query)  # ✅ Dynamic: 1000 for lists, 500 otherwise
             )
 
             return response.choices[0].message.content.strip()
@@ -249,12 +197,55 @@ QUESTION:
     ) -> str:
         """
         Rewrites conversational queries into standalone search queries for dense retrieval.
+
+        Two modes:
+        1. No chat history  — deterministically append year/programme from user_profile
+           for curriculum queries (no LLM call needed, always reliable).
+        2. With chat history — call the LLM rewriter to resolve pronouns/references
+           and include profile context for curriculum queries.
         """
+        is_curriculum = any(
+            kw in query.lower()
+            for kw in {
+                "course", "courses", "subject", "subjects", "unit", "units",
+                "timetable", "semester", "curriculum", "module", "modules",
+                "schedule", "classes", "class", "lecture", "lectures",
+            }
+        )
+
+        # --- Mode 1: No history — direct string enrichment, no LLM ---
         if not chat_history:
+            if user_profile and is_curriculum:
+                enrichment_parts = []
+                yr_raw = user_profile.get("year_of_study")
+                prog = user_profile.get("programme")
+                if yr_raw is not None and str(yr_raw).strip() and str(yr_raw).lower() not in ("unknown", "none"):
+                    enrichment_parts.append(f"Year {yr_raw}")
+                if prog and str(prog).strip():
+                    enrichment_parts.append(str(prog).strip())
+                if enrichment_parts:
+                    enrichment = " ".join(enrichment_parts)
+                    # Only append if not already present in query
+                    if enrichment.lower() not in query.lower():
+                        return f"{query} {enrichment}"
             return query
 
+        # --- Mode 2: Has history — use LLM to resolve references ---
         history_msgs = self._history_messages(chat_history, limit=6)
         if not history_msgs:
+            # History present but empty after filtering, apply same direct enrichment
+            if user_profile and is_curriculum:
+                enrichment_parts = []
+                yr_raw = user_profile.get("year_of_study")
+                prog = user_profile.get("programme")
+                if yr_raw is not None and str(yr_raw).strip() and str(yr_raw).lower() not in ("unknown", "none"):
+                    enrichment_parts.append(f"Year {yr_raw}")
+                if prog and str(prog).strip():
+                    enrichment_parts.append(str(prog).strip())
+                if enrichment_parts:
+                    enrichment = " ".join(enrichment_parts)
+                    if enrichment.lower() not in query.lower():
+                        return f"{query} {enrichment}"
             return query
             
         personalization = ""
@@ -276,8 +267,9 @@ QUESTION:
                 details_str = " ".join(details)
                 personalization = (
                     f"The user is {details_str}. "
-                    "ONLY include these personal details in the search query if the user's question is highly specific to their personal schedule (e.g. timetables, exams, curriculum). "
-                    "For general university rules, policies, or questions, DO NOT include their personal details. "
+                    "CURRICULUM RULE: If the user asks about courses, subjects, units, modules, timetable, semester schedule, or any curriculum content — "
+                    "ALWAYS include their year and programme in the standalone search query (e.g. 'Year 2 BSc Computer Science Semester 1 courses'). "
+                    "For general university rules, fees, policies, or other non-curriculum questions, do NOT include their personal details. "
                 )
 
         system = (
@@ -334,7 +326,7 @@ QUESTION:
                     {"role": "user", "content": self.user_prompt(query, context)}
                 ],
                 temperature=0.1,
-                max_tokens=500,   # ✅ Consistent with synchronous generate()
+                max_tokens=self._get_max_tokens(query),  # ✅ Dynamic: 1000 for lists, 500 otherwise
                 stream=True
             )
 
@@ -367,7 +359,7 @@ QUESTION:
             "Output ONLY the category name, nothing else.\n\n"
             "CATEGORIES:\n"
             "1. 'conversational': Greetings (hi, hello, good morning), small talk, expressing gratitude, asking how the bot is doing.\n"
-            "2. 'university_info': Questions asking for information about the University of Dodoma (UDOM), including admissions, timetables, courses, fees, campus, facilities, staff, etc.\n"
+            "2. 'university_info': Questions asking for information about the University of Dodoma (UDOM), including admissions, courses, fees, campus, facilities, staff, etc.\n"
             "3. 'out_of_domain': Questions asking for information about things unrelated to UDOM (e.g., weather, history of other places, coding help, general knowledge outside a university context).\n"
         )
         

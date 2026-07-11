@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { deleteDocument, getDocuments, getDocument, updateDocument, deleteDocumentsBatch } from "../../api/documentApi";
+import { deleteDocument, getDocuments, getDocument, updateDocument, deleteDocumentsBatch, reindexDocument } from "../../api/documentApi";
 import { reindexAll } from "../../api/settingsApi";
 
 const emptyForm = { content: "", filename: "" };
@@ -278,7 +278,7 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const handleReindexAll = async () => {
         setIsReindexing(true);
         try {
-            const result = await reindexAll();
+            const result = await reindexAll(!hasNeedsReindex);
             setStatus(result.message || "Reindex started.");
             setStatusType("success");
             await loadDocuments({ clearStatus: false });
@@ -291,7 +291,21 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         }
     };
 
+    const handleReindexSingle = async (doc) => {
+        try {
+            const result = await reindexDocument(doc.id);
+            setStatus(result.message || "Reindex started.");
+            setStatusType("success");
+            await loadDocuments({ clearStatus: false });
+            onChanged?.();
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        }
+    };
+
     const hasNeedsReindex = documents.some((d) => d.status === "needs_reindex");
+    const isProcessing = documents.some((d) => d.status === "processing");
 
     return (
         <section style={styles.page}>
@@ -323,14 +337,17 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                         type="button"
                         style={{
                             ...styles.reindexBtn,
-                            ...(isReindexing ? styles.disabledBtn : {}),
+                            ...((isReindexing || isProcessing) ? styles.disabledBtn : {}),
+                            ...(hasNeedsReindex ? { background: "#ffe0b2", borderColor: "#ffb74d", color: "#e65100" } : {})
                         }}
                         onClick={handleReindexAll}
-                        disabled={isReindexing}
+                        disabled={isReindexing || isProcessing}
                         id="btn-reindex-all"
                     >
                         <ReindexIcon />
-                        {isReindexing ? "Reindexing…" : "Reindex All"}
+                        {isReindexing || isProcessing
+                            ? "Reindexing…" 
+                            : hasNeedsReindex ? "Reindex Pending" : "Reindex All"}
                     </button>
                     <button
                         type="button"
@@ -497,6 +514,21 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                                 <p style={{ ...styles.docRowPreview, ...(isNarrow ? styles.docRowPreviewNarrow : {}) }}>{doc.content}</p>
                             </div>
                             <div style={{ ...styles.docRowActions, ...(isNarrow ? styles.docRowActionsNarrow : {}) }}>
+                                <button
+                                    type="button"
+                                    style={{ 
+                                        ...styles.ghostBtn, 
+                                        ...(isNarrow ? styles.editBtnNarrow : {}), 
+                                        padding: "6px 10px", 
+                                        fontSize: "12px",
+                                        ...(doc.status === "processing" ? styles.disabledBtn : {})
+                                    }}
+                                    onClick={() => handleReindexSingle(doc)}
+                                    disabled={doc.status === "processing"}
+                                >
+                                    <ReindexIcon />
+                                    {doc.status === "processing" ? "Reindexing…" : "Reindex"}
+                                </button>
                                 <button
                                     type="button"
                                     style={{ ...styles.editBtn, ...(isNarrow ? styles.editBtnNarrow : {}) }}

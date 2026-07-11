@@ -153,6 +153,7 @@ class CrawlerQueue(Base):
     id = Column(Integer, primary_key=True, index=True)
     job_type = Column(Text, ForeignKey("crawler_jobs.job_type", ondelete="CASCADE"), nullable=False, index=True)
     url = Column(Text, nullable=False)
+    link_text = Column(Text, nullable=True)
     status = Column(Text, nullable=False, default="pending") # pending, processing, completed, failed
     
     from sqlalchemy import UniqueConstraint

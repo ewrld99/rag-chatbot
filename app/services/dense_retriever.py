@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 import logging
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import DocumentChunk, FAQModel
@@ -71,14 +72,18 @@ class DenseRetriever:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def retrieve(self, query: str, top_k: int = 20) -> list[DenseResult]:
+    def retrieve(self, query: str, top_k: int = 20, filters: dict | None = None) -> list[DenseResult]:
         """
         Embed *query* and return the *top_k* most similar chunks.
 
         Parameters
         ----------
-        query:  raw user query string
-        top_k:  maximum number of results to return
+        query:   raw user query string
+        top_k:   maximum number of results to return
+        filters: optional dict with keys 'programme' and/or 'year' to narrow
+                 results to chunks whose metadata matches.  Chunks without the
+                 metadata key are always included (graceful fallback for older
+                 ingested documents).
 
         Returns
         -------
@@ -90,18 +95,37 @@ class DenseRetriever:
         try:
             query_embedding = get_embedding(query, self.db)
 
-            # cosine_distance ∈ [0, 2]; smaller = more similar
-            rows = (
+            doc_query = (
                 self.db.query(
                     DocumentChunk,
                     DocumentChunk.embedding.cosine_distance(query_embedding).label("dist"),
                 )
                 .filter(DocumentChunk.document.has(status="active"))
                 .options(joinedload(DocumentChunk.document))
-                .order_by("dist")
-                .limit(top_k)
-                .all()
             )
+
+            # Apply optional metadata filters with graceful fallback:
+            # chunks missing the metadata key (NULL) are always included so
+            # old documents ingested without metadata are not silently dropped.
+            if filters:
+                programme = filters.get("programme")
+                year = filters.get("year")
+                if programme:
+                    doc_query = doc_query.filter(
+                        or_(
+                            DocumentChunk.metadata_["programme"].astext == str(programme),
+                            DocumentChunk.metadata_["programme"].astext.is_(None),
+                        )
+                    )
+                if year:
+                    doc_query = doc_query.filter(
+                        or_(
+                            DocumentChunk.metadata_["year"].astext == str(year),
+                            DocumentChunk.metadata_["year"].astext.is_(None),
+                        )
+                    )
+
+            rows = doc_query.order_by("dist").limit(top_k).all()
             
             faq_rows = (
                 self.db.query(

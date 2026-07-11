@@ -44,8 +44,8 @@ export function updateSetting(key, value) {
 }
 
 /** POST /api/admin/documents/reindex-all */
-export function reindexAll() {
-    return requestSettings("/documents/reindex-all", { method: "POST" });
+export function reindexAll(force = false) {
+    return requestSettings(`/documents/reindex-all${force ? "?force=true" : ""}`, { method: "POST" });
 }
 
 export function getCrawlerStatus() {

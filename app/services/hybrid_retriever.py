@@ -92,17 +92,20 @@ class HybridRetriever:
     # -----------------------------------------------------------------------
     # Core: RRF fusion, returns raw results
     # -----------------------------------------------------------------------
-    def retrieve_raw(self, query: str) -> list[RRFResult]:
+    def retrieve_raw(self, query: str, filters: dict | None = None) -> list[RRFResult]:
         """
         Run hybrid retrieval and return raw RRFResult objects.
         Used by the /query endpoint to expose full rank metadata.
+
+        Optional *filters* dict (keys: 'programme', 'year') is forwarded to
+        both the dense and sparse retrievers for metadata-based narrowing.
         """
         dense_r = DenseRetriever(self.db)
         sparse_r = SparseRetriever(self.db)
         rrf = ReciprocalRankFusion(k=self.rrf_k)
 
-        dense_results = dense_r.retrieve(query, top_k=self.dense_top_k)
-        sparse_results = sparse_r.retrieve(query, top_k=self.sparse_top_k)
+        dense_results = dense_r.retrieve(query, top_k=self.dense_top_k, filters=filters)
+        sparse_results = sparse_r.retrieve(query, top_k=self.sparse_top_k, filters=filters)
 
         logger.debug(
             "HybridRetriever: dense=%d sparse=%d query=%r",
@@ -135,10 +138,10 @@ class HybridRetriever:
     # -----------------------------------------------------------------------
     # LangChain-compatible public interfaces
     # -----------------------------------------------------------------------
-    def invoke(self, query: str, **kwargs: Any) -> list[Document]:
+    def invoke(self, query: str, filters: dict | None = None, **kwargs: Any) -> list[Document]:
         """LangChain standard retriever interface (v0.2+)."""
-        return [_rrf_to_langchain(r) for r in self.retrieve_raw(query)]
+        return [_rrf_to_langchain(r) for r in self.retrieve_raw(query, filters=filters)]
 
-    def get_relevant_documents(self, query: str, **kwargs: Any) -> list[Document]:
+    def get_relevant_documents(self, query: str, filters: dict | None = None, **kwargs: Any) -> list[Document]:
         """Legacy LangChain alias — delegates to invoke()."""
-        return self.invoke(query, **kwargs)
+        return self.invoke(query, filters=filters, **kwargs)

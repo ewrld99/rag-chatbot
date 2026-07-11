@@ -21,7 +21,6 @@ from app.schemas.document import DocumentCreate, DocumentResponse, DocumentUpdat
 from app.services.settings_service import SettingsService
 from app.schemas.settings import SystemSettingResponse, SystemSettingUpdate
 from app.services.faq_service import FAQService
-from app.services.timetable_fetcher import TimetableFetcherService, TimetableFetchError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -65,6 +64,7 @@ def rebuild_document_chunks(
     document: DocumentModel,
     content: str,
     db: Session,
+    extra_metadata: dict | None = None,
 ) -> None:
     settings_svc = SettingsService(db)
     chunk_size = settings_svc.chunk_size
@@ -102,6 +102,7 @@ def rebuild_document_chunks(
             chunk_index=i,
             chunk_text=chunk,
             embedding=embedding,
+            metadata_=extra_metadata or {},
         )
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
     ]
@@ -308,6 +309,8 @@ def update_setting(
 def upload_document(
     file: UploadFile = File(...),
     strategy: str = Form("auto"),
+    programme: Optional[str] = Form(None, description="Programme this document belongs to, e.g. 'BSc Computer Science'"),
+    year: Optional[int] = Form(None, description="Year of study this document applies to, e.g. 2"),
     db: Session = Depends(get_db)
 ):
     """
@@ -419,6 +422,14 @@ def upload_document(
             db.add(document)
             db.flush() 
             
+            # Build chunk metadata: always record ingestion time;
+            # include programme and year when provided by the uploader.
+            chunk_meta: dict = {}
+            if programme:
+                chunk_meta["programme"] = programme.strip()
+            if year is not None:
+                chunk_meta["year"] = str(year)
+
             db.bulk_insert_mappings(
                 DocumentChunk,
                 [
@@ -427,6 +438,7 @@ def upload_document(
                         "chunk_text": chunk,
                         "embedding": embedding,
                         "chunk_index": i,
+                        "metadata_": chunk_meta if chunk_meta else None,
                     }
                     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
                 ]
@@ -452,16 +464,18 @@ def upload_document(
 @router.post("/documents/reindex-all")
 def reindex_all_documents(
     background_tasks: BackgroundTasks,
+    force: bool = False,
     db: Session = Depends(get_db),
 ):
     """
-    Queue a background re-ingestion job for every document marked needs_reindex.
-    Returns immediately with the count of queued documents.
+    Queue a background re-ingestion job for documents.
+    If force is True, reindexes all documents. Otherwise, only those marked needs_reindex.
     """
-    documents = (
-        db.query(DocumentModel)
-        .all()
-    )
+    query = db.query(DocumentModel)
+    if not force:
+        query = query.filter(DocumentModel.status == "needs_reindex")
+    
+    documents = query.all()
 
     if not documents:
         return {"queued": 0, "message": "No documents require reindexing."}
@@ -476,6 +490,31 @@ def reindex_all_documents(
     background_tasks.add_task(_reindex_documents_task, doc_ids)
 
     return {"queued": len(doc_ids), "message": f"{len(doc_ids)} document(s) queued for reindexing."}
+
+@router.post("/documents/{document_id}/reindex")
+def reindex_single_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Queue a background re-ingestion job for a specific document.
+    """
+    try:
+        doc_uuid = UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID format")
+
+    doc = db.query(DocumentModel).filter(DocumentModel.id == doc_uuid).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc.status = "processing"
+    db.commit()
+
+    background_tasks.add_task(_reindex_documents_task, [str(doc.id)])
+
+    return {"message": f"Document '{doc.filename}' queued for reindexing."}
 
 
 def _reindex_documents_task(doc_ids: list[str]) -> None:
@@ -514,15 +553,28 @@ def _reindex_documents_task(doc_ids: list[str]) -> None:
                     continue
 
                 # Try to reload from the original file if it still exists
-                if document.file_path and document.file_path.endswith((".pdf", ".docx", ".txt")):
-                    try:
-                        file_ext = document.file_path.rsplit(".", 1)[-1].lower()
-                        content = load_document(document.file_path, file_ext)
-                    except Exception:
-                        # Fallback to reconstructing from stored chunk text
-                        content = "\n".join(c.chunk_text for c in existing_chunks)
-                else:
-                    content = "\n".join(c.chunk_text for c in existing_chunks)
+                target_file_path = document.file_path
+                if not target_file_path and document.filename:
+                    import os
+                    target_file_path = os.path.join("uploads", document.filename)
+
+                content = None
+                if target_file_path and target_file_path.endswith((".pdf", ".docx", ".txt")):
+                    import os
+                    if os.path.exists(target_file_path):
+                        try:
+                            file_ext = target_file_path.rsplit(".", 1)[-1].lower()
+                            content = load_document(target_file_path, file_ext)
+                        except Exception as e:
+                            logger.error(f"Reindex failed reading file {target_file_path}: {e}")
+                    else:
+                        logger.error(f"Reindex failed: file not found on disk at {target_file_path}")
+                
+                if not content:
+                    logger.warning("Reindex: document %s content could not be loaded, failing safely to avoid corruption", doc_id)
+                    document.status = "failed"
+                    db.commit()
+                    continue
 
                 if not content or not content.strip():
                     document.status = "failed"
@@ -656,221 +708,6 @@ def import_faqs(background_tasks: BackgroundTasks, file: UploadFile = File(...),
     background_tasks.add_task(_import_faqs_task, content, filename, admin_username)
     return {"message": "Import process started in the background."}
 
-
-# -----------------------------------------------
-# TIMETABLE FETCHER ROUTES
-# -----------------------------------------------
-
-class TimetableFetchRequest(BaseModel):
-    year: str
-    semester: str
-    category: str
-    option: str = "programme"  # programme | course | room | instructor
-    data: List[str]
-    label: Optional[str] = None  # Custom document label
-    strategy: str = "timetable"  # auto | fast | timetable
-
-
-@router.get("/timetable/years")
-def timetable_get_years(admin_username: str = Depends(require_admin)):
-    """Return static list of academic years."""
-    return [
-        {"value": "11", "label": "2024/2025"},
-        {"value": "12", "label": "2025/2026"},
-    ]
-
-
-@router.get("/timetable/semesters")
-def timetable_get_semesters(
-    year: str,
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin)
-):
-    """Proxy UDOM AJAX call to get semesters for a year."""
-    svc = TimetableFetcherService(db)
-    try:
-        return svc.get_semesters(year)
-    finally:
-        svc.close()
-
-
-@router.get("/timetable/categories")
-def timetable_get_categories(
-    year: str,
-    semester: str,
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin)
-):
-    """Proxy UDOM AJAX call to get timetable categories for a year + semester."""
-    svc = TimetableFetcherService(db)
-    try:
-        return svc.get_categories(year, semester)
-    finally:
-        svc.close()
-
-
-@router.get("/timetable/option-types")
-def timetable_get_option_types(
-    year: str,
-    semester: str,
-    category: str,
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin)
-):
-    """Proxy UDOM AJAX call to get download option types (By Programme / By Course / etc.)."""
-    svc = TimetableFetcherService(db)
-    try:
-        return svc.get_option_types(year, semester, category)
-    finally:
-        svc.close()
-
-
-@router.get("/timetable/data-options")
-def timetable_get_data_options(
-    year: str,
-    semester: str,
-    category: str,
-    option: str,
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin)
-):
-    """Proxy UDOM AJAX call to get programme/course/room/instructor list."""
-    svc = TimetableFetcherService(db)
-    try:
-        return svc.get_data_options(year, semester, category, option)
-    except TimetableFetchError as e:
-        raise HTTPException(status_code=e.status_code, detail=str(e))
-    finally:
-        svc.close()
-
-
-TIMETABLE_TASKS = {}
-
-
-def _fetch_timetable_task(
-    year: str,
-    semester: str,
-    category: str,
-    option: str,
-    data: List[str],
-    label: str,
-    admin_username: str,
-    strategy: str = "timetable",
-    task_id: str = None,
-):
-    """Background task: download PDF from UDOM and ingest into RAG pipeline."""
-    from app.db.session import SessionLocal
-    from app.db.models import User
-
-    db = SessionLocal()
-    svc = None
-    try:
-        admin_user = db.query(User).filter(User.username == admin_username).first()
-        admin_id = admin_user.id if admin_user else None
-
-        svc = TimetableFetcherService(db)
-        
-        # UDOM's site only generates a single PDF for the first ID if sent as an array.
-        # To batch download, we must iterate through each selected ID and fetch individually.
-        for index, data_id in enumerate(data):
-            try:
-                # Append an index if there are multiple to distinguish the documents
-                doc_label = f"{label} (Part {index+1})" if len(data) > 1 else label
-                
-                if task_id and task_id in TIMETABLE_TASKS:
-                    TIMETABLE_TASKS[task_id]["progress"] = {
-                        "message": f"Downloading PDF for {doc_label}...",
-                        "percentage": int((index / len(data)) * 100)
-                    }
-
-                def progress_cb(msg: str, step_pct: int):
-                    if task_id and task_id in TIMETABLE_TASKS:
-                        base_pct = int((index / len(data)) * 100)
-                        item_pct = int((step_pct / 100) * (100 / len(data)))
-                        TIMETABLE_TASKS[task_id]["progress"] = {
-                            "message": f"{msg} (Part {index+1}/{len(data)})",
-                            "percentage": base_pct + item_pct
-                        }
-
-                pdf_bytes = svc.download_pdf(year, semester, category, option, [data_id], progress_cb)
-                result = svc.ingest_pdf(pdf_bytes, doc_label, admin_id=admin_id, strategy=strategy, progress_cb=progress_cb)
-                logger.info("Timetable fetch+ingest completed for ID %s: %s", data_id, result)
-            except Exception as e:
-                logger.error("Failed to fetch/ingest timetable ID %s: %s", data_id, e)
-                if task_id and task_id in TIMETABLE_TASKS:
-                    TIMETABLE_TASKS[task_id]["status"] = "error"
-                    TIMETABLE_TASKS[task_id]["progress"] = {"message": f"Error: {e}", "percentage": 100}
-                    return
-                
-        if task_id and task_id in TIMETABLE_TASKS:
-            TIMETABLE_TASKS[task_id]["status"] = "success"
-            TIMETABLE_TASKS[task_id]["progress"] = {"message": "All timetables processed successfully.", "percentage": 100}
-            
-    except Exception as e:
-        logger.exception("Unexpected error during timetable batch fetch: %s", e)
-        if task_id and task_id in TIMETABLE_TASKS:
-            TIMETABLE_TASKS[task_id]["status"] = "error"
-            TIMETABLE_TASKS[task_id]["progress"] = {"message": f"Unexpected error: {e}", "percentage": 100}
-    finally:
-        if svc is not None:
-            svc.close()
-        db.close()
-
-
-@router.post("/timetable/fetch")
-def fetch_timetable(
-    payload: TimetableFetchRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin)
-):
-    """
-    Trigger background download + ingestion of a UDOM timetable PDF.
-    Returns immediately; the actual work runs asynchronously.
-    """
-    if not payload.data:
-        raise HTTPException(status_code=400, detail="At least one data selection is required.")
-
-    label = payload.label or f"Timetable {payload.year} Sem{payload.semester} {payload.option.title()}"
-
-    task_id = str(uuid4())
-    TIMETABLE_TASKS[task_id] = {
-        "status": "processing",
-        "progress": {
-            "message": "Starting fetch in background...",
-            "percentage": 0
-        }
-    }
-
-    background_tasks.add_task(
-        _fetch_timetable_task,
-        payload.year,
-        payload.semester,
-        payload.category,
-        payload.option,
-        payload.data,
-        label,
-        admin_username,
-        payload.strategy,
-        task_id,
-    )
-
-    return {
-        "message": "Timetable fetch started in background.",
-        "label": label,
-        "status": "processing",
-        "task_id": task_id,
-    }
-
-
-@router.get("/timetable/progress/{task_id}")
-def get_timetable_progress(
-    task_id: str,
-    admin_username: str = Depends(require_admin)
-):
-    if task_id not in TIMETABLE_TASKS:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return TIMETABLE_TASKS[task_id]
 
 # -----------------------------------------------
 # CRAWLER ROUTES

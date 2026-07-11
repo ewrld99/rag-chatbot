@@ -50,6 +50,8 @@ export default function UploadCard({ onUploaded }) {
     const [progress, setProgress] = useState(0);
     const [statusType, setStatusType] = useState("");
     const [strategy, setStrategy] = useState("auto");
+    const [programme, setProgramme] = useState("");
+    const [year, setYear] = useState("");
 
     const fileMeta = useMemo(() => {
         if (!file) return "PDF, DOCX, TXT, or MD · up to your backend limit";
@@ -81,7 +83,7 @@ export default function UploadCard({ onUploaded }) {
         setStatusType("info");
         setProgress(8);
         try {
-            const res = await uploadDocument(file, setProgress, setMsg, strategy);
+            const res = await uploadDocument(file, setProgress, setMsg, strategy, programme.trim() || null, year ? parseInt(year) : null);
             setMsg(`✓ Uploaded ${res.filename} — ${res.chunks_stored ?? 0} searchable chunks added.`);
             setStatusType("success");
             setProgress(100);
@@ -152,6 +154,49 @@ export default function UploadCard({ onUploaded }) {
                         <option value="auto">Advanced (High-fidelity tables via pdfplumber)</option>
                         <option value="fast">Fast (Raw text via pypdf - best for long books)</option>
                     </select>
+                </div>
+            )}
+
+            {/* Programme & Year metadata — optional, shown when a file is selected */}
+            {file && (
+                <div style={styles.metaContainer}>
+                    <p style={styles.metaHint}>
+                        <strong>Optional:</strong> Tag this document with a programme and year so the chatbot can filter search results to the right students.
+                    </p>
+                    <div style={styles.metaRow}>
+                        <div style={styles.metaField}>
+                            <label style={styles.strategyLabel} htmlFor="meta-programme">
+                                Programme
+                            </label>
+                            <input
+                                id="meta-programme"
+                                type="text"
+                                placeholder="e.g. BCom Accounting"
+                                value={programme}
+                                onChange={(e) => setProgramme(e.target.value)}
+                                style={styles.metaInput}
+                                disabled={isUploading}
+                            />
+                        </div>
+                        <div style={styles.metaField}>
+                            <label style={styles.strategyLabel} htmlFor="meta-year">
+                                Year of Study
+                            </label>
+                            <select
+                                id="meta-year"
+                                value={year}
+                                onChange={(e) => setYear(e.target.value)}
+                                style={styles.strategySelect}
+                                disabled={isUploading}
+                            >
+                                <option value="">All years</option>
+                                <option value="1">Year 1</option>
+                                <option value="2">Year 2</option>
+                                <option value="3">Year 3</option>
+                                <option value="4">Year 4</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
             )}
 
@@ -296,6 +341,40 @@ const styles = {
         display: "flex",
         flexDirection: "column",
         gap: "6px",
+    },
+    metaContainer: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "10px",
+        padding: "14px",
+        borderRadius: "12px",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border)",
+    },
+    metaHint: {
+        margin: 0,
+        fontSize: "12px",
+        color: "var(--app-muted)",
+        lineHeight: 1.5,
+    },
+    metaRow: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: "12px",
+    },
+    metaField: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "6px",
+    },
+    metaInput: {
+        padding: "10px 12px",
+        borderRadius: "10px",
+        border: "1px solid var(--app-border-strong)",
+        background: "#ffffff",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        outline: "none",
     },
     strategyLabel: {
         fontSize: "12px",

@@ -58,7 +58,7 @@ class RetrievalService:
     # -----------------------------------------------------------------------
     # 2. Retrieve Documents
     # -----------------------------------------------------------------------
-    def retrieve(self, query: str) -> List[Document]:
+    def retrieve(self, query: str, filters: Dict[str, Any] | None = None) -> List[Document]:
         """
         Full hybrid retrieval pipeline → LangChain Documents.
 
@@ -66,18 +66,22 @@ class RetrievalService:
           1. Dense  (pgvector cosine)
           2. Sparse (PostgreSQL FTS)
           3. RRF fusion
+
+        Optional *filters* (keys: 'programme', 'year') narrow results to
+        chunks whose JSONB metadata matches. Old chunks without the key
+        are still included (IS NULL fallback).
         """
-        return self._hybrid.get_relevant_documents(query)
+        return self._hybrid.get_relevant_documents(query, filters=filters)
 
     # -----------------------------------------------------------------------
     # 3. Retrieve with Scores (returns cosine-like rrf_score for compatibility)
     # -----------------------------------------------------------------------
-    def retrieve_with_scores(self, query: str) -> List[Tuple[Document, float]]:
+    def retrieve_with_scores(self, query: str, filters: Dict[str, Any] | None = None) -> List[Tuple[Document, float]]:
         """
         Returns (Document, rrf_score) pairs.
         rrf_score replaces the old cosine distance score.
         """
-        raw = self._hybrid.retrieve_raw(query)
+        raw = self._hybrid.retrieve_raw(query, filters=filters)
         output: List[Tuple[Document, float]] = []
 
         for result in raw:
@@ -157,9 +161,9 @@ class RetrievalService:
     # -----------------------------------------------------------------------
     # 5. Full Pipeline
     # -----------------------------------------------------------------------
-    def get_context(self, query: str) -> Dict[str, Any]:
+    def get_context(self, query: str, filters: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """End-to-end retrieval pipeline — unchanged interface."""
-        docs = self.retrieve(query)
+        docs = self.retrieve(query, filters=filters)
         context = self.format_context(docs)
         return {
             "query": query,

@@ -136,9 +136,13 @@ class SparseRetriever:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def retrieve(self, query: str, top_k: int = 20) -> list[SparseResult]:
+    def retrieve(self, query: str, top_k: int = 20, filters: dict | None = None) -> list[SparseResult]:
         """
         Run FTS and return the *top_k* best-matching chunks.
+
+        Optional *filters* dict supports keys 'programme' and 'year'.
+        Matching uses an IS NULL fallback so old chunks without metadata
+        are never silently excluded (graceful degradation).
 
         Returns an empty list (never raises) when:
           - the query is blank / produces no tsquery tokens
@@ -148,17 +152,57 @@ class SparseRetriever:
         if not query or not query.strip():
             return []
 
+        # Build optional SQL filter clauses.
+        # Only clause *structure* is injected via f-string; actual values are
+        # bound parameters — no SQL injection risk.
+        params: dict = {"query": query.strip(), "top_k": top_k}
+        prog_clause = ""
+        year_clause = ""
+
+        if filters:
+            programme = filters.get("programme")
+            year = filters.get("year")
+            if programme:
+                prog_clause = "AND (dc.metadata->>'programme' = :programme OR dc.metadata->>'programme' IS NULL)"
+                params["programme"] = str(programme)
+            if year:
+                year_clause = "AND (dc.metadata->>'year' = :year OR dc.metadata->>'year' IS NULL)"
+                params["year"] = str(year)
+
+        fts_sql = text(f"""
+            SELECT
+                dc.id::text                                     AS chunk_id,
+                d.id::text                                      AS document_id,
+                d.filename                                      AS source,
+                dc.chunk_text                                   AS text,
+                dc.chunk_index                                  AS chunk_index,
+                GREATEST(
+                    ts_rank_cd(dc.tsv, tsq_s, 34),
+                    ts_rank_cd(dc.tsv, tsq_e, 34)
+                )                                               AS fts_score
+            FROM
+                document_chunks dc
+            JOIN
+                documents d ON d.id = dc.document_id,
+                websearch_to_tsquery('simple',  :query) AS tsq_s,
+                websearch_to_tsquery('english', :query) AS tsq_e
+            WHERE
+                (dc.tsv @@ tsq_s OR dc.tsv @@ tsq_e)
+                AND d.status = 'active'
+                {prog_clause}
+                {year_clause}
+            ORDER BY
+                fts_score DESC
+            LIMIT :top_k
+        """)
+
         try:
-            rows = self.db.execute(
-                _FTS_QUERY,
-                {"query": query.strip(), "top_k": top_k},
-            ).fetchall()
-            
+            rows = self.db.execute(fts_sql, params).fetchall()
+
             faq_rows = self.db.execute(
                 _FTS_FAQ_QUERY,
                 {"query": query.strip(), "top_k": top_k},
             ).fetchall()
-            
         except Exception as exc:
             # Graceful degradation: FTS failure never kills the pipeline
             logger.warning("SparseRetriever FTS query failed: %s", exc)

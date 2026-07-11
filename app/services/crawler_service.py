@@ -73,6 +73,19 @@ class CrawlerService:
             self.db.commit()
             self.db.refresh(self.system_user)
 
+        # Self-healing migration for link_text column
+        from sqlalchemy import inspect, text
+        inspector = inspect(self.db.bind)
+        columns = [c['name'] for c in inspector.get_columns('crawler_queue')]
+        if 'link_text' not in columns:
+            try:
+                self.db.execute(text("ALTER TABLE crawler_queue ADD COLUMN link_text TEXT"))
+                self.db.commit()
+                logger.info("Successfully added link_text column to crawler_queue")
+            except Exception as e:
+                self.db.rollback()
+                logger.error(f"Failed to add link_text column: {e}")
+
     def process_external_link(self, url: str, found_on: str, db: Session):
         exists = db.query(ExternalLinkModel).filter(ExternalLinkModel.url == url).first()
         if not exists:
@@ -100,25 +113,28 @@ class CrawlerService:
             logger.info(f"PDF {url} has not changed. Skipping.")
             return
 
-        filename = os.path.basename(urlparse(url).path)
-        if title_hint:
-            import re
-            safe_title = re.sub(r'[^a-zA-Z0-9_\- ]', '', title_hint).strip()
-            if safe_title:
-                filename = f"{safe_title[:50].replace(' ', '_')}.pdf"
+        if doc and doc.filename:
+            # Overwrite existing file to prevent duplicates
+            filename = doc.filename
+            os.makedirs("uploads", exist_ok=True)
+            file_path = os.path.join("uploads", filename)
+        else:
+            filename = os.path.basename(urlparse(url).path)
+            if title_hint:
+                import re
+                safe_title = re.sub(r'[^a-zA-Z0-9_\- ]', '', title_hint).strip()
+                if safe_title:
+                    filename = f"{safe_title[:50].replace(' ', '_')}.pdf"
+                    
+            if not filename.lower().endswith(".pdf"):
+                filename = "document.pdf"
                 
-        if not filename.lower().endswith(".pdf"):
-            filename = f"{uuid.uuid4().hex}.pdf"
+            # Use UUID to prevent race conditions during concurrent crawler runs
+            name_without_ext = os.path.splitext(filename)[0]
+            filename = f"{name_without_ext}_{uuid.uuid4().hex[:8]}.pdf"
             
-        os.makedirs("uploads", exist_ok=True)
-        file_path = os.path.join("uploads", filename)
-        
-        # Prevent overwrite
-        name_without_ext = os.path.splitext(filename)[0]
-        copy_index = 1
-        while os.path.exists(file_path):
-            file_path = os.path.join("uploads", f"{name_without_ext}_{copy_index}.pdf")
-            copy_index += 1
+            os.makedirs("uploads", exist_ok=True)
+            file_path = os.path.join("uploads", filename)
 
         with open(file_path, "wb") as f:
             f.write(content)
@@ -128,9 +144,9 @@ class CrawlerService:
             logger.warning(f"Could not extract text from {url}")
             return
             
-        self._embed_and_save(url, filename, text, file_hash, "pdf", db)
+        self._embed_and_save(url, filename, text, file_hash, "pdf", db, file_path=file_path)
 
-    def _embed_and_save(self, url: str, title: str, text: str, content_hash: str, category: str, db: Session):
+    def _embed_and_save(self, url: str, title: str, text: str, content_hash: str, category: str, db: Session, doc_metadata: dict | None = None, file_path: str = None):
         local_settings = SettingsService(db)
         chunk_size = local_settings.chunk_size
         chunk_overlap = local_settings.chunk_overlap
@@ -147,6 +163,7 @@ class CrawlerService:
             doc = DocumentModel(
                 title=title,
                 filename=title,
+                file_path=file_path,
                 source_url=url,
                 category=category,
                 uploaded_by=sys_user.id if sys_user else None,
@@ -157,18 +174,27 @@ class CrawlerService:
             db.flush()
         else:
             doc.title = title
+            doc.filename = title
+            if file_path:
+                doc.file_path = file_path
             doc.content_hash = content_hash
             doc.last_crawled_at = datetime.utcnow()
             db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
             db.flush()
-            
+
+        # Merge crawler-specific fields with any caller-supplied metadata
+        # (e.g. programme, year from future admin tooling).
+        base_meta = {"source_url": url, "crawled_at": datetime.utcnow().isoformat()}
+        if doc_metadata:
+            base_meta.update(doc_metadata)
+
         new_chunks = [
             DocumentChunk(
                 document_id=doc.id,
                 chunk_index=i,
                 chunk_text=chunk,
                 embedding=embedding,
-                metadata_={"source_url": url, "crawled_at": datetime.utcnow().isoformat()}
+                metadata_=base_meta
             )
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
         ]
@@ -331,9 +357,10 @@ class CrawlerService:
                 job = CrawlerJob(job_type=job_type, status="running", max_pages=max_pages, crawled_count=0)
                 db.add(job)
             else:
-                if job.status == "running":
+                if job.status == "running" and not reset:
                     logger.warning(f"Crawler {job_type} is already running. Skipping start.")
                     return
+                # Force reset if reset=True
                 job.status = "running"
                 job.max_pages = max_pages
                 if reset:
@@ -348,7 +375,7 @@ class CrawlerService:
             for url in start_urls:
                 existing = db.query(CrawlerQueue).filter_by(job_type=job_type, url=url).first()
                 if not existing:
-                    db.add(CrawlerQueue(job_type=job_type, url=url, status='pending'))
+                    db.add(CrawlerQueue(job_type=job_type, url=url, status='pending', link_text=""))
             db.commit()
 
         batch_size = 3
@@ -370,7 +397,7 @@ class CrawlerService:
                         if not pending_batch:
                             break
                             
-                        batch_data = [(item.url, "") for item in pending_batch]
+                        batch_data = [(item.url, item.link_text or "") for item in pending_batch]
                         batch_urls = [item.url for item in pending_batch]
                         
                         for item in pending_batch:
@@ -411,7 +438,7 @@ class CrawlerService:
                         for new_url, link_text in new_urls_dict.items():
                             existing = db.query(CrawlerQueue).filter_by(job_type=job_type, url=new_url).first()
                             if not existing:
-                                db.add(CrawlerQueue(job_type=job_type, url=new_url, status='pending'))
+                                db.add(CrawlerQueue(job_type=job_type, url=new_url, status='pending', link_text=link_text))
                                     
                         job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
                         if job:

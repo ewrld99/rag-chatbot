@@ -22,6 +22,19 @@ class RAGPipeline:
     def _should_fallback(self, answer: str) -> bool:
         return answer.strip() == self.document_refusal
 
+    def _is_curriculum_query(self, query: str) -> bool:
+        """
+        Returns True when the query is about courses, timetable, or curriculum.
+        Used to decide whether to inject the student's year/programme into
+        the retrieval filter so we only fetch relevant chunks.
+        """
+        keywords = {
+            "course", "courses", "subject", "subjects", "unit", "units",
+            "timetable", "semester", "curriculum", "module", "modules",
+            "schedule", "classes", "class", "lecture", "lectures",
+        }
+        return any(kw in query.lower() for kw in keywords)
+
     def _retrieval_query(
         self,
         query: str,
@@ -62,7 +75,37 @@ class RAGPipeline:
             }
 
         retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
-        retrieval_result = self.retrieval_service.get_context(retrieval_query)
+
+        # Safety-net: for curriculum queries, directly append year/programme to the
+        # retrieval string if not already there. This catches any case where the
+        # LLM rewriter didn't include profile context (e.g. skipped due to no history).
+        if user_profile and self._is_curriculum_query(query):
+            prog = user_profile.get("programme")
+            year = user_profile.get("year_of_study")
+            enrichment_parts = []
+            if year and str(year).lower() not in ("unknown", "none", ""):
+                enrichment_parts.append(f"Year {year}")
+            if prog and str(prog).strip():
+                enrichment_parts.append(str(prog).strip())
+            if enrichment_parts:
+                enrichment = " ".join(enrichment_parts)
+                if enrichment.lower() not in retrieval_query.lower():
+                    retrieval_query = f"{retrieval_query} {enrichment}"
+
+        # Build metadata filters for curriculum queries so retrieval fetches
+        # only chunks tagged with this student's programme and year.
+        retrieval_filters = None
+        if user_profile and self._is_curriculum_query(query):
+            prog = user_profile.get("programme")
+            year = user_profile.get("year_of_study")
+            if prog or (year and str(year).lower() not in ("unknown", "none", "")):
+                retrieval_filters = {}
+                if prog:
+                    retrieval_filters["programme"] = str(prog)
+                if year and str(year).lower() not in ("unknown", "none", ""):
+                    retrieval_filters["year"] = str(year)
+
+        retrieval_result = self.retrieval_service.get_context(retrieval_query, filters=retrieval_filters)
         context = retrieval_result["context"]
         documents = retrieval_result["documents"]
 
@@ -108,7 +151,36 @@ class RAGPipeline:
             return
 
         retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
-        retrieval_result = await run_in_threadpool(self.retrieval_service.get_context, retrieval_query)
+
+        # Safety-net: same direct enrichment as in run()
+        if user_profile and self._is_curriculum_query(query):
+            prog = user_profile.get("programme")
+            year = user_profile.get("year_of_study")
+            enrichment_parts = []
+            if year and str(year).lower() not in ("unknown", "none", ""):
+                enrichment_parts.append(f"Year {year}")
+            if prog and str(prog).strip():
+                enrichment_parts.append(str(prog).strip())
+            if enrichment_parts:
+                enrichment = " ".join(enrichment_parts)
+                if enrichment.lower() not in retrieval_query.lower():
+                    retrieval_query = f"{retrieval_query} {enrichment}"
+
+        # Same curriculum filter logic as in run()
+        retrieval_filters = None
+        if user_profile and self._is_curriculum_query(query):
+            prog = user_profile.get("programme")
+            year = user_profile.get("year_of_study")
+            if prog or (year and str(year).lower() not in ("unknown", "none", "")):
+                retrieval_filters = {}
+                if prog:
+                    retrieval_filters["programme"] = str(prog)
+                if year and str(year).lower() not in ("unknown", "none", ""):
+                    retrieval_filters["year"] = str(year)
+
+        retrieval_result = await run_in_threadpool(
+            self.retrieval_service.get_context, retrieval_query, retrieval_filters
+        )
         context = retrieval_result["context"]
 
         if self._is_empty_context(context):
@@ -154,7 +226,20 @@ class RAGPipeline:
             }
 
         retrieval_query = self._retrieval_query(query, chat_history, user_profile=user_profile)
-        scored_docs = self.retrieval_service.retrieve_with_scores(retrieval_query)
+
+        # Same curriculum filter logic
+        retrieval_filters = None
+        if user_profile and self._is_curriculum_query(query):
+            prog = user_profile.get("programme")
+            year = user_profile.get("year_of_study")
+            if prog or (year and str(year).lower() not in ("unknown", "none", "")):
+                retrieval_filters = {}
+                if prog:
+                    retrieval_filters["programme"] = str(prog)
+                if year and str(year).lower() not in ("unknown", "none", ""):
+                    retrieval_filters["year"] = str(year)
+
+        scored_docs = self.retrieval_service.retrieve_with_scores(retrieval_query, filters=retrieval_filters)
 
         documents = []
         debug_info = []
