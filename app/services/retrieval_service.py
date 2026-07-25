@@ -14,15 +14,19 @@ Fusion (RRF).
 
 from __future__ import annotations
 
-import os
+from html import escape
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.documents import Document
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.services.alias_expansion_service import AliasExpansionService
 from app.services.embedding_service import get_embedding
+from app.services.grounding_service import GroundingService
 from app.services.hybrid_retriever import HybridRetriever
+from app.services.reranker_service import RerankService
+from app.services.source_service import document_name
+from app.services.settings_service import SettingsService
 
 
 class RetrievalService:
@@ -39,13 +43,15 @@ class RetrievalService:
         top_k: int = 5,
     ) -> None:
         self.db = db
-        self.top_k = top_k
+        self._settings = SettingsService(db)
+        self.top_k = top_k if top_k is not None else self._settings.top_k_final
+        self._reranker = RerankService()
         self._hybrid = HybridRetriever(
             db=db,
-            top_k=top_k,
-            dense_top_k=settings.DENSE_TOP_K,
-            sparse_top_k=settings.SPARSE_TOP_K,
-            rrf_k=settings.RRF_K,
+            top_k=self.top_k,
+            dense_top_k=self._settings.top_k_dense,
+            sparse_top_k=self._settings.top_k_sparse,
+            rrf_k=self._settings.rrf_k,
         )
 
     # -----------------------------------------------------------------------
@@ -66,11 +72,34 @@ class RetrievalService:
           1. Dense  (pgvector cosine)
           2. Sparse (PostgreSQL FTS)
           3. RRF fusion
+          4. Reranking (Jina when configured, local lexical fallback otherwise)
 
         Optional *filters* (keys: 'programme', 'year') narrow results to
         chunks whose JSONB metadata matches. Old chunks without the key
         are still included (IS NULL fallback).
         """
+        if self._settings.enable_reranker:
+            # Give the reranker the full fused pool from both retrievers.
+            # Using only DENSE_TOP_K discards strong sparse-only candidates before
+            # Jina ever sees them. The union can be up to DENSE_TOP_K + SPARSE_TOP_K
+            # unique chunks after RRF deduplication.
+            pool_size = self._settings.top_k_dense + self._settings.top_k_sparse
+            alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+            raw = self._hybrid.retrieve_raw(
+                query,
+                filters=filters,
+                pool_size=pool_size,
+                include_neighbors=False,
+            )
+            reranked = self._reranker.rerank(
+                query,
+                raw,
+                top_k=self.top_k,
+                alias_expansions=alias_expansions,
+            )
+            reranked = self._hybrid.expand_neighbor_chunks(reranked)
+            from app.services.hybrid_retriever import _rrf_to_langchain
+            return [_rrf_to_langchain(r) for r in reranked]
         return self._hybrid.get_relevant_documents(query, filters=filters)
 
     # -----------------------------------------------------------------------
@@ -78,17 +107,35 @@ class RetrievalService:
     # -----------------------------------------------------------------------
     def retrieve_with_scores(self, query: str, filters: Dict[str, Any] | None = None) -> List[Tuple[Document, float]]:
         """
-        Returns (Document, rrf_score) pairs.
-        rrf_score replaces the old cosine distance score.
+        Returns (Document, score) pairs.
+        Score is the Jina relevance score (if reranker is on) or RRF score.
         """
-        raw = self._hybrid.retrieve_raw(query, filters=filters)
-        output: List[Tuple[Document, float]] = []
+        if self._settings.enable_reranker:
+            pool_size = self._settings.top_k_dense + self._settings.top_k_sparse
+            alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+            raw = self._hybrid.retrieve_raw(
+                query,
+                filters=filters,
+                pool_size=pool_size,
+                include_neighbors=False,
+            )
+            raw = self._reranker.rerank(
+                query,
+                raw,
+                top_k=self.top_k,
+                alias_expansions=alias_expansions,
+            )
+            raw = self._hybrid.expand_neighbor_chunks(raw)
+        else:
+            raw = self._hybrid.retrieve_raw(query, filters=filters)
 
+        output: List[Tuple[Document, float]] = []
         for result in raw:
             doc = Document(
                 page_content=result.text,
                 metadata={
                     **result.metadata,
+                    "document_id": result.document_id,
                     "chunk_id": result.chunk_id,
                     "rrf_score": result.rrf_score,
                     "dense_rank": result.dense_rank,
@@ -96,54 +143,54 @@ class RetrievalService:
                     "retrieval_sources": result.retrieval_sources,
                 },
             )
-            output.append((doc, result.rrf_score))
+            score = result.metadata.get("rerank_score", result.rrf_score)
+            output.append((doc, score))
 
         return output
 
     # -----------------------------------------------------------------------
     # 4. Format Context
     # -----------------------------------------------------------------------
-    def format_context(self, documents: List[Document], max_chars: int = 12000) -> str:
-        """Convert retrieved documents into structured LLM context."""
+    def format_context(self, documents: List[Document], max_chars: int | None = None) -> str:
+        """Convert retrieved documents into structured LLM context.
+
+        max_chars defaults to top_k_final * 2400 so the budget automatically
+        scales when the admin increases the number of retrieved chunks.
+        """
         if not documents:
             return "No relevant context found."
 
+        # Scale budget with the configured top-k rather than using a hard constant.
+        if max_chars is None:
+            max_chars = self._settings.top_k_final * 2400
+
         formatted_chunks: List[str] = []
         current_length = 0
+        grounding = GroundingService()
         
-        for i, doc in enumerate(documents):
-            source = doc.metadata.get("source_url") or doc.metadata.get("source") or "unknown"
-            
-            # Clean up path for display name securely
-            doc_name = os.path.basename(source.replace("\\", "/"))
-
-            # If the source is just a local PDF filename, convert it to a full URL
-            if source.endswith((".pdf", ".docx", ".doc", ".txt", ".xlsx", ".csv")) and not source.startswith("http"):
-                uploads_dir_abs = os.path.abspath(settings.UPLOADS_DIR)
-                local_path_abs = os.path.abspath(os.path.join(settings.UPLOADS_DIR, doc_name))
-                
-                # Path traversal protection & file existence check
-                if not local_path_abs.startswith(uploads_dir_abs) or not os.path.exists(local_path_abs):
-                    pass # Keep source as filename to avoid broken links
-                else:
-                    base_url = settings.BASE_URL.rstrip('/')
-                    source = f"{base_url}/uploads/{doc_name}"
-
-            chunk_index = doc.metadata.get("chunk_index", "unknown")
+        for doc in documents:
+            doc_name = escape(document_name(doc.metadata), quote=True)
+            document_id = escape(str(doc.metadata.get("document_id", "unknown")), quote=True)
+            chunk_index = escape(str(doc.metadata.get("chunk_index", "unknown")), quote=True)
+            page_number = escape(str(doc.metadata.get("page_number", "unknown")), quote=True)
+            evidence_id = grounding.evidence_id(doc)
+            content = escape(doc.page_content.strip(), quote=False)
             chunk_text = (
-                f'  <document id="[Doc {i+1}]" name="{doc_name}" source="{source}" chunk="{chunk_index}">\n'
-                f'    {doc.page_content.strip()}\n'
+                f'  <document evidence_id="{evidence_id}" document_id="{document_id}" '
+                f'name="{doc_name}" chunk="{chunk_index}" page="{page_number}">\n'
+                f'    {content}\n'
                 f'  </document>'
             )
             
             if current_length + len(chunk_text) > max_chars:
-                overhead = len(chunk_text) - len(doc.page_content.strip())
+                overhead = len(chunk_text) - len(content)
                 remaining_for_content = max_chars - current_length - overhead - 20 # For "... [TRUNCATED]"
 
                 if remaining_for_content > 0:
-                    truncated_content = doc.page_content.strip()[:remaining_for_content] + "... [TRUNCATED]"
+                    truncated_content = content[:remaining_for_content] + "... [TRUNCATED]"
                     chunk_text = (
-                        f'  <document id="[Doc {i+1}]" name="{doc_name}" source="{source}" chunk="{chunk_index}">\n'
+                        f'  <document evidence_id="{evidence_id}" document_id="{document_id}" '
+                        f'name="{doc_name}" chunk="{chunk_index}" page="{page_number}">\n'
                         f'    {truncated_content}\n'
                         f'  </document>'
                     )

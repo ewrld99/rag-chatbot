@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     JINA_API_KEY: str = ""
     JINA_API_BASE_URL: str = "https://api.jina.ai/v1"
+    JINA_AUTH_COOLDOWN_SECONDS: float = 300.0
     DATABASE_URL: str = "postgresql://postgres:password@localhost:5432/rag_db"
     EMBEDDING_PROVIDER: str = "jina"
     EMBEDDING_MODEL: str = "jina-embeddings-v3"
@@ -24,6 +25,32 @@ class Settings(BaseSettings):
 
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_ALLOWED_MODELS: str = (
+        "llama-3.3-70b-versatile,"
+        "openai/gpt-oss-120b,"
+        "qwen/qwen3.6-27b,"
+        "openai/gpt-oss-20b,"
+        "llama-3.1-8b-instant"
+    )
+    GROQ_ANSWER_MODEL_ORDER: str = GROQ_ALLOWED_MODELS
+    GROQ_UTILITY_MODEL_ORDER: str = (
+        "openai/gpt-oss-20b,"
+        "llama-3.1-8b-instant,"
+        "llama-3.3-70b-versatile,"
+        "qwen/qwen3.6-27b,"
+        "openai/gpt-oss-120b"
+    )
+    GROQ_USER_MODEL_SELECTION_ENABLED: bool = True
+    GENERATION_MAX_RETRIES: int = 2
+    GENERATION_RETRY_BASE_SECONDS: float = 0.5
+    GENERATION_RETRY_JITTER_SECONDS: float = 0.25
+    GENERATION_MAX_SHORT_RETRY_SECONDS: float = 5.0
+    GENERATION_CIRCUIT_FAILURE_THRESHOLD: int = 3
+    GENERATION_CIRCUIT_COOLDOWN_SECONDS: float = 30.0
+    GENERATION_PERMISSION_COOLDOWN_SECONDS: float = 300.0
+    GENERATION_MAX_CIRCUIT_SECONDS: float = 900.0
+
+    COHERE_API_KEY: str = ""
 
     # --- CORS ---
     # Comma-separated list of allowed frontend origins.

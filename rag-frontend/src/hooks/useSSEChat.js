@@ -43,9 +43,16 @@ export function useSSEChat(onEvent) {
      * @param {number|null} sessionId  DB session id (null for guest)
      * @param {number|null} userId     DB user id    (null for guest)
      * @param {Array}   history    Recent chat history for context
+     * @param {string}  modelPreference  Approved answer model or "auto"
      */
     const sendMessage = useCallback(
-        async (message, sessionId = null, userId = null, history = []) => {
+        async (
+            message,
+            sessionId = null,
+            userId = null,
+            history = [],
+            modelPreference = "auto",
+        ) => {
             // Cancel any previous stream before starting a new one
             abort();
             const controller = new AbortController();
@@ -61,6 +68,7 @@ export function useSSEChat(onEvent) {
                         session_id: sessionId ?? undefined,
                         user_id: userId ?? undefined,
                         history,
+                        model_preference: modelPreference,
                     }),
                     signal: controller.signal,
                 });
@@ -71,12 +79,25 @@ export function useSSEChat(onEvent) {
             }
 
             if (!response.ok) {
-                let detail = `Server error ${response.status}`;
+                let errorEvent = {
+                    type: "error",
+                    message: "Unable to complete the request right now. Please try again.",
+                };
                 try {
                     const body = await response.json();
-                    if (body?.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+                    if (typeof body?.detail === "string") {
+                        errorEvent.message = body.detail;
+                    } else if (body?.detail?.message) {
+                        errorEvent = {
+                            type: "error",
+                            code: body.detail.code,
+                            message: body.detail.message,
+                            sources: body.detail.sources,
+                            retry_after: body.detail.retry_after,
+                        };
+                    }
                 } catch (_) { /* ignore */ }
-                onEvent({ type: "error", message: detail });
+                onEvent(errorEvent);
                 return;
             }
 

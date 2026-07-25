@@ -16,7 +16,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.db.session import get_db
 from app.schemas.query import (
     HealthResponse,
@@ -27,8 +26,11 @@ from app.schemas.query import (
     SourceItem,
 )
 from app.services.generation_service import GenerationService
-from app.services.hybrid_retriever import HybridRetriever
+from app.services.generation_resilience import GenerationUnavailableError
+from app.services.model_router import ModelRouter
 from app.services.retrieval_service import RetrievalService
+from app.services.settings_service import SettingsService
+from app.services.source_service import format_source_records
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -56,36 +58,56 @@ def query(
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # ── 1. Hybrid retrieval (raw RRFResult objects) ────────────────────────
-    hybrid = HybridRetriever(
-        db=db,
-        top_k=payload.top_k,
-        dense_top_k=settings.DENSE_TOP_K,
-        sparse_top_k=settings.SPARSE_TOP_K,
-        rrf_k=settings.RRF_K,
-    )
-
+    # 1. Shared retrieval path: hybrid search, neighbor expansion, and reranking.
+    retrieval_service = RetrievalService(db=db, top_k=payload.top_k)
     try:
-        raw_results = hybrid.retrieve_raw(payload.question)
+        scored_docs = retrieval_service.retrieve_with_scores(payload.question)
     except Exception as exc:
         logger.exception("Hybrid retrieval failed")
-        raise HTTPException(status_code=500, detail=f"Retrieval error: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "RETRIEVAL_FAILED",
+                "message": "Unable to search the documents right now. Please try again.",
+            },
+        ) from exc
 
-    # ── 2. Build context for LLM ────────────────────────────────────────────
-    retrieval_service = RetrievalService(db=db, top_k=payload.top_k)
-    docs = hybrid.get_relevant_documents(payload.question)
+    docs = [doc for doc, _score in scored_docs]
     context = retrieval_service.format_context(docs)
+    safe_sources = format_source_records(docs)
 
     # ── 3. LLM generation ───────────────────────────────────────────────────
     try:
-        generator = GenerationService()
+        generator = GenerationService(
+            model_router=ModelRouter(SettingsService(db))
+        )
+        generator.set_model_preference(payload.model_preference)
         if not context or context.strip() == "No relevant context found.":
             answer = generator.DOCUMENT_REFUSAL
+            evidence_ids: list[str] = []
         else:
-            answer = generator.generate(payload.question, context)
+            generation_result = generator.generate_response(
+                payload.question,
+                context,
+                documents=docs,
+            )
+            answer = generation_result["answer"]
+            evidence_ids = generation_result["evidence_ids"]
+    except GenerationUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=exc.public_payload(sources=safe_sources),
+        ) from exc
     except Exception as exc:
-        logger.exception("LLM generation failed")
-        raise HTTPException(status_code=502, detail=f"Generation error: {exc}")
+        logger.exception("Unexpected LLM generation failure")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "GENERATION_FAILED",
+                "message": "Unable to generate an answer right now. Please try again.",
+                "sources": safe_sources,
+            },
+        ) from exc
 
     t_end = time.perf_counter()
     latency_ms = round((t_end - t_start) * 1000, 1)
@@ -93,21 +115,22 @@ def query(
     # ── 4. Build response ────────────────────────────────────────────────────
     retrieved_chunks = [
         RetrievedChunk(
-            chunk_id=r.chunk_id,
-            document_id=r.document_id,
-            rrf_score=round(r.rrf_score, 6),
-            dense_rank=r.dense_rank,
-            sparse_rank=r.sparse_rank,
-            retrieval_sources=r.retrieval_sources,
-            text=r.text,
-            metadata=r.metadata,
+            chunk_id=str(doc.metadata.get("chunk_id", "")),
+            document_id=str(doc.metadata.get("document_id", "")),
+            rrf_score=round(float(doc.metadata.get("rrf_score", score)), 6),
+            dense_rank=doc.metadata.get("dense_rank"),
+            sparse_rank=doc.metadata.get("sparse_rank"),
+            retrieval_sources=doc.metadata.get("retrieval_sources", []),
+            text=doc.page_content,
+            metadata=doc.metadata,
         )
-        for r in raw_results
+        for doc, score in scored_docs
     ]
 
+    grounded_docs = generator.grounding.filter_documents(docs, evidence_ids)
     sources = [
         SourceItem(content=doc.page_content, metadata=doc.metadata)
-        for doc in docs
+        for doc in grounded_docs
     ]
 
     return QueryResponse(
@@ -115,6 +138,7 @@ def query(
         sources=sources,
         retrieved_chunks=retrieved_chunks,
         latency_ms=latency_ms,
+        **generator.model_metadata(),
     )
 
 
@@ -153,8 +177,8 @@ def health(db: Session = Depends(get_db)):
             text(
                 """
                 SELECT COUNT(*) FROM pg_indexes
-                WHERE tablename = 'documents'
-                  AND indexdef ILIKE '%vector%'
+                WHERE tablename IN ('document_chunks', 'faqs')
+                  AND indexdef ILIKE '%vector_cosine_ops%'
                 """
             )
         ).scalar()
@@ -168,8 +192,8 @@ def health(db: Session = Depends(get_db)):
             text(
                 """
                 SELECT COUNT(*) FROM pg_indexes
-                WHERE tablename = 'documents'
-                  AND indexname = 'idx_documents_fts'
+                WHERE tablename IN ('document_chunks', 'faqs')
+                  AND indexname IN ('idx_document_chunks_fts', 'idx_faqs_fts')
                 """
             )
         ).scalar()
@@ -183,7 +207,7 @@ def health(db: Session = Depends(get_db)):
     if not vector_index:
         detail = (detail or "") + " Vector index missing."
     if not fts_index:
-        detail = (detail or "") + " FTS index missing — run init_db()."
+        detail = (detail or "") + " FTS index missing - run migrations/init_db()."
 
     return HealthResponse(
         status=status,

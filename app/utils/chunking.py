@@ -6,6 +6,8 @@ def split_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> list[st
 
     # Preserve single and double newlines for tables, but remove excessive whitespace
     clean_text = re.sub(r'[ \t]+', ' ', text)
+    # Strip markdown headings so '## Title' becomes 'Title'
+    clean_text = re.sub(r'(?m)^#+\s+', '', clean_text)
     clean_text = re.sub(r'\n{3,}', '\n\n', clean_text).strip()
     
     chunks = []

@@ -3,7 +3,8 @@ import MessageBubble, { TypingBubble } from "./MessageBubble";
 import ChatInput from "./ChatInput";
 import { useSSEChat } from "../../hooks/useSSEChat";
 import {
-    createChatSession, deleteChatSession, getChatSession, getChatSessions, changePassword, submitMessageFeedback
+    createChatSession, deleteChatSession, getChatSession, getChatSessions, changePassword,
+    getGenerationModels, submitMessageFeedback
 } from "../../api/chatApi";
 import udomLogo from "../../assets/udom-logo.svg";
 
@@ -102,6 +103,18 @@ const eveningGreetings = [
     "Hope you had a great day"
 ];
 
+const FALLBACK_MODEL_OPTIONS = [
+    {
+        id: "llama-3.3-70b-versatile",
+        label: "Llama 3.3 70B Versatile",
+        is_default: true,
+    },
+    { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+    { id: "qwen/qwen3.6-27b", label: "Qwen 3.6 27B" },
+    { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
+    { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant" },
+];
+
 function getTimeGreeting(date = new Date()) {
     const hour = date.getHours();
     const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -150,9 +163,14 @@ export default function ChatWindow() {
     const [activeSessionId, setActiveSessionId] = useState(null);
     const [messages, setMessages] = useState([]);
     const [isWaiting, setIsWaiting] = useState(false);
-    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(() => !isNarrow);
     const [isAuthMenuOpen, setIsAuthMenuOpen] = useState(false);
     const [historyError, setHistoryError] = useState("");
+    const [modelOptions, setModelOptions] = useState(FALLBACK_MODEL_OPTIONS);
+    const [modelSelectionEnabled, setModelSelectionEnabled] = useState(true);
+    const [modelPreference, setModelPreference] = useState(() => (
+        window.localStorage.getItem("ragModelPreference") || "auto"
+    ));
     const messageListRef = useRef(null);
 
     // Password Change State
@@ -178,6 +196,42 @@ export default function ChatWindow() {
         }
     }, [user]);
 
+    useEffect(() => {
+        let active = true;
+
+        getGenerationModels()
+            .then((policy) => {
+                if (!active) return;
+                const options = Array.isArray(policy?.models) ? policy.models : [];
+                if (options.length > 0) setModelOptions(options);
+
+                const selectionEnabled = policy?.selection_enabled !== false;
+                setModelSelectionEnabled(selectionEnabled);
+                setModelPreference((current) => {
+                    const allowed = new Set(options.map((option) => option.id));
+                    const next = (
+                        selectionEnabled
+                        && (current === "auto" || allowed.has(current))
+                    ) ? current : "auto";
+                    window.localStorage.setItem("ragModelPreference", next);
+                    return next;
+                });
+            })
+            .catch(() => {
+                // Static allowlisted options remain available if policy loading fails.
+            });
+
+        return () => {
+            active = false;
+        };
+    }, []);
+
+    const handleModelChange = (event) => {
+        const preference = event.target.value;
+        setModelPreference(preference);
+        window.localStorage.setItem("ragModelPreference", preference);
+    };
+
     const handleSSEEvent = useCallback((event) => {
         if (event.type === "stream") {
             setIsWaiting(false);
@@ -186,24 +240,52 @@ export default function ChatWindow() {
                 if (last?.role === "assistant") {
                     return [...prev.slice(0, -1), { ...last, content: last.content + event.token }];
                 }
-                return [...prev, { role: "assistant", content: event.token }];
+                return [...prev, { role: "assistant", content: event.token, sources: [] }];
             });
         }
         if (event.type === "done") {
             setIsWaiting(false);
-            if (event.message_id) {
+            if (
+                event.message_id
+                || Array.isArray(event.sources)
+                || event.selected_model
+            ) {
                 setMessages((prev) => {
                     const next = [...prev];
                     const lastMsg = next[next.length - 1];
                     if (lastMsg && lastMsg.role === "assistant") {
-                        lastMsg.id = event.message_id;
+                        if (event.message_id) lastMsg.id = event.message_id;
+                        if (Array.isArray(event.sources)) lastMsg.sources = event.sources;
+                        if (event.selected_model) lastMsg.selectedModel = event.selected_model;
+                        lastMsg.fallbackUsed = Boolean(event.fallback_used);
                     }
                     return next;
                 });
             }
             loadSessions();
         }
-        if (event.type === "error") { setIsWaiting(false); setHistoryError(event.message); }
+        if (event.type === "error") {
+            setIsWaiting(false);
+            const safeMessage = event.message || "Unable to complete the answer right now. Please try again.";
+
+            if (event.code === "GENERATION_TEMPORARILY_UNAVAILABLE") {
+                setHistoryError("");
+                setMessages((prev) => {
+                    const sources = Array.isArray(event.sources) ? event.sources : [];
+                    const last = prev[prev.length - 1];
+                    if (last?.role === "assistant") {
+                        return [
+                            ...prev.slice(0, -1),
+                            { ...last, content: safeMessage, sources },
+                        ];
+                    }
+                    return [...prev, { role: "assistant", content: safeMessage, sources }];
+                });
+                return;
+            }
+
+            setHistoryError(safeMessage);
+        }
     }, [loadSessions]);
 
     const { sendMessage } = useSSEChat(handleSSEEvent);
@@ -267,7 +349,13 @@ export default function ChatWindow() {
         try {
             const session = await getChatSession(user.id, sessionId);
             setActiveSessionId(session.id);
-            setMessages(session.messages.map((m) => ({ id: m.id, role: m.role, content: m.content, feedback: m.feedback })));
+            setMessages(session.messages.map((m) => ({
+                id: m.id,
+                role: m.role,
+                content: m.content,
+                sources: Array.isArray(m.sources) ? m.sources : [],
+                feedback: m.feedback,
+            })));
             setHistoryError("");
         } catch (error) {
             setHistoryError(error.message);
@@ -322,7 +410,13 @@ export default function ChatWindow() {
             }
         }
         // Pass userId + sessionId so the SSE endpoint can persist the exchange
-        sendMessage(text, sessionId, user?.id ?? null, recentHistory);
+        sendMessage(
+            text,
+            sessionId,
+            user?.id ?? null,
+            recentHistory,
+            modelPreference,
+        );
     };
 
     useEffect(() => {
@@ -454,7 +548,7 @@ export default function ChatWindow() {
                 {/* Panel Header */}
                 <div className="chat-panel-header-theme" style={{ ...styles.panelHeader, ...(isNarrow ? styles.panelHeaderNarrow : {}) }}>
                     <div style={styles.panelHeaderLeft}>
-                        <div style={styles.panelHeaderIcon}><ChatLogo /></div>
+                        {!isNarrow && <div style={styles.panelHeaderIcon}><ChatLogo /></div>}
                         <div>
                             <h2 style={styles.panelTitle}>University Assistant</h2>
                             <p style={styles.panelSubtitle}>
@@ -462,7 +556,6 @@ export default function ChatWindow() {
                             </p>
                         </div>
                     </div>
-                    {/* Guest auth moved to sidebar */}
                 </div>
 
                 {/* Messages */}
@@ -478,7 +571,15 @@ export default function ChatWindow() {
                                     ? "Ask questions and get clear, helpful answers. Your chat is saved."
                                     : "Ask questions and get clear, helpful answers. Log in only if you want saved history."}
                             </p>
-                            <ChatInput onSend={handleSend} disabled={isWaiting} placement="center" />
+                            <ChatInput
+                                onSend={handleSend}
+                                disabled={isWaiting}
+                                placement="center"
+                                modelOptions={modelOptions}
+                                modelPreference={modelPreference}
+                                modelSelectionEnabled={modelSelectionEnabled}
+                                onModelChange={handleModelChange}
+                            />
                         </section>
                     ) : (
                         messages.map((m, i) => (
@@ -493,7 +594,16 @@ export default function ChatWindow() {
                     {isWaiting && <TypingBubble />}
                 </div>
 
-                {messages.length > 0 && <ChatInput onSend={handleSend} disabled={isWaiting} />}
+                {messages.length > 0 && (
+                    <ChatInput
+                        onSend={handleSend}
+                        disabled={isWaiting}
+                        modelOptions={modelOptions}
+                        modelPreference={modelPreference}
+                        modelSelectionEnabled={modelSelectionEnabled}
+                        onModelChange={handleModelChange}
+                    />
+                )}
             </div>
 
             {/* Profile Modal */}
@@ -942,7 +1052,7 @@ const styles = {
         gap: "12px",
     },
     panelHeaderNarrow: {
-        alignItems: "flex-start",
+        alignItems: "center",
         padding: "12px 14px",
     },
     panelHeaderLeft: { display: "flex", alignItems: "center", gap: "12px" },
@@ -1551,7 +1661,7 @@ Object.assign(styles, {
         width: "46px",
         height: "46px",
         borderRadius: "50%",
-        background: "#050505",
+        background: "var(--app-surface-muted)",
         border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",
@@ -1562,7 +1672,7 @@ Object.assign(styles, {
     panelSubtitle: { fontSize: "12px", color: "var(--app-faint)", margin: "3px 0 0" },
     pillActive: {
         background: "var(--app-accent-soft)",
-        border: "1px solid #e8cdb8",
+        border: "1px solid var(--app-border-strong)",
         color: "var(--app-accent)",
     },
     pillGuest: {
@@ -1597,7 +1707,7 @@ Object.assign(styles, {
         width: "92px",
         height: "92px",
         borderRadius: "50%",
-        background: "#050505",
+        background: "var(--app-surface-muted)",
         border: "1px solid var(--app-border-strong)",
         display: "flex",
         alignItems: "center",

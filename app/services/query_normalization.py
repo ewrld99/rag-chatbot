@@ -1,0 +1,257 @@
+"""
+app/services/query_normalization.py
+------------------------------------
+Deterministic query normalization and keyword expansion for retrieval.
+
+The sparse retriever can pass database-backed aliases into this module, so
+UDOM-specific acronyms do not have to be hardcoded in Python. A small fallback
+map remains for resilience when the database table has not been migrated yet.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import re
+
+
+@dataclass(frozen=True)
+class QueryVariant:
+    label: str
+    query: str
+    weight: float
+
+
+MAX_EXPANDED_TERMS = 30
+
+DOMAIN_TERMS = {
+    "udom",
+    "dodoma",
+    "university",
+    "universityofdodoma",
+}
+
+QUESTION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "please",
+    "should",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "would",
+    "you",
+    "your",
+}
+
+# Bootstrap aliases used only when DB-backed aliases are unavailable. Add large
+# vocabularies to the retrieval_aliases table, not here.
+FALLBACK_ALIAS_EXPANSIONS: dict[str, list[str]] = {
+    "gpa": [
+        "gpa",
+        "grade point average",
+        "grade point",
+        "grading system",
+        "course weight",
+        "total score",
+    ],
+    "cgpa": ["cgpa", "cumulative grade point average", "grade point average"],
+    "ca": ["continuous assessment"],
+    "sr": [
+        "sr",
+        "sr2",
+        "student records",
+        "student record",
+        "student records system",
+        "student registration",
+        "student information system",
+        "student portal",
+    ],
+    "sr2": [
+        "sr2",
+        "sr",
+        "student records",
+        "student records system",
+        "student portal",
+    ],
+    "tcu": ["tanzania commission for universities"],
+    "nactvet": ["national council for technical and vocational education and training"],
+}
+
+CALCULATION_TERMS = {"calculate", "calculated", "calculating", "calculation", "computed", "computing"}
+
+
+def clean_query_text(query: str) -> str:
+    return re.sub(r"\s+", " ", query.strip())
+
+
+def tokenize(query: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", query.lower())
+
+
+def significant_tokens(query: str) -> list[str]:
+    tokens = []
+    for token in tokenize(query):
+        if token in DOMAIN_TERMS or token in QUESTION_STOPWORDS:
+            continue
+        if len(token) <= 1:
+            continue
+        tokens.append(token)
+    return _dedupe(tokens)
+
+
+def normalize_sparse_query(query: str) -> str:
+    return " ".join(significant_tokens(query))
+
+
+def build_sparse_query_variants(
+    query: str,
+    alias_expansions: Mapping[str, Sequence[str]] | None = None,
+    max_expanded_terms: int = MAX_EXPANDED_TERMS,
+) -> list[QueryVariant]:
+    raw = clean_query_text(query)
+    tokens = significant_tokens(raw)
+    token_set = set(tokens)
+    aliases = _matched_alias_terms(raw, tokens, alias_expansions or FALLBACK_ALIAS_EXPANSIONS)
+
+    variants: list[QueryVariant] = []
+    _add_variant(variants, "raw", raw, 1.0)
+
+    normalized = " ".join(tokens)
+    _add_variant(variants, "normalized", normalized, 0.98)
+
+    expanded_terms = _limit_terms([*tokens, *aliases], max_expanded_terms)
+    if "gpa" in token_set and (token_set & CALCULATION_TERMS):
+        expanded_terms = _limit_terms(
+            [
+                *expanded_terms,
+                "calculation",
+                "calculated",
+                "compute",
+                "computed",
+                "grade point average",
+                "course weight",
+                "total score",
+            ],
+            max_expanded_terms,
+        )
+
+    expanded_query = _or_query(expanded_terms)
+    _add_variant(variants, "expanded", expanded_query, 0.92)
+
+    fallback_terms = [*tokens, *aliases]
+    if token_set & CALCULATION_TERMS:
+        fallback_terms.extend(["calculation", "calculated", "computed"])
+
+    fallback_query = _or_query(_limit_terms(fallback_terms, max_expanded_terms))
+    _add_variant(variants, "fallback", fallback_query, 0.72)
+
+    return variants
+
+
+def _matched_alias_terms(
+    query: str,
+    tokens: list[str],
+    alias_expansions: Mapping[str, Sequence[str]],
+) -> list[str]:
+    token_set = set(tokens)
+    normalized_query = _token_phrase(query)
+    matched_terms: list[str] = []
+
+    for term, aliases in _normalize_alias_expansions(alias_expansions).items():
+        single_word_aliases = {alias for alias in aliases if " " not in alias}
+        phrase_aliases = [alias for alias in aliases if " " in alias]
+        matched = (
+            term in token_set
+            or bool(single_word_aliases & token_set)
+            or any(_token_phrase(phrase).strip() and _token_phrase(phrase) in normalized_query for phrase in phrase_aliases)
+        )
+        if matched:
+            matched_terms.append(term)
+            matched_terms.extend(aliases)
+
+    return _dedupe(matched_terms)
+
+
+def _normalize_alias_expansions(
+    alias_expansions: Mapping[str, Sequence[str]],
+) -> dict[str, list[str]]:
+    output: dict[str, list[str]] = {}
+    for raw_term, raw_aliases in alias_expansions.items():
+        term = clean_query_text(str(raw_term)).lower()
+        if not term:
+            continue
+        aliases: list[str] = []
+        values = [raw_aliases] if isinstance(raw_aliases, str) else list(raw_aliases or [])
+        for value in values:
+            alias = clean_query_text(str(value)).lower()
+            if alias:
+                aliases.append(alias)
+        output[term] = _dedupe(aliases)
+    return output
+
+
+def _or_query(terms: list[str]) -> str:
+    formatted = []
+    for term in _dedupe([item.strip() for item in terms if item and item.strip()]):
+        if " " in term:
+            formatted.append(f'"{term}"')
+        else:
+            formatted.append(term)
+    return " OR ".join(formatted)
+
+
+def _add_variant(variants: list[QueryVariant], label: str, query: str, weight: float) -> None:
+    query = clean_query_text(query)
+    if not query:
+        return
+    normalized = query.lower()
+    if any(existing.query.lower() == normalized for existing in variants):
+        return
+    variants.append(QueryVariant(label=label, query=query, weight=weight))
+
+
+def _limit_terms(items: list[str], limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    return _dedupe(items)[:limit]
+
+
+def _token_phrase(text: str) -> str:
+    phrase = " ".join(tokenize(text))
+    return f" {phrase} " if phrase else " "
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen = set()
+    output = []
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output

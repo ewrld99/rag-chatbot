@@ -3,7 +3,6 @@ import "./App.css";
 import PublicLayout from "./layouts/PublicLayout.jsx";
 import AdminLayout from "./layouts/AdminLayout.jsx";
 import ChatPage from "./pages/ChatPage.jsx";
-// import AboutPage from "./pages/AboutPage.jsx";
 import AdminLoginPage from "./pages/AdminLoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
 import AdminDashboardPage from "./pages/AdminDashboardPage.jsx";

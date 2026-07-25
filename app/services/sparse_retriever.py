@@ -1,29 +1,29 @@
 """
 app/services/sparse_retriever.py
 ----------------------------------
-Sparse (keyword) retrieval using PostgreSQL Full-Text Search.
+Sparse keyword retrieval using PostgreSQL Full-Text Search.
 
-Uses:
-  - tsvector column  (pre-computed by DB trigger on every INSERT/UPDATE)
-  - websearch_to_tsquery()  for natural query parsing (handles AND, OR, quotes)
-  - ts_rank_cd()  for BM25-style positional scoring
-
-The GIN index on fts_vector means this is fast even on large tables.
+This retriever searches multiple query variants:
+  - raw user query
+  - normalized query with domain filler words removed
+  - expanded keyword query for acronyms such as GPA
+  - relaxed OR fallback query for partial matches
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
-from sqlalchemy.orm import Session
+
 from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.services.alias_expansion_service import AliasExpansionService
+from app.services.query_normalization import QueryVariant, build_sparse_query_variants
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Result type
-# ---------------------------------------------------------------------------
 class SparseResult:
     """Lightweight result holder for a single FTS hit."""
 
@@ -59,103 +59,118 @@ class SparseResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# SQL
-# ---------------------------------------------------------------------------
-_FTS_QUERY = text(
-    """
-    SELECT
-        dc.id::text                                     AS chunk_id,
-        d.id::text                                      AS document_id,
-        d.filename                                      AS source,
-        dc.chunk_text                                   AS text,
-        dc.chunk_index                                  AS chunk_index,
-        GREATEST(
-            ts_rank_cd(dc.tsv, tsq_s, 34),
-            ts_rank_cd(dc.tsv, tsq_e, 34)
-        )                                               AS fts_score
-    FROM
-        document_chunks dc
-    JOIN
-        documents d ON d.id = dc.document_id,
-        websearch_to_tsquery('simple',  :query) AS tsq_s,
-        websearch_to_tsquery('english', :query) AS tsq_e
-    WHERE
-        (dc.tsv @@ tsq_s OR dc.tsv @@ tsq_e)
-        AND d.status = 'active'
-    ORDER BY
-        fts_score DESC
-    LIMIT :top_k
-    """
-)
-
 _FTS_FAQ_QUERY = text(
     """
+    WITH search_query AS (
+        SELECT
+            websearch_to_tsquery('simple', :query) AS tsq_s,
+            websearch_to_tsquery('english', :query) AS tsq_e
+    )
     SELECT
         f.id::text                                      AS chunk_id,
         f.id::text                                      AS document_id,
         COALESCE('FAQ - ' || f.category, 'FAQ')         AS source,
-        f.question || E'\n\n' || f.answer              AS text,
+        f.question || CHR(10) || CHR(10) || f.answer     AS text,
         0                                               AS chunk_index,
         f.category                                      AS category,
+        f.metadata                                      AS metadata_json,
         GREATEST(
-            ts_rank_cd(f.fts_vector, tsq_s, 34),
-            ts_rank_cd(f.fts_vector, tsq_e, 34)
+            ts_rank_cd(f.fts_vector, search_query.tsq_s, 34),
+            ts_rank_cd(f.fts_vector, search_query.tsq_e, 34)
         )                                               AS fts_score
-    FROM
-        faqs f,
-        websearch_to_tsquery('simple',  :query) AS tsq_s,
-        websearch_to_tsquery('english', :query) AS tsq_e
-    WHERE
-        f.is_active = true
-        AND (f.fts_vector @@ tsq_s OR f.fts_vector @@ tsq_e)
-    ORDER BY
-        fts_score DESC
+    FROM faqs f
+    CROSS JOIN search_query
+    WHERE f.is_active = true
+      AND (f.fts_vector @@ search_query.tsq_s OR f.fts_vector @@ search_query.tsq_e)
+    ORDER BY fts_score DESC, f.id ASC
     LIMIT :top_k
     """
 )
 
 
-# ---------------------------------------------------------------------------
-# Retriever
-# ---------------------------------------------------------------------------
 class SparseRetriever:
     """
     Keyword retrieval via PostgreSQL FTS.
 
-    ``websearch_to_tsquery`` supports:
-      - plain terms           → all terms must match
-      - quoted phrases        → "exact phrase"
-      - OR operator           → term1 OR term2
-      - negation              → -term
-
-    ``ts_rank_cd`` uses cover-density ranking which rewards
-    proximity of matching terms (closer to BM25 than plain ts_rank).
+    websearch_to_tsquery is strict for normal text because terms are ANDed.
+    To behave more like a production sparse retriever, this class tries
+    normalized, expanded, and fallback variants, then merges them by score.
     """
 
     def __init__(self, db: Session) -> None:
         self.db = db
 
     def retrieve(self, query: str, top_k: int = 20, filters: dict | None = None) -> list[SparseResult]:
-        """
-        Run FTS and return the *top_k* best-matching chunks.
-
-        Optional *filters* dict supports keys 'programme' and 'year'.
-        Matching uses an IS NULL fallback so old chunks without metadata
-        are never silently excluded (graceful degradation).
-
-        Returns an empty list (never raises) when:
-          - the query is blank / produces no tsquery tokens
-          - the FTS index finds no matches
-          - any DB error occurs (logged as WARNING)
-        """
         if not query or not query.strip():
             return []
 
-        # Build optional SQL filter clauses.
-        # Only clause *structure* is injected via f-string; actual values are
-        # bound parameters — no SQL injection risk.
-        params: dict = {"query": query.strip(), "top_k": top_k}
+        alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+        variants = build_sparse_query_variants(query, alias_expansions=alias_expansions)
+        if not variants:
+            return []
+
+        merged: dict[str, SparseResult] = {}
+        matched_queries: dict[str, list[dict[str, Any]]] = {}
+
+        for variant_index, variant in enumerate(variants):
+            variant_results = self._retrieve_variant(variant, top_k=top_k, filters=filters)
+            for rank, result in enumerate(variant_results, start=1):
+                result.metadata["sparse_query_type"] = variant.label
+                result.metadata["sparse_query"] = variant.query
+                result.metadata["sparse_query_rank"] = rank
+                result.metadata["sparse_query_weight"] = variant.weight
+
+                matched_queries.setdefault(result.chunk_id, []).append(
+                    {
+                        "type": variant.label,
+                        "query": variant.query,
+                        "rank": rank,
+                        "weight": variant.weight,
+                    }
+                )
+
+                existing = merged.get(result.chunk_id)
+                if existing is None:
+                    merged[result.chunk_id] = result
+                    continue
+
+                existing_rank = existing.metadata.get("sparse_query_rank", 10**9)
+                existing_variant_index = self._variant_order(
+                    existing.metadata.get("sparse_query_type"),
+                    variants,
+                )
+                should_replace = (
+                    result.fts_score > existing.fts_score
+                    or (
+                        result.fts_score == existing.fts_score
+                        and (variant_index, rank, result.chunk_id) < (existing_variant_index, existing_rank, existing.chunk_id)
+                    )
+                )
+                if should_replace:
+                    merged[result.chunk_id] = result
+
+        for chunk_id, result in merged.items():
+            result.metadata["matched_sparse_queries"] = matched_queries.get(chunk_id, [])
+
+        results = sorted(
+            merged.values(),
+            key=lambda item: (
+                -item.fts_score,
+                self._variant_order(item.metadata.get("sparse_query_type"), variants),
+                item.metadata.get("sparse_query_rank", 10**9),
+                item.document_id,
+                item.chunk_id,
+            ),
+        )
+        return results[:top_k]
+
+    def _retrieve_variant(
+        self,
+        variant: QueryVariant,
+        top_k: int,
+        filters: dict | None,
+    ) -> list[SparseResult]:
+        params: dict[str, Any] = {"query": variant.query, "top_k": top_k}
         prog_clause = ""
         year_clause = ""
 
@@ -170,87 +185,124 @@ class SparseRetriever:
                 params["year"] = str(year)
 
         fts_sql = text(f"""
+            WITH search_query AS (
+                SELECT
+                    websearch_to_tsquery('simple', :query) AS tsq_s,
+                    websearch_to_tsquery('english', :query) AS tsq_e
+            )
             SELECT
                 dc.id::text                                     AS chunk_id,
                 d.id::text                                      AS document_id,
                 d.filename                                      AS source,
+                d.title                                         AS document_title,
+                d.source_url                                    AS source_url,
+                d.status                                        AS document_status,
+                d.content_hash                                  AS content_hash,
+                d.upload_date                                   AS document_uploaded_at,
                 dc.chunk_text                                   AS text,
                 dc.chunk_index                                  AS chunk_index,
+                dc.page_number                                  AS page_number,
+                dc.metadata                                     AS metadata_json,
                 GREATEST(
-                    ts_rank_cd(dc.tsv, tsq_s, 34),
-                    ts_rank_cd(dc.tsv, tsq_e, 34)
+                    ts_rank_cd(dc.tsv, search_query.tsq_s, 34),
+                    ts_rank_cd(dc.tsv, search_query.tsq_e, 34)
                 )                                               AS fts_score
-            FROM
-                document_chunks dc
-            JOIN
-                documents d ON d.id = dc.document_id,
-                websearch_to_tsquery('simple',  :query) AS tsq_s,
-                websearch_to_tsquery('english', :query) AS tsq_e
-            WHERE
-                (dc.tsv @@ tsq_s OR dc.tsv @@ tsq_e)
-                AND d.status = 'active'
-                {prog_clause}
-                {year_clause}
-            ORDER BY
-                fts_score DESC
+            FROM document_chunks dc
+            JOIN documents d ON d.id = dc.document_id
+            CROSS JOIN search_query
+            WHERE (dc.tsv @@ search_query.tsq_s OR dc.tsv @@ search_query.tsq_e)
+              AND d.status = 'active'
+              {prog_clause}
+              {year_clause}
+            ORDER BY fts_score DESC, dc.id ASC
             LIMIT :top_k
         """)
 
         try:
             rows = self.db.execute(fts_sql, params).fetchall()
-
             faq_rows = self.db.execute(
                 _FTS_FAQ_QUERY,
-                {"query": query.strip(), "top_k": top_k},
+                {"query": variant.query, "top_k": top_k},
             ).fetchall()
         except Exception as exc:
-            # Graceful degradation: FTS failure never kills the pipeline
-            logger.warning("SparseRetriever FTS query failed: %s", exc)
+            logger.warning(
+                "SparseRetriever FTS query failed for %s query %r: %s",
+                variant.label,
+                variant.query,
+                exc,
+            )
             return []
 
-        # Merge and sort
         combined = []
         for row in rows:
             combined.append((row.fts_score, row, "doc"))
         for row in faq_rows:
             combined.append((row.fts_score, row, "faq"))
-            
-        combined.sort(key=lambda x: x[0], reverse=True)
-        # Do NOT slice to top_k here — return the full merged pool so RRF
-        # has richer candidates from both document chunks and FAQs.
+
+        combined.sort(key=lambda item: (-float(item[0]), str(item[1].chunk_id)))
+        combined = combined[:top_k]
 
         results: list[SparseResult] = []
         for score, row, type_ in combined:
-            chunk_id = str(row.chunk_id)
+            raw_score = float(score or 0.0)
+            adjusted_score = round(raw_score * variant.weight, 6)
             if type_ == "doc":
+                metadata = dict(row.metadata_json or {})
+                metadata.update(
+                    {
+                        "source": row.source or "database",
+                        "chunk_index": row.chunk_index,
+                        "source_type": "document",
+                        "fts_score_raw": round(raw_score, 6),
+                    }
+                )
+                if row.page_number is not None:
+                    metadata["page_number"] = row.page_number
+                if row.document_title:
+                    metadata["document_title"] = row.document_title
+                if row.source_url:
+                    metadata["source_url"] = row.source_url
+                metadata["document_status"] = row.document_status or "active"
+                if row.content_hash:
+                    metadata["content_hash"] = row.content_hash
+                if row.document_uploaded_at:
+                    metadata["document_uploaded_at"] = row.document_uploaded_at.isoformat()
+
                 results.append(
                     SparseResult(
-                        chunk_id=chunk_id,
+                        chunk_id=str(row.chunk_id),
                         document_id=str(row.document_id),
-                        fts_score=round(float(score), 6),
+                        fts_score=adjusted_score,
                         text=row.text,
-                        metadata={
-                            "source": row.source or "database",
-                            "chunk_index": row.chunk_index,
-                            "source_type": "document"
-                        },
+                        metadata=metadata,
                     )
                 )
             else:
+                metadata = dict(row.metadata_json or {})
+                metadata.update(
+                    {
+                        "source": row.source,
+                        "chunk_index": 0,
+                        "source_type": "faq",
+                        "faq_id": str(row.document_id),
+                        "category": row.category,
+                        "fts_score_raw": round(raw_score, 6),
+                    }
+                )
                 results.append(
                     SparseResult(
-                        chunk_id=chunk_id,
+                        chunk_id=str(row.chunk_id),
                         document_id=str(row.document_id),
-                        fts_score=round(float(score), 6),
+                        fts_score=adjusted_score,
                         text=row.text,
-                        metadata={
-                            "source": row.source,
-                            "chunk_index": 0,
-                            "source_type": "faq",
-                            "faq_id": str(row.document_id),
-                            "category": row.category
-                        },
+                        metadata=metadata,
                     )
                 )
 
         return results
+
+    def _variant_order(self, label: Any, variants: list[QueryVariant]) -> int:
+        for index, variant in enumerate(variants):
+            if variant.label == label:
+                return index
+        return len(variants)

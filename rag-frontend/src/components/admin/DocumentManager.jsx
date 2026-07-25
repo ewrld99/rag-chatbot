@@ -111,6 +111,12 @@ function useMediaQuery(query) {
 export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const isNarrow = useMediaQuery("(max-width: 760px)");
     const [documents, setDocuments] = useState([]);
+    const [page, setPage] = useState(1);
+    const [limit] = useState(10);
+    const [searchInput, setSearchInput] = useState("");
+    const [searchQuery, setSearchQuery] = useState("");
+    const [totalDocs, setTotalDocs] = useState(0);
+    const [totalPages, setTotalPages] = useState(1);
     const [form, setForm] = useState(emptyForm);
     const [editingId, setEditingId] = useState(null);
     const [status, setStatus] = useState("");
@@ -167,8 +173,10 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const loadDocuments = useCallback(async ({ clearStatus = true } = {}) => {
         setIsLoading(true);
         try {
-            const data = await getDocuments();
-            setDocuments(data);
+            const data = await getDocuments(page, limit, searchQuery);
+            setDocuments(data.items);
+            setTotalDocs(data.total);
+            setTotalPages(data.total_pages);
             if (clearStatus) { setStatus(""); setStatusType(""); }
         } catch (error) {
             setStatus(error.message);
@@ -176,7 +184,15 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         } finally {
             setIsLoading(false);
         }
-    }, []);
+    }, [page, limit, searchQuery]);
+
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            setSearchQuery(searchInput);
+            setPage(1);
+        }, 300);
+        return () => clearTimeout(timer);
+    }, [searchInput]);
 
     useEffect(() => {
         const timer = window.setTimeout(() => loadDocuments(), 0);
@@ -316,13 +332,20 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                     <h2 style={styles.title}>Manage Documents</h2>
                 </div>
                 <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                    <input
+                        type="text"
+                        placeholder="Search files..."
+                        value={searchInput}
+                        onChange={(e) => setSearchInput(e.target.value)}
+                        style={styles.searchInput}
+                    />
                     {selectedIds.size > 0 && (
                         <button
                             type="button"
                             style={{
                                 ...styles.ghostBtn,
                                 color: "var(--app-danger)",
-                                borderColor: "#f1c4b2",
+                                borderColor: "var(--app-danger-soft)",
                                 background: "var(--app-danger-soft)",
                                 ...(isLoading ? styles.disabledBtn : {})
                             }}
@@ -330,7 +353,7 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                             disabled={isLoading}
                         >
                             <TrashIcon />
-                            Delete Selected ({selectedIds.size})
+                            Delete ({selectedIds.size})
                         </button>
                     )}
                     <button
@@ -360,7 +383,6 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                         disabled={isLoading}
                     >
                         <RefreshIcon />
-                        {isLoading ? "Refreshing…" : "Refresh"}
                     </button>
                 </div>
             </div>
@@ -549,6 +571,31 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                     ))
                 )}
             </div>
+
+            {/* Pagination Controls */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "16px", padding: "8px 16px", background: "var(--app-surface)", borderRadius: "12px", border: "1px solid var(--app-border)" }}>
+                <div style={styles.paginationContainer}>
+                    <button
+                        type="button"
+                        style={{ ...styles.pageButton, ...(page === 1 ? styles.disabledBtn : {}) }}
+                        onClick={() => setPage((p) => Math.max(1, p - 1))}
+                        disabled={page === 1}
+                    >
+                        Previous
+                    </button>
+                    <span style={styles.pageText}>
+                        Page {page} of {totalPages}
+                    </span>
+                    <button
+                        type="button"
+                        style={{ ...styles.pageButton, ...(page === totalPages ? styles.disabledBtn : {}) }}
+                        onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                        disabled={page === totalPages}
+                    >
+                        Next
+                    </button>
+                </div>
+            </div>
         </section>
     );
 }
@@ -581,6 +628,39 @@ const styles = {
         textTransform: "uppercase",
         color: "var(--app-accent)",
         marginBottom: "4px",
+    },
+    searchInput: {
+        padding: "8px 12px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-border-strong)",
+        background: "var(--app-bg)",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        outline: "none",
+        width: "200px",
+    },
+    paginationContainer: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "16px",
+        marginTop: "10px",
+    },
+    pageButton: {
+        padding: "8px 16px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-border)",
+        background: "var(--app-surface)",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        fontWeight: "600",
+        cursor: "pointer",
+        transition: "all 0.15s",
+    },
+    pageText: {
+        fontSize: "13px",
+        color: "var(--app-muted)",
+        fontWeight: "500",
     },
     title: { fontSize: "22px", fontWeight: "700", color: "var(--app-text)", margin: 0 },
     ghostBtn: {

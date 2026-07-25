@@ -2,17 +2,33 @@ import hashlib
 import math
 import re
 import time
+import logging
 from typing import List, Union
 from collections import OrderedDict
+import httpx
 from openai import APIStatusError, OpenAI, RateLimitError
 
 from app.core.config import settings
+from app.services.jina_resilience import (
+    JinaProviderCooldownError,
+    is_jina_account_failure,
+    jina_provider_circuit,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingServiceError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 502,
+        *,
+        provider_cooldown: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.provider_cooldown = provider_cooldown
 
 
 _QUERY_EMBEDDING_CACHE = OrderedDict()
@@ -21,6 +37,7 @@ CACHE_MAX_SIZE = 2000
 
 from sqlalchemy.orm import Session
 from app.services.settings_service import SettingsService
+from app.services.tls_service import system_ssl_context
 
 class EmbeddingService:
     """
@@ -41,6 +58,11 @@ class EmbeddingService:
         self.client = None
 
         if self.provider == "local":
+            logger.warning(
+                "EmbeddingService: provider='local' uses a hash-based fallback "
+                "that produces random vectors. Semantic similarity search will NOT "
+                "work correctly. Set EMBEDDING_PROVIDER=jina or openai in your .env."
+            )
             return
 
         if self.provider == "jina":
@@ -49,7 +71,11 @@ class EmbeddingService:
             self.client = OpenAI(
                 api_key=settings.JINA_API_KEY,
                 base_url=settings.JINA_API_BASE_URL,
-                timeout=15.0
+                http_client=httpx.Client(
+                    verify=system_ssl_context(),
+                    timeout=15.0,
+                ),
+                max_retries=0,
             )
             return
 
@@ -59,7 +85,13 @@ class EmbeddingService:
         if not settings.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is missing in environment variables")
 
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=15.0)
+        self.client = OpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            http_client=httpx.Client(
+                verify=system_ssl_context(),
+                timeout=15.0,
+            ),
+        )
 
     # ---------------------------------------
     # 1. Single Text Embedding
@@ -175,6 +207,16 @@ class EmbeddingService:
         return EmbeddingServiceError(f"Embedding service error: {str(error)}")
 
     def _embed_jina(self, input_value: Union[str, List[str]], retries=3) -> List[List[float]]:
+        try:
+            jina_provider_circuit.before_call()
+        except JinaProviderCooldownError as error:
+            raise EmbeddingServiceError(
+                "Jina embeddings are temporarily unavailable after an account "
+                "authorization or balance failure.",
+                status_code=503,
+                provider_cooldown=True,
+            ) from error
+
         for attempt in range(retries):
             try:
                 response = self.client.embeddings.create(
@@ -185,6 +227,7 @@ class EmbeddingService:
                         "embedding_type": "float",
                     },
                 )
+                jina_provider_circuit.record_success()
                 break
             except APIStatusError as error:
                 code = getattr(error, "code", None)
@@ -209,6 +252,13 @@ class EmbeddingService:
 
     def _raise_jina_status_error(self, error: APIStatusError):
         message = getattr(error, "message", None) or str(error)
+        if is_jina_account_failure(error):
+            jina_provider_circuit.record_account_failure()
+            raise EmbeddingServiceError(
+                "Jina embedding authorization failed or the account balance is "
+                "insufficient. Sparse retrieval remains available.",
+                status_code=503,
+            ) from error
         if "1010" in message:
             message = (
                 "Jina rejected the request with error code 1010. "

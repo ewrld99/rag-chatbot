@@ -6,6 +6,7 @@ import VectorStatus from "../components/admin/VectorStatus.jsx";
 import FeedbackViewer from "../components/admin/FeedbackViewer.jsx";
 import RagSettings from "../components/admin/RagSettings.jsx";
 import FaqManager from "../components/admin/FaqManager.jsx";
+import AcronymManager from "../components/admin/AcronymManager.jsx";
 import { getDocuments } from "../api/documentApi.js";
 
 function getCurrentSection() {
@@ -32,9 +33,9 @@ export default function AdminDashboardPage() {
             setStatus({ isLoading: true, error: "" });
 
             try {
-                const data = await getDocuments();
+                const data = await getDocuments(1, 1000); // Fetch a large batch for stats
                 if (isActive) {
-                    setDocuments(data);
+                    setDocuments(data.items || []);
                     setStatus({ isLoading: false, error: "" });
                 }
             } catch (error) {
@@ -75,6 +76,7 @@ export default function AdminDashboardPage() {
             {section === "documents" && <DocumentManager refreshKey={refreshKey} onChanged={() => setRefreshKey((value) => value + 1)} />}
             {section === "vector" && <VectorStatus stats={stats} documents={documents} />}
             {section === "faq" && <FaqManager />}
+            {section === "acronyms" && <AcronymManager />}
             {section === "feedback" && <FeedbackViewer />}
             {section === "settings" && <RagSettings />}
         </div>

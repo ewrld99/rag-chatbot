@@ -90,8 +90,10 @@ async function requestDocument(path, options = {}) {
     return data;
 }
 
-export function getDocuments() {
-    return requestDocument("/documents/");
+export function getDocuments(page = 1, limit = 50, search = "") {
+    const params = new URLSearchParams({ page, limit });
+    if (search) params.append("search", search);
+    return requestDocument(`/documents/?${params.toString()}`);
 }
 
 export function getDocument(id) {

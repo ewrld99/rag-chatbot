@@ -16,7 +16,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import DocumentChunk, FAQModel
-from app.services.embedding_service import get_embedding
+from app.services.embedding_service import EmbeddingServiceError, get_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +137,12 @@ class DenseRetriever:
                 .limit(top_k)
                 .all()
             )
+        except EmbeddingServiceError as exc:
+            log = logger.debug if exc.provider_cooldown else logger.warning
+            log("DenseRetriever embedding unavailable; using sparse retrieval only: %s", exc)
+            return []
         except Exception as exc:
-            logger.warning("DenseRetriever query failed: %s", exc)
+            logger.warning("DenseRetriever query failed; using sparse retrieval only: %s", exc)
             return []
 
         # Merge and sort
@@ -149,46 +153,68 @@ class DenseRetriever:
         for faq, dist in faq_rows:
             combined.append((dist, faq, "faq"))
             
-        combined.sort(key=lambda x: x[0])
-        # Do NOT slice to top_k here — return the full merged pool so RRF
-        # has richer candidates from both document chunks and FAQs.
+        combined.sort(key=lambda item: (float(item[0]), str(item[1].id)))
+        combined = combined[:top_k]
 
         results: list[DenseResult] = []
         for dist, item, type_ in combined:
+            similarity_score = round(max(0.0, 1.0 - float(dist)), 6)
             if type_ == "doc":
                 chunk = item
                 chunk_id = str(chunk.id)
                 doc_filename = chunk.document.filename if chunk.document and chunk.document.filename else "database"
                 doc_id = str(chunk.document_id)
-                
+                metadata = dict(chunk.metadata_ or {})
+                metadata.update(
+                    {
+                        "source": doc_filename,
+                        "chunk_index": chunk.chunk_index,
+                        "source_type": "document",
+                        "similarity_score": similarity_score,
+                    }
+                )
+                if chunk.page_number is not None:
+                    metadata["page_number"] = chunk.page_number
+                if chunk.document and chunk.document.title:
+                    metadata["document_title"] = chunk.document.title
+                if chunk.document and chunk.document.source_url:
+                    metadata["source_url"] = chunk.document.source_url
+                if chunk.document:
+                    metadata["document_status"] = chunk.document.status or "active"
+                    if chunk.document.content_hash:
+                        metadata["content_hash"] = chunk.document.content_hash
+                    if chunk.document.upload_date:
+                        metadata["document_uploaded_at"] = chunk.document.upload_date.isoformat()
+
                 results.append(
                     DenseResult(
                         chunk_id=chunk_id,
                         document_id=doc_id,
-                        similarity_score=round(max(0.0, 1.0 - float(dist)), 6),
+                        similarity_score=similarity_score,
                         text=chunk.chunk_text,
-                        metadata={
-                            "source": doc_filename,
-                            "chunk_index": chunk.chunk_index,
-                            "source_type": "document"
-                        },
+                        metadata=metadata,
                     )
                 )
             else:
                 faq = item
+                metadata = dict(faq.metadata_ or {})
+                metadata.update(
+                    {
+                        "source": f"FAQ - {faq.category}" if faq.category else "FAQ",
+                        "chunk_index": 0,
+                        "source_type": "faq",
+                        "faq_id": str(faq.id),
+                        "category": faq.category,
+                        "similarity_score": similarity_score,
+                    }
+                )
                 results.append(
                     DenseResult(
                         chunk_id=str(faq.id),
                         document_id=str(faq.id),
-                        similarity_score=round(max(0.0, 1.0 - float(dist)), 6),
+                        similarity_score=similarity_score,
                         text=f"{faq.question}\n\n{faq.answer}",
-                        metadata={
-                            "source": f"FAQ - {faq.category}" if faq.category else "FAQ",
-                            "chunk_index": 0,
-                            "source_type": "faq",
-                            "faq_id": str(faq.id),
-                            "category": faq.category
-                        },
+                        metadata=metadata,
                     )
                 )
 

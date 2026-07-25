@@ -41,3 +41,10 @@ class DocumentChunkResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class PaginatedDocumentResponse(BaseModel):
+    items: List[DocumentResponse]
+    total: int
+    page: int
+    limit: int
+    total_pages: int

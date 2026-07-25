@@ -71,12 +71,19 @@ const FaqIcon = () => (
     </svg>
 );
 
+const AliasIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 7h16" /><path d="M4 17h16" /><path d="M7 4l-2 16" /><path d="M19 4l-2 16" />
+    </svg>
+);
+
 const adminSections = [
     { id: "overview", label: "Dashboard", detail: "KPIs and system health", icon: <DashboardIcon /> },
     { id: "upload", label: "Upload", detail: "Add knowledge files", icon: <UploadIcon /> },
     { id: "documents", label: "Documents", detail: "Manage indexed content", icon: <DocumentIcon /> },
     { id: "vector", label: "Vector DB", detail: "Index status", icon: <VectorIcon /> },
     { id: "faq", label: "FAQs", detail: "Manage Q&A", icon: <FaqIcon /> },
+    { id: "acronyms", label: "Acronyms", detail: "Retrieval aliases", icon: <AliasIcon /> },
     { id: "feedback", label: "Feedback", detail: "User responses", icon: <MessageSquareIcon /> },
     { id: "settings", label: "RAG Settings", detail: "Pipeline configuration", icon: <SettingsIcon /> },
 ];

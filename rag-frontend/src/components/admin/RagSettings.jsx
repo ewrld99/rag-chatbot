@@ -25,6 +25,14 @@ const RefreshIcon = () => (
 );
 
 // ─── Setting metadata ──────────────────────────────────────────────────────────
+const GENERATION_MODELS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+];
+
 const SETTING_META = {
     chunk_size:         { label: "Chunk Size",           type: "number", min: 500,  max: 2000, step: 50,  reindex: true },
     chunk_overlap:      { label: "Chunk Overlap",        type: "number", min: 0,    max: 500,  step: 10,  reindex: true },
@@ -42,6 +50,32 @@ const SETTING_META = {
                               'jina-code-embeddings-1.5b', 'jina-clip-v1', 'jina-clip-v2', 'jina-colbert-v1-en', 
                               'jina-colbert-v2', 'elser-v2'
                           ], reindex: true  },
+    generation_default_model: {
+        label: "Default Answer Model",
+        type: "select",
+        options: GENERATION_MODELS,
+        reindex: false,
+    },
+    generation_allowed_models: {
+        label: "Enabled Models",
+        type: "text",
+        reindex: false,
+    },
+    generation_answer_model_order: {
+        label: "Answer Fallback Order",
+        type: "text",
+        reindex: false,
+    },
+    generation_utility_model_order: {
+        label: "Utility Fallback Order",
+        type: "text",
+        reindex: false,
+    },
+    generation_user_selection_enabled: {
+        label: "Allow User Model Selection",
+        type: "toggle",
+        reindex: false,
+    },
     max_upload_size_mb: { label: "Max Upload Size (MB)", type: "number", min: 1,    max: 100,  step: 1,   reindex: false },
     allowed_extensions: { label: "Allowed Extensions",  type: "text",                                    reindex: false },
     crawler_allowlist:  { label: "Crawler Allowlist (Domains)", type: "text",                            reindex: false },
@@ -70,6 +104,19 @@ const GROUPS = [
         eyebrow: "Embedding Model",
         description: "Which model generates vector representations of text.",
         keys: ["embedding_model"],
+    },
+    {
+        id: "generation",
+        label: "Generation",
+        eyebrow: "Model Routing",
+        description: "Control user model choices and automatic failover priority.",
+        keys: [
+            "generation_default_model",
+            "generation_allowed_models",
+            "generation_answer_model_order",
+            "generation_utility_model_order",
+            "generation_user_selection_enabled",
+        ],
     },
     {
         id: "upload",

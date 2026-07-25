@@ -97,8 +97,8 @@ a {
   gap: 24px;
   padding: 14px 24px;
   color: var(--app-text);
-  background: rgba(250, 249, 245, 0.94);
-  border-bottom: 1px solid #e8e2d6;
+  background: var(--app-surface);
+  border-bottom: 1px solid var(--app-border);
   backdrop-filter: blur(14px);
 }
 
@@ -181,7 +181,7 @@ a {
 
 .chat-sidebar.closed {
   width: 64px;
-  background: #111827;
+  background: var(--app-surface-muted);
 }
 
 .sidebar-toggle {
@@ -191,10 +191,17 @@ a {
   z-index: 5;
   width: 40px;
   height: 40px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--app-border);
   border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.1);
+  background: var(--app-surface);
+  box-shadow: var(--app-shadow);
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.sidebar-toggle:hover {
+  border-color: var(--app-accent);
+  transform: translateY(-1px);
 }
 
 .sidebar-toggle-icon {
@@ -211,12 +218,12 @@ a {
 
 .sidebar-toggle-icon span:first-child {
   border-radius: 2px;
-  background: #1f2937;
+  background: var(--app-border-strong);
 }
 
 .sidebar-toggle-icon span:last-child {
-  border-top: 2px solid #1f2937;
-  border-bottom: 2px solid #1f2937;
+  border-top: 2px solid var(--app-border-strong);
+  border-bottom: 2px solid var(--app-border-strong);
 }
 
 .chat-sidebar-content {
@@ -226,9 +233,9 @@ a {
   gap: 12px;
   padding: 14px;
   overflow: hidden;
-  color: #f8fafc;
-  background: #111827;
-  border-right: 1px solid #263244;
+  color: var(--app-text);
+  background: var(--app-surface-muted);
+  border-right: 1px solid var(--app-border);
 }
 
 .chat-sidebar-header h2,
@@ -243,9 +250,19 @@ a {
   border: 0;
   border-radius: 8px;
   padding: 10px 12px;
-  color: #f8fafc;
-  background: #263244;
+  color: var(--app-surface);
+  background: var(--app-text);
   font-weight: 800;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.new-chat-button:hover,
+.open-auth-button:hover,
+.chat-auth-card button:hover,
+.chat-user-card button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
 }
 
 .new-chat-button {
@@ -253,8 +270,9 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
-  border: 1px solid #334155;
+  border: 1px solid var(--app-border);
   background: transparent;
+  color: var(--app-text);
   text-align: left;
 }
 
@@ -264,7 +282,8 @@ a {
   display: grid;
   place-items: center;
   border-radius: 6px;
-  background: #2563eb;
+  background: var(--app-accent);
+  color: var(--app-surface);
 }
 
 .guest-note,
@@ -273,9 +292,9 @@ a {
   display: grid;
   gap: 12px;
   padding: 14px;
-  border: 1px solid #334155;
+  border: 1px solid var(--app-border);
   border-radius: 8px;
-  background: #1f2937;
+  background: var(--app-surface);
 }
 
 .guest-note h3,
@@ -651,15 +670,6 @@ a {
   background: var(--app-accent-soft);
 }
 
-.admin-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 0 8px;
-  margin-bottom: 4px;
-  border-bottom: 1px solid #e3ded2;
-}
-
 .admin-brand h1 {
   margin: 0;
   color: var(--app-text);
@@ -712,22 +722,27 @@ a {
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
 
-.admin-side-nav a:hover,
-.admin-side-nav a.active {
+.admin-nav-item:hover,
+.admin-nav-item.active {
+  background: var(--app-surface);
+  color: var(--app-text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+}
+
+.admin-nav-item.active {
   color: var(--app-accent);
-  border-color: #e8cdb8;
-  background: var(--app-accent-soft);
 }
 
 .admin-nav-icon {
-  width: 28px;
-  height: 28px;
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  border-radius: 8px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: var(--app-surface-muted);
+  border: 1px solid var(--app-border);
   color: var(--app-accent);
-  background: var(--app-accent-soft);
 }
 
 .admin-nav-copy {

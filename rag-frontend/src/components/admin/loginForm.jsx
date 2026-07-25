@@ -305,7 +305,7 @@ const styles = {
         padding: "12px 14px",
         borderRadius: "10px",
         background: "var(--app-danger-soft)",
-        border: "1px solid #f1c4b2",
+        border: "1px solid var(--app-border-strong)",
         color: "var(--app-danger)",
         fontSize: "13px",
     },
@@ -335,7 +335,7 @@ const styles = {
     spinner: {
         width: "16px",
         height: "16px",
-        border: "2px solid rgba(255,250,240,0.35)",
+        border: "2px solid var(--app-border-strong)",
         borderTop: "2px solid var(--app-surface-muted)",
         borderRadius: "50%",
         animation: "spin 0.8s linear infinite",

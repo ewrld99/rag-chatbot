@@ -1,20 +1,32 @@
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+from typing import Any, List, Optional
 from sqlalchemy.orm import Session
 from app.db.models import SystemSetting, AuditLog
 from app.core.config import settings as env_settings
+from app.services.model_catalog import (
+    DEFAULT_ANSWER_MODEL_ORDER,
+    DEFAULT_MODEL,
+    DEFAULT_UTILITY_MODEL_ORDER,
+    SUPPORTED_MODEL_IDS,
+)
 
 # Keys that require all documents to be reindexed when changed
 REINDEX_REQUIRED_KEYS = {"chunk_size", "chunk_overlap", "embedding_model"}
 
 DEFAULT_SETTINGS = [
-    {"key": "chunk_size", "value": "800", "description": "Size of each text chunk (characters)", "category": "rag"},
+    {"key": "chunk_size", "value": "1500", "description": "Size of each text chunk (characters)", "category": "rag"},
     {"key": "chunk_overlap", "value": "100", "description": "Character overlap between consecutive chunks", "category": "rag"},
     {"key": "top_k_dense", "value": "20", "description": "Candidate pool size for dense (vector) retrieval", "category": "retrieval"},
     {"key": "top_k_sparse", "value": "20", "description": "Candidate pool size for sparse (FTS) retrieval", "category": "retrieval"},
     {"key": "top_k_final", "value": "5", "description": "Final number of chunks passed to the LLM", "category": "retrieval"},
-    {"key": "rrf_k", "value": "60", "description": "RRF smoothing constant — higher values reduce top-rank influence", "category": "retrieval"},
-    {"key": "enable_reranker", "value": "false", "description": "Enable cross-encoder reranking after fusion", "category": "retrieval"},
+    {"key": "rrf_k", "value": "60", "description": "RRF smoothing constant ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â higher values reduce top-rank influence", "category": "retrieval"},
+    {"key": "enable_reranker", "value": "true", "description": "Enable reranking after fusion; uses Jina when configured and local lexical fallback otherwise", "category": "retrieval"},
     {"key": "embedding_model", "value": env_settings.EMBEDDING_MODEL, "description": "Model used to generate embeddings", "category": "embeddings"},
+    {"key": "generation_default_model", "value": DEFAULT_MODEL, "description": "Primary model used when users select Auto", "category": "generation"},
+    {"key": "generation_allowed_models", "value": ",".join(SUPPORTED_MODEL_IDS), "description": "Models users and automatic failover may use", "category": "generation"},
+    {"key": "generation_answer_model_order", "value": ",".join(DEFAULT_ANSWER_MODEL_ORDER), "description": "Fallback priority for user-facing answers", "category": "generation"},
+    {"key": "generation_utility_model_order", "value": ",".join(DEFAULT_UTILITY_MODEL_ORDER), "description": "Fallback priority for intent classification and query rewriting", "category": "generation"},
+    {"key": "generation_user_selection_enabled", "value": "true", "description": "Allow users to select an enabled answer model", "category": "generation"},
     {"key": "similarity_metric", "value": "cosine", "description": "Vector similarity metric", "category": "retrieval"},
     {"key": "max_upload_size_mb", "value": "20", "description": "Maximum allowed upload size in megabytes", "category": "upload"},
     {"key": "allowed_extensions", "value": "pdf,docx,txt", "description": "Comma-separated list of allowed file extensions", "category": "upload"},
@@ -27,7 +39,7 @@ def seed_default_settings(db: Session):
     """Seed default system settings into the DB if they don't exist."""
     for setting_data in DEFAULT_SETTINGS:
         existing = db.query(SystemSetting).filter_by(key=setting_data["key"]).first()
-        if not existing:
+        if existing is None:
             setting = SystemSetting(
                 key=setting_data["key"],
                 value=setting_data["value"],
@@ -40,6 +52,8 @@ def seed_default_settings(db: Session):
 
 
 class SettingsService:
+    _cache: dict[str, str] | None
+
     """
     Provides typed, cached access to system settings stored in the database.
 
@@ -59,7 +73,7 @@ class SettingsService:
 
     def __init__(self, db: Session):
         self.db = db
-        self._cache: Optional[Dict[str, str]] = None  # raw string values, None = not loaded
+        self._cache = None  # raw string values, None = not loaded
 
     # ------------------------------------------------------------------
     # Cache management
@@ -70,7 +84,10 @@ class SettingsService:
         if self._cache is not None:
             return
         rows = self.db.query(SystemSetting).all()
-        self._cache = {row.key: row.value for row in rows}
+        cache: dict[str, str] = {}
+        for row in rows:
+            cache[str(row.key)] = str(row.value)
+        self._cache = cache
 
     def _raw(self, key: str) -> Optional[str]:
         """Return the raw string value for a key, or None if not found."""
@@ -103,7 +120,7 @@ class SettingsService:
         return [ext.strip() for ext in raw.split(",") if ext.strip()]
 
     # ------------------------------------------------------------------
-    # Typed properties – RAG
+    # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ RAG
     # ------------------------------------------------------------------
 
     @property
@@ -115,7 +132,7 @@ class SettingsService:
         return self._int("chunk_overlap", env_settings.DOCUMENT_CHUNK_OVERLAP)
 
     # ------------------------------------------------------------------
-    # Typed properties – Retrieval
+    # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Retrieval
     # ------------------------------------------------------------------
 
     @property
@@ -136,10 +153,10 @@ class SettingsService:
 
     @property
     def enable_reranker(self) -> bool:
-        return self._bool("enable_reranker", False)
+        return self._bool("enable_reranker", True)
 
     # ------------------------------------------------------------------
-    # Typed properties – Embeddings
+    # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Embeddings
     # ------------------------------------------------------------------
 
     @property
@@ -147,7 +164,40 @@ class SettingsService:
         return self._str("embedding_model", env_settings.EMBEDDING_MODEL)
 
     # ------------------------------------------------------------------
-    # Typed properties – Upload
+    # Typed properties - Generation
+    # ------------------------------------------------------------------
+
+    @property
+    def generation_default_model(self) -> str:
+        return self._str("generation_default_model", env_settings.GROQ_MODEL)
+
+    @property
+    def generation_allowed_models(self) -> List[str]:
+        return self._list(
+            "generation_allowed_models",
+            list(DEFAULT_ANSWER_MODEL_ORDER),
+        )
+
+    @property
+    def generation_answer_model_order(self) -> List[str]:
+        return self._list(
+            "generation_answer_model_order",
+            list(DEFAULT_ANSWER_MODEL_ORDER),
+        )
+
+    @property
+    def generation_utility_model_order(self) -> List[str]:
+        return self._list(
+            "generation_utility_model_order",
+            list(DEFAULT_UTILITY_MODEL_ORDER),
+        )
+
+    @property
+    def generation_user_selection_enabled(self) -> bool:
+        return self._bool("generation_user_selection_enabled", True)
+
+    # ------------------------------------------------------------------
+    # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Upload
     # ------------------------------------------------------------------
 
     @property
@@ -159,7 +209,7 @@ class SettingsService:
         return self._list("allowed_extensions", ["pdf", "docx", "txt", "md"])
 
     # ------------------------------------------------------------------
-    # Typed properties – Crawler
+    # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Crawler
     # ------------------------------------------------------------------
 
     @property
@@ -205,10 +255,10 @@ class SettingsService:
 
     def update(self, key: str, value: str, admin_username: str = "System") -> SystemSetting:
         setting = self.db.query(SystemSetting).filter(SystemSetting.key == key).first()
-        if not setting:
+        if setting is None:
             raise KeyError(f"Setting '{key}' not found")
 
-        old_value = setting.value
+        old_value = str(getattr(setting, "value"))
         value = str(value).strip()
 
         if old_value == value:
@@ -241,6 +291,50 @@ class SettingsService:
             elif key == "embedding_model":
                 if not value:
                     raise ValueError("embedding_model cannot be empty")
+            elif key == "generation_default_model":
+                if value not in SUPPORTED_MODEL_IDS:
+                    raise ValueError("generation_default_model is not supported")
+                if value not in self.generation_allowed_models:
+                    raise ValueError("generation_default_model must be enabled")
+            elif key in {
+                "generation_allowed_models",
+                "generation_answer_model_order",
+                "generation_utility_model_order",
+            }:
+                models = [model.strip() for model in value.split(",") if model.strip()]
+                if not models:
+                    raise ValueError(f"{key} must contain at least one model")
+                unsupported = [
+                    model for model in models
+                    if model not in SUPPORTED_MODEL_IDS
+                ]
+                if unsupported:
+                    raise ValueError(
+                        f"{key} contains unsupported models: {', '.join(unsupported)}"
+                    )
+                models = list(dict.fromkeys(models))
+                if (
+                    key == "generation_allowed_models"
+                    and self.generation_default_model not in models
+                ):
+                    raise ValueError(
+                        "generation_allowed_models must include the default model"
+                    )
+                if (
+                    key != "generation_allowed_models"
+                    and any(
+                        model not in self.generation_allowed_models
+                        for model in models
+                    )
+                ):
+                    raise ValueError(f"{key} may contain only enabled models")
+                value = ",".join(models)
+            elif key == "generation_user_selection_enabled":
+                if value.lower() not in {"true", "false"}:
+                    raise ValueError(
+                        "generation_user_selection_enabled must be true or false"
+                    )
+                value = value.lower()
             elif key == "allowed_extensions":
                 import re
                 value = value.replace(" ", "")
@@ -261,7 +355,7 @@ class SettingsService:
                 raise ValueError(f"{key} must be an integer")
             raise
 
-        setting.value = value
+        setattr(setting, "value", value)
         
         # Create audit log
         audit = AuditLog(

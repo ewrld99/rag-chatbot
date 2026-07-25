@@ -1,5 +1,13 @@
 import pytest
 from app.services.embedding_service import EmbeddingService
+from app.services.jina_resilience import jina_provider_circuit
+
+
+@pytest.fixture(autouse=True)
+def reset_jina_circuit():
+    jina_provider_circuit.reset()
+    yield
+    jina_provider_circuit.reset()
 
 def test_embed_batch_handles_batching(db_session, monkeypatch):
     import app.core.config
@@ -51,3 +59,30 @@ def test_embed_batch_strips_empty_texts(db_session, monkeypatch):
     
     assert len(result) == 1
     assert call_count == 1
+
+
+def test_jina_cooldown_fails_fast_without_api_call(db_session, monkeypatch):
+    import app.core.config
+    from app.services.embedding_service import EmbeddingServiceError
+
+    monkeypatch.setattr(app.core.config.settings, "EMBEDDING_PROVIDER", "jina")
+    monkeypatch.setattr(app.core.config.settings, "JINA_API_KEY", "test-key")
+
+    service = EmbeddingService(db_session)
+    calls = 0
+
+    class FailEmbeddings:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("Jina must not be called during cooldown.")
+
+    service.client = type("FakeClient", (), {"embeddings": FailEmbeddings()})()
+    jina_provider_circuit.record_account_failure()
+
+    with pytest.raises(EmbeddingServiceError) as captured:
+        service._embed_jina("query")
+
+    assert captured.value.provider_cooldown is True
+    assert captured.value.status_code == 503
+    assert calls == 0

@@ -16,6 +16,14 @@ from pydantic import BaseModel, Field
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, description="User question")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
+    model_preference: Literal[
+        "auto",
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
+        "openai/gpt-oss-20b",
+        "llama-3.1-8b-instant",
+    ] = "auto"
 
 
 class RetrievedChunk(BaseModel):
@@ -25,8 +33,8 @@ class RetrievedChunk(BaseModel):
     dense_rank: int | None
     sparse_rank: int | None
     retrieval_sources: list[Literal["dense", "sparse"]]
-    text: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    text: str
 
 
 class SourceItem(BaseModel):
@@ -39,6 +47,9 @@ class QueryResponse(BaseModel):
     sources: list[SourceItem]
     retrieved_chunks: list[RetrievedChunk]
     latency_ms: float
+    requested_model: str = "auto"
+    selected_model: str | None = None
+    fallback_used: bool = False
 
 
 # ---------------------------------------------------------------------------

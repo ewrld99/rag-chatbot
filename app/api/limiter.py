@@ -15,15 +15,27 @@ Usage as a FastAPI dependency:
 The limiter raises HTTP 429 (Too Many Requests) with a Retry-After header
 when the per-IP request count exceeds `limit` within `window` seconds.
 
-The same sliding-window helper is used by ws_chat.py for WebSocket messages,
-keeping the rate-limiting logic consistent across the whole API.
+⚠️  PRODUCTION WARNING — IN-MEMORY ONLY
+This store lives in each Python process. It has two known limitations:
+
+  1. Multi-worker: running `uvicorn --workers N` gives each worker an
+     independent store, so a client can make N × limit requests before
+     being throttled. To fix this, switch to a shared Redis backend
+     (e.g. `slowapi` with `RedisStore`, or `fastapi-limiter`).
+
+  2. Restart reset: counters are cleared whenever the process restarts.
+
+For a single-worker development server both limitations are acceptable.
 """
 
+import logging
 import time
 from collections import defaultdict
 from typing import Dict, List
 
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 # Shared in-memory request log: { client_ip: [monotonic_timestamps] }
 _request_log: Dict[str, List[float]] = defaultdict(list)

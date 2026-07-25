@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sqlalchemy import create_engine
 from sqlalchemy import text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -7,6 +9,7 @@ from app.core.config import settings
 engine = create_engine(settings.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
 def get_db():
@@ -15,6 +18,40 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def run_sql_migrations(conn) -> None:
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ DEFAULT now() NOT NULL
+            )
+            """
+        )
+    )
+
+    applied_versions = set(
+        conn.execute(text("SELECT version FROM schema_migrations")).scalars().all()
+    )
+
+    if not MIGRATIONS_DIR.exists():
+        return
+
+    for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        version = migration_path.stem
+        if version in applied_versions:
+            continue
+
+        migration_sql = migration_path.read_text(encoding="utf-8").strip()
+        if migration_sql:
+            conn.exec_driver_sql(migration_sql)
+
+        conn.execute(
+            text("INSERT INTO schema_migrations (version) VALUES (:version)"),
+            {"version": version},
+        )
 
 
 def init_db():
@@ -30,6 +67,9 @@ def init_db():
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS programme TEXT;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS campus TEXT;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS admission_year INTEGER;"))
+
+    with engine.begin() as conn:
+        run_sql_migrations(conn)
 
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))

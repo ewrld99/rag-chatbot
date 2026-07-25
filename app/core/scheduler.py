@@ -27,8 +27,8 @@ async def run_announcement_crawler():
         start_urls = [
             "https://www.udom.ac.tz/announcements"
         ]
-        # Only check the first 2 announcements (3 pages total) for testing
-        await svc.run_crawler(start_urls, max_pages=21, job_type="announcements")
+        # Only crawl 1 page as requested
+        await svc.run_crawler(start_urls, max_pages=1, job_type="announcements")
     except Exception as e:
         logger.error(f"Announcement Crawler failed: {e}")
     finally:

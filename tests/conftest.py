@@ -1,5 +1,6 @@
 import os
 import sys
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -9,8 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.main import app
 from app.db.session import engine, get_db
-from app.api.deps import get_rag_pipeline
-from app.db.models import Base
+from app.db.models import AuditLog, Base, FAQModel, SystemSetting
 
 # Setup database tables just in case
 Base.metadata.create_all(bind=engine)
@@ -19,37 +19,64 @@ Base.metadata.create_all(bind=engine)
 @pytest.fixture(scope="function")
 def db_session():
     """
-    Creates a fresh SQLAlchemy session for a test, wrapped in a transaction.
-    After the test completes, the transaction is rolled back, ensuring
-    no test data pollutes the development database.
+    Create an isolated SQLAlchemy session for each test.
+
+    The suite may run against a development database that already contains
+    seeded settings/FAQs. We clear only the small tables these tests mutate
+    inside an outer transaction, then roll everything back after the test.
     """
     connection = engine.connect()
     transaction = connection.begin()
-    session = Session(bind=connection)
+    session = Session(
+        bind=connection,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
 
-    yield session
+    try:
+        session.query(AuditLog).delete(synchronize_session=False)
+        session.query(FAQModel).delete(synchronize_session=False)
+        session.query(SystemSetting).delete(synchronize_session=False)
+        session.commit()
 
-    session.close()
-    transaction.rollback()
-    connection.close()
+        yield session
+    finally:
+        session.close()
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
 
 
 @pytest.fixture(scope="function")
 def client(db_session):
     """
     FastAPI TestClient with overridden database and mocked services.
+
+    Each request gets its own Session object while sharing the same outer
+    transaction as the test body. That avoids cross-thread reuse of the
+    test Session while keeping request data visible and rollbackable.
     """
-    # Override get_db dependency
+    connection = db_session.get_bind()
+
     def override_get_db():
-        yield db_session
+        request_session = Session(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield request_session
+        finally:
+            request_session.close()
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with TestClient(app) as test_client:
+    test_client = TestClient(app)
+    try:
         yield test_client
-
-    # Clean up overrides
-    app.dependency_overrides.clear()
+    finally:
+        test_client.close()
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -68,7 +95,7 @@ def mock_embedding_service(monkeypatch):
 
         def embed_batch(self, texts):
             return [[0.1] * self.dimension for _ in texts]
-            
+
         def safe_embed(self, text):
             return [0.1] * self.dimension
 

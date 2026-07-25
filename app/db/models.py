@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Text, text, Boolean, Index
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Text, text, Boolean, Index, Float
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -46,6 +46,7 @@ class ChatMessage(Base):
     session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     role = Column(Text, nullable=False)
     content = Column(Text, nullable=False)
+    sources = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     feedback = Column(Integer, nullable=True)  # 1: Thumbs Up, -1: Thumbs Down
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -84,6 +85,19 @@ class DocumentChunk(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     document = relationship("DocumentModel", back_populates="chunks")
+
+
+class RetrievalAlias(Base):
+    __tablename__ = "retrieval_aliases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, index=True, server_default=text("gen_random_uuid()"))
+    term = Column(Text, nullable=False)
+    aliases = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    category = Column(Text, nullable=True)
+    weight = Column(Float, nullable=False, server_default=text("1.0"))
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class SystemSetting(Base):

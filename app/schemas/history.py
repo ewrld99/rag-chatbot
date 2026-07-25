@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import List
+from typing import Any, Dict, List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ChatSessionCreate(BaseModel):
@@ -24,6 +24,7 @@ class ChatMessageResponse(BaseModel):
     session_id: int
     role: str
     content: str
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
 
     class Config:

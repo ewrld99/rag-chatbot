@@ -94,6 +94,7 @@ def test_faq_service_crud(mock_log, mock_get_embedding, mock_db_session):
 @patch("app.services.faq_service.log_audit")
 def test_bulk_import_batched(mock_log, mock_get_embeddings, mock_db_session):
     svc = FAQService(mock_db_session)
+    mock_db_session.query.return_value.filter.return_value.first.return_value = None
     mock_get_embeddings.return_value = [[0.1]*1024, [0.2]*1024]
     
     df = pd.DataFrame({

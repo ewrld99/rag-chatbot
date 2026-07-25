@@ -99,6 +99,10 @@ export function getFeedbackMessages(skip = 0, limit = 100) {
     return request(`/api/chat/feedback/messages?skip=${skip}&limit=${limit}`);
 }
 
+export function getGenerationModels() {
+    return request("/api/chat/models");
+}
+
 export function getChatSessions(userId) {
     return request(`/api/chat/users/${userId}/sessions`);
 }

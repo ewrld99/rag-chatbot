@@ -9,12 +9,21 @@ from app.api.limiter import RateLimiter
 from app.schemas.chat import ChatRequest, ChatResponse, MessageFeedbackRequest
 from app.schemas.history import ChatSessionCreate, ChatSessionDetail, ChatSessionResponse
 from app.services.rag_pipeline import RAGPipeline
-from app.api.deps import get_rag_pipeline
+from app.api.deps import get_chat_history, get_rag_pipeline, get_user_profile
 from app.db.models import ChatMessage, ChatSession, User
 from app.db.session import get_db, SessionLocal
+from app.services.generation_resilience import GenerationUnavailableError
+from app.services.model_router import ModelRouter
+from app.services.settings_service import SettingsService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/models")
+def list_generation_models(db: Session = Depends(get_db)):
+    """Return the admin-approved model options exposed to chat users."""
+    return ModelRouter(SettingsService(db)).public_policy()
 
 
 def get_user_or_404(user_id: int, db: Session) -> User:
@@ -83,6 +92,7 @@ def chat(
     body: ChatRequest,
     debug: bool = Query(False, description="Enable debug mode"),
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    db: Session = Depends(get_db),
     _: None = Depends(RateLimiter(limit=20, window=60)),
 ):
     """
@@ -94,54 +104,66 @@ def chat(
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    user_profile = None
-    if body.user_id:
-        from app.db.session import SessionLocal
-        from app.db.models import User
-        from datetime import datetime
-        with SessionLocal() as db:
-            user = db.query(User).filter(User.id == body.user_id).first()
-            if user:
-                year = None
-                if user.admission_year:
-                    now = datetime.now()
-                    current_academic_year_start = now.year if now.month >= 9 else now.year - 1
-                    year = max(1, (current_academic_year_start - user.admission_year) + 1)
-                
-                user_profile = {
-                    "registration_number": user.registration_number,
-                    "programme": user.programme,
-                    "campus": user.campus,
-                    "year_of_study": year,
-                }
+    # Fix #3: single call, uses the already-open request DB session
+    user_profile = get_user_profile(body.user_id, db)
+
+    # Authenticated history comes from the owned DB session. Guests use only
+    # bounded, role-validated in-memory history from the current browser chat.
+    chat_history = get_chat_history(
+        body.user_id,
+        body.session_id,
+        body.history,
+        db,
+    )
 
     try:
         # ✅ Debug Mode
         if debug:
-            result = rag_pipeline.run_debug(body.message, chat_history=body.history, user_profile=user_profile)
+            result = rag_pipeline.run_debug(
+                body.message,
+                chat_history=chat_history,
+                user_profile=user_profile,
+                model_preference=body.model_preference,
+            )
 
             return {
                 "response": result["answer"],
                 "sources": [],
-                "debug": result["debug"]
+                "debug": result["debug"],
+                "requested_model": body.model_preference,
+                "selected_model": result.get("selected_model"),
+                "fallback_used": result.get("fallback_used", False),
             }
 
         # ✅ Normal Mode
-        result = rag_pipeline.run(body.message, chat_history=body.history, user_profile=user_profile)
+        result = rag_pipeline.run(
+            body.message,
+            chat_history=chat_history,
+            user_profile=user_profile,
+            model_preference=body.model_preference,
+        )
 
         return ChatResponse(
             response=result["answer"],
-            sources=result["sources"]
+            sources=result["sources"],
+            requested_model=result.get("requested_model", body.model_preference),
+            selected_model=result.get("selected_model"),
+            fallback_used=result.get("fallback_used", False),
         )
 
-    except Exception as e:
+    except HTTPException:
+        raise
+    except GenerationUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=exc.public_payload()) from exc
+    except Exception as exc:
+        logger.exception("Unexpected chat processing failure")
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "Chat processing failed",
-                "message": str(e)
+                "code": "CHAT_PROCESSING_FAILED",
+                "message": "Unable to process your request right now. Please try again.",
             }
-        )
+        ) from exc
 
 
 # -----------------------------------------------------------------------
@@ -151,6 +173,7 @@ def chat(
 async def chat_stream(
     body: ChatRequest,
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    db: Session = Depends(get_db),
     _: None = Depends(RateLimiter(limit=20, window=60)),
 ):
     """
@@ -168,90 +191,125 @@ async def chat_stream(
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    user_profile = None
-    if body.user_id:
-        from app.db.session import SessionLocal
-        from app.db.models import User
-        from datetime import datetime
-        with SessionLocal() as db:
-            user = db.query(User).filter(User.id == body.user_id).first()
-            if user:
-                year = None
-                if user.admission_year:
-                    now = datetime.now()
-                    # Academic year starts in September
-                    current_academic_year_start = now.year if now.month >= 9 else now.year - 1
-                    year = max(1, (current_academic_year_start - user.admission_year) + 1)
-                
-                user_profile = {
-                    "registration_number": user.registration_number,
-                    "programme": user.programme,
-                    "campus": user.campus,
-                    "year_of_study": year,
-                }
+    # Fix #3: single call using the already-open request DB session
+    user_profile = get_user_profile(body.user_id, db)
+
+    # This raises HTTP 403 for an unowned authenticated session. A true guest
+    # has no IDs and receives sanitized recent browser history instead.
+    chat_history = get_chat_history(
+        body.user_id,
+        body.session_id,
+        body.history,
+        db,
+    )
 
     async def event_stream():
         full_response = ""
         assistant_message_id = None
+        response_sources = []
+        response_model = {
+            "requested_model": body.model_preference,
+            "selected_model": None,
+            "fallback_used": False,
+        }
 
         try:
-            # ── Stream tokens from RAG pipeline ────────────────────────────
-            async for token in rag_pipeline.stream(
+            # ── Stream tokens from RAG pipeline ───────────────────────────
+            async for event in rag_pipeline.stream_events(
                 body.message,
-                chat_history=body.history,
+                chat_history=chat_history,
                 user_profile=user_profile,
+                model_preference=body.model_preference,
             ):
+                if event["type"] == "sources":
+                    response_sources = event["sources"]
+                    continue
+                if event["type"] == "model":
+                    response_model = {
+                        "requested_model": event["requested_model"],
+                        "selected_model": event["selected_model"],
+                        "fallback_used": event["fallback_used"],
+                    }
+                    continue
+                token = str(event["token"])
                 full_response += token
-                payload = json.dumps({"type": "stream", "token": token}, ensure_ascii=False)
-                yield f"data: {payload}\n\n"
+                stream_payload = json.dumps({"type": "stream", "token": token}, ensure_ascii=False)
+                yield f"data: {stream_payload}\n\n"
 
-        except Exception as exc:
-            logger.exception("SSE stream error")
-            err_payload = json.dumps({"type": "error", "message": str(exc)})
+        except GenerationUnavailableError as exc:
+            safe_sources = response_sources or exc.sources
+            err_payload = json.dumps(
+                {
+                    "type": "error",
+                    **exc.public_payload(sources=safe_sources),
+                },
+                ensure_ascii=False,
+            )
+            yield f"data: {err_payload}\n\n"
+            return
+        except Exception:
+            logger.exception("Unexpected SSE stream failure")
+            err_payload = json.dumps(
+                {
+                    "type": "error",
+                    "code": "CHAT_STREAM_FAILED",
+                    "message": "Unable to complete the answer right now. Please try again.",
+                    "sources": response_sources,
+                },
+                ensure_ascii=False,
+            )
             yield f"data: {err_payload}\n\n"
             return
 
-        # ── Persist to DB if caller supplied session context ────────────────
+        # ── Persist to DB if caller supplied session context ──────────────────
         if body.user_id and body.session_id and full_response:
-            db: Session = SessionLocal()
-            try:
-                session = (
-                    db.query(ChatSession)
-                    .filter(
-                        ChatSession.id == body.session_id,
-                        ChatSession.user_id == body.user_id,
+            with SessionLocal() as persist_db:
+                try:
+                    session = (
+                        persist_db.query(ChatSession)
+                        .filter(
+                            ChatSession.id == body.session_id,
+                            ChatSession.user_id == body.user_id,
+                        )
+                        .first()
                     )
-                    .first()
-                )
-                if session:
-                    user_msg = ChatMessage(
-                        session_id=body.session_id,
-                        role="user",
-                        content=body.message,
-                    )
-                    db.add(user_msg)
+                    if session:
+                        user_msg = ChatMessage(
+                            session_id=body.session_id,
+                            role="user",
+                            content=body.message,
+                        )
+                        persist_db.add(user_msg)
 
-                    asst_msg = ChatMessage(
-                        session_id=body.session_id,
-                        role="assistant",
-                        content=full_response,
-                    )
-                    db.add(asst_msg)
+                        asst_msg = ChatMessage(
+                            session_id=body.session_id,
+                            role="assistant",
+                            content=full_response,
+                            sources=response_sources,
+                        )
+                        persist_db.add(asst_msg)
 
-                    if session.title == "New chat":
-                        session.title = body.message[:80]
-                    session.updated_at = func.now()
-                    db.commit()
-                    db.refresh(asst_msg)
-                    assistant_message_id = asst_msg.id
-            except Exception as exc:
-                logger.warning("SSE: failed to persist chat exchange: %s", exc)
-                db.rollback()
-            finally:
-                db.close()
+                        if session.title == "New chat":
+                            session.title = body.message[:80]
+                        session.updated_at = func.now()
+                        persist_db.commit()
+                        persist_db.refresh(asst_msg)
+                        assistant_message_id = asst_msg.id
+                except Exception as exc:
+                    logger.warning("SSE: failed to persist chat exchange: %s", exc)
+                    persist_db.rollback()
 
-        # ── Signal completion ───────────────────────────────────────────────
-        yield f"data: {json.dumps({'type': 'done', 'message_id': assistant_message_id})}\n\n"
+        # ── Signal completion ─────────────────────────────────────────
+        done_payload = json.dumps(
+            {
+                "type": "done",
+                "message_id": assistant_message_id,
+                "sources": response_sources,
+                **response_model,
+            },
+            ensure_ascii=False,
+        )
+        yield f"data: {done_payload}\n\n"
 
     return StreamingResponse(
         event_stream(),

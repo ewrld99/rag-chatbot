@@ -9,18 +9,26 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 import base64
+import csv
+import io
 import json
 
 from app.utils.loaders import load_document
 from app.utils.chunking import split_text
 from app.core.config import settings
 from app.services.embedding_service import EmbeddingServiceError, get_embeddings
-from app.db.models import DocumentModel, DocumentChunk
+from app.db.models import DocumentModel, DocumentChunk, RetrievalAlias
 from app.db.session import get_db
-from app.schemas.document import DocumentCreate, DocumentResponse, DocumentUpdate
+from app.schemas.document import (
+    DocumentCreate, 
+    DocumentUpdate, 
+    DocumentResponse, 
+    PaginatedDocumentResponse
+)
 from app.services.settings_service import SettingsService
 from app.schemas.settings import SystemSettingResponse, SystemSettingUpdate
 from app.services.faq_service import FAQService
+from app.services.alias_expansion_service import AliasExpansionService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -112,20 +120,38 @@ def rebuild_document_chunks(
 # ---------------------------------------
 # Document CRUD
 # ---------------------------------------
-from sqlalchemy import func
+from sqlalchemy import Text, func, or_
 from app.db.models import DocumentChunk
 
-@router.get("/documents/", response_model=list[DocumentResponse])
-def list_documents(db: Session = Depends(get_db)):
-    results = db.query(DocumentModel, func.count(DocumentChunk.id).label("chunk_count")) \
-        .outerjoin(DocumentChunk, DocumentModel.id == DocumentChunk.document_id) \
-        .group_by(DocumentModel.id) \
-        .order_by(DocumentModel.upload_date.desc()) \
-        .all()
+@router.get("/documents/", response_model=PaginatedDocumentResponse)
+def list_documents(
+    page: int = 1,
+    limit: int = 50,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(DocumentModel, func.count(DocumentChunk.id).label("chunk_count")) \
+        .outerjoin(DocumentChunk, DocumentModel.id == DocumentChunk.document_id)
+        
+    if search:
+        search_filter = f"%{search}%"
+        query = query.filter(
+            (DocumentModel.filename.ilike(search_filter)) | 
+            (DocumentModel.title.ilike(search_filter))
+        )
+        
+    query = query.group_by(DocumentModel.id).order_by(DocumentModel.upload_date.desc())
     
-    output = []
+    # Calculate totals
+    total = query.count()
+    total_pages = (total + limit - 1) // limit if limit > 0 else 1
+    
+    # Apply pagination
+    results = query.offset((page - 1) * limit).limit(limit).all()
+    
+    items = []
     for doc, count in results:
-        output.append({
+        items.append({
             "id": str(doc.id),
             "title": doc.title,
             "filename": doc.filename,
@@ -136,7 +162,14 @@ def list_documents(db: Session = Depends(get_db)):
             "status": doc.status,
             "chunk_count": count,
         })
-    return output
+        
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages
+    }
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
@@ -559,7 +592,7 @@ def _reindex_documents_task(doc_ids: list[str]) -> None:
                     target_file_path = os.path.join("uploads", document.filename)
 
                 content = None
-                if target_file_path and target_file_path.endswith((".pdf", ".docx", ".txt")):
+                if target_file_path and target_file_path.endswith((".pdf", ".docx", ".txt", ".md")):
                     import os
                     if os.path.exists(target_file_path):
                         try:
@@ -707,6 +740,291 @@ def import_faqs(background_tasks: BackgroundTasks, file: UploadFile = File(...),
     filename = file.filename
     background_tasks.add_task(_import_faqs_task, content, filename, admin_username)
     return {"message": "Import process started in the background."}
+
+
+# ---------------------------------------
+# Retrieval Alias CRUD
+# ---------------------------------------
+
+class RetrievalAliasCreate(BaseModel):
+    term: str = Field(..., min_length=1, max_length=120)
+    aliases: list[str] = Field(default_factory=list, max_length=50)
+    category: Optional[str] = Field(None, max_length=120)
+    weight: float = Field(1.0, ge=0.1, le=5.0)
+    is_active: bool = True
+
+
+class RetrievalAliasUpdate(BaseModel):
+    term: Optional[str] = Field(None, min_length=1, max_length=120)
+    aliases: Optional[list[str]] = Field(None, max_length=50)
+    category: Optional[str] = Field(None, max_length=120)
+    weight: Optional[float] = Field(None, ge=0.1, le=5.0)
+    is_active: Optional[bool] = None
+
+
+def _payload_dict(payload: BaseModel) -> dict:
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(exclude_unset=True)
+    return payload.dict(exclude_unset=True)
+
+
+def _normalize_alias_term(term: str) -> str:
+    term = " ".join(str(term).strip().lower().split())
+    if not term:
+        raise HTTPException(status_code=400, detail="Alias term cannot be empty")
+    return term
+
+
+def _normalize_alias_values(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen = set()
+    for value in values or []:
+        item = " ".join(str(value).strip().lower().split())
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _serialize_retrieval_alias(row: RetrievalAlias) -> dict:
+    return {
+        "id": str(row.id),
+        "term": row.term,
+        "aliases": row.aliases or [],
+        "category": row.category,
+        "weight": float(row.weight or 1.0),
+        "is_active": bool(row.is_active),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _parse_alias_csv_values(raw: str | None) -> list[str]:
+    if not raw or not raw.strip():
+        return []
+    value = raw.strip()
+    if value.startswith("["):
+        parsed = json.loads(value)
+        if not isinstance(parsed, list):
+            raise ValueError("aliases JSON must be an array")
+        return _normalize_alias_values([str(item) for item in parsed])
+    delimiter = ";" if ";" in value else ","
+    return _normalize_alias_values(value.split(delimiter))
+
+
+def _parse_alias_bool(raw: str | None, default: bool = True) -> bool:
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "active"}
+
+
+def _parse_alias_weight(raw: str | None) -> float:
+    if raw is None or not str(raw).strip():
+        return 1.0
+    return float(raw)
+
+
+@router.get("/retrieval-aliases/")
+def list_retrieval_aliases(
+    skip: int = 0,
+    limit: int = 100,
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    query = db.query(RetrievalAlias)
+
+    if search:
+        like = f"%{search.strip().lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(RetrievalAlias.term).like(like),
+                func.lower(RetrievalAlias.aliases.cast(Text)).like(like),
+            )
+        )
+    if category:
+        query = query.filter(func.lower(RetrievalAlias.category) == category.strip().lower())
+    if is_active is not None:
+        query = query.filter(RetrievalAlias.is_active == is_active)
+
+    total = query.count()
+    rows = (
+        query.order_by(func.lower(RetrievalAlias.term).asc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    categories = [
+        row[0]
+        for row in db.query(RetrievalAlias.category)
+        .filter(RetrievalAlias.category.isnot(None))
+        .distinct()
+        .order_by(RetrievalAlias.category.asc())
+        .all()
+        if row[0]
+    ]
+
+    return {
+        "items": [_serialize_retrieval_alias(row) for row in rows],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "categories": categories,
+    }
+
+
+@router.post("/retrieval-aliases/", status_code=201)
+def create_retrieval_alias(
+    payload: RetrievalAliasCreate,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    term = _normalize_alias_term(payload.term)
+    existing = db.query(RetrievalAlias).filter(func.lower(RetrievalAlias.term) == term).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="An alias with this term already exists")
+
+    row = RetrievalAlias(
+        term=term,
+        aliases=_normalize_alias_values(payload.aliases),
+        category=_normalize_alias_term(payload.category) if payload.category else None,
+        weight=payload.weight,
+        is_active=payload.is_active,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    AliasExpansionService.clear_cache()
+    return _serialize_retrieval_alias(row)
+
+
+@router.put("/retrieval-aliases/{alias_id}")
+def update_retrieval_alias(
+    alias_id: str,
+    payload: RetrievalAliasUpdate,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    try:
+        row_id = UUID(alias_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid alias id")
+
+    row = db.query(RetrievalAlias).filter(RetrievalAlias.id == row_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Alias not found")
+
+    changes = _payload_dict(payload)
+    if "term" in changes and changes["term"] is not None:
+        term = _normalize_alias_term(changes["term"])
+        conflict = (
+            db.query(RetrievalAlias)
+            .filter(func.lower(RetrievalAlias.term) == term, RetrievalAlias.id != row.id)
+            .first()
+        )
+        if conflict:
+            raise HTTPException(status_code=409, detail="An alias with this term already exists")
+        row.term = term
+    if "aliases" in changes and changes["aliases"] is not None:
+        row.aliases = _normalize_alias_values(changes["aliases"])
+    if "category" in changes:
+        row.category = _normalize_alias_term(changes["category"]) if changes["category"] else None
+    if "weight" in changes and changes["weight"] is not None:
+        row.weight = changes["weight"]
+    if "is_active" in changes and changes["is_active"] is not None:
+        row.is_active = changes["is_active"]
+
+    db.commit()
+    db.refresh(row)
+    AliasExpansionService.clear_cache()
+    return _serialize_retrieval_alias(row)
+
+
+@router.delete("/retrieval-aliases/{alias_id}")
+def delete_retrieval_alias(
+    alias_id: str,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    try:
+        row_id = UUID(alias_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid alias id")
+
+    row = db.query(RetrievalAlias).filter(RetrievalAlias.id == row_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Alias not found")
+
+    db.delete(row)
+    db.commit()
+    AliasExpansionService.clear_cache()
+    return {"message": "Alias deleted successfully", "id": alias_id}
+
+
+@router.post("/retrieval-aliases/import")
+def import_retrieval_aliases(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+
+    content = file.file.read()
+    try:
+        text_content = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded")
+
+    reader = csv.DictReader(io.StringIO(text_content))
+    required = {"term", "aliases"}
+    missing = required - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing CSV columns: {', '.join(sorted(missing))}")
+
+    created = 0
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for line_number, row_data in enumerate(reader, start=2):
+        try:
+            term = _normalize_alias_term(row_data.get("term", ""))
+            aliases = _parse_alias_csv_values(row_data.get("aliases"))
+            category_raw = row_data.get("category")
+            category = _normalize_alias_term(category_raw) if category_raw and category_raw.strip() else None
+            weight = _parse_alias_weight(row_data.get("weight"))
+            is_active = _parse_alias_bool(row_data.get("is_active"), default=True)
+        except Exception as exc:
+            errors.append(f"Row {line_number}: {exc}")
+            skipped += 1
+            continue
+
+        existing = db.query(RetrievalAlias).filter(func.lower(RetrievalAlias.term) == term).first()
+        if existing:
+            existing.aliases = aliases
+            existing.category = category
+            existing.weight = weight
+            existing.is_active = is_active
+            updated += 1
+        else:
+            db.add(
+                RetrievalAlias(
+                    term=term,
+                    aliases=aliases,
+                    category=category,
+                    weight=weight,
+                    is_active=is_active,
+                )
+            )
+            created += 1
+
+    db.commit()
+    AliasExpansionService.clear_cache()
+    return {"created": created, "updated": updated, "skipped": skipped, "errors": errors[:25]}
 
 
 # -----------------------------------------------

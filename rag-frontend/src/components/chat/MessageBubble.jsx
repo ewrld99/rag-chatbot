@@ -27,7 +27,56 @@ const ThumbsDownIcon = ({ filled }) => (
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-const MessageBubble = memo(function MessageBubble({ id, role, content, feedback, onFeedback }) {
+function safeSourceUrl(url) {
+    if (!url) return null;
+    try {
+        const parsed = new URL(url, window.location.origin);
+        return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : null;
+    } catch {
+        return null;
+    }
+}
+
+function SourceList({ sources }) {
+    if (!Array.isArray(sources) || sources.length === 0) return null;
+    return (
+        <section style={styles.sources} aria-label="Sources">
+            <span style={styles.sourcesTitle}>Sources</span>
+            <ul style={styles.sourcesList}>
+                {sources.map((source, index) => {
+                    const href = safeSourceUrl(source.url);
+                    const label = source.name || "UDOM document";
+                    return (
+                        <li key={source.document_id || `${label}-${index}`} style={styles.sourceItem}>
+                            {href
+                                ? <a href={href} target="_blank" rel="noopener noreferrer" style={styles.sourceLink}>{label}</a>
+                                : <span>{label}</span>}
+                        </li>
+                    );
+                })}
+            </ul>
+        </section>
+    );
+}
+
+const MODEL_LABELS = {
+    "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
+    "openai/gpt-oss-120b": "GPT-OSS 120B",
+    "qwen/qwen3.6-27b": "Qwen 3.6 27B",
+    "openai/gpt-oss-20b": "GPT-OSS 20B",
+    "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
+};
+
+const MessageBubble = memo(function MessageBubble({
+    id,
+    role,
+    content,
+    sources = [],
+    feedback,
+    onFeedback,
+    selectedModel,
+    fallbackUsed = false,
+}) {
     const isUser = role === "user";
 
     return (
@@ -39,13 +88,26 @@ const MessageBubble = memo(function MessageBubble({ id, role, content, feedback,
             )}
 
             <div style={{ ...styles.content, ...(isUser ? styles.contentUser : styles.contentAssistant) }}>
-                {!isUser && <span style={styles.author}>Assistant</span>}
+                {!isUser && (
+                    <div style={styles.authorRow}>
+                        <span style={styles.author}>Assistant</span>
+                        {selectedModel && (
+                            <span
+                                style={styles.modelNote}
+                                title={fallbackUsed ? "The selected model was unavailable, so a fallback answered." : "Model used for this answer"}
+                            >
+                                {MODEL_LABELS[selectedModel] || selectedModel}
+                                {fallbackUsed ? " (fallback)" : ""}
+                            </span>
+                        )}
+                    </div>
+                )}
                 <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant), whiteSpace: isUser ? "pre-wrap" : "normal" }}>
                     {isUser ? content : (
                         <ReactMarkdown 
                             remarkPlugins={[remarkGfm]}
                             components={{
-                                a: ({node, ...props}) => <a {...props} target="_blank" rel="noopener noreferrer" style={{ color: "#63b3a4", textDecoration: "underline", fontWeight: "600" }} />,
+                                a: ({children}) => <span>{children}</span>,
                                 p: ({node, ...props}) => <p style={{ margin: "0 0 12px 0", ...(node.parent && node.parent.tagName === 'li' ? { margin: 0 } : {}) }} {...props} />,
                                 ul: ({node, ...props}) => <ul style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
                                 ol: ({node, ...props}) => <ol style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
@@ -59,6 +121,7 @@ const MessageBubble = memo(function MessageBubble({ id, role, content, feedback,
                         </ReactMarkdown>
                     )}
                 </div>
+                {!isUser && <SourceList sources={sources} />}
                 {!isUser && id && (
                     <div style={styles.feedbackActions}>
                         <button 
@@ -114,127 +177,6 @@ export function TypingBubble() {
 
 const styles = {
     row: {
-        display: "flex",
-        alignItems: "flex-end",
-        gap: "10px",
-        padding: "6px 0",
-    },
-    rowUser: {
-        flexDirection: "row-reverse",
-    },
-    rowAssistant: {
-        flexDirection: "row",
-    },
-    avatar: {
-        width: "32px",
-        height: "32px",
-        borderRadius: "10px",
-        background: "linear-gradient(135deg, rgba(99,179,164,0.15), rgba(99,179,164,0.05))",
-        border: "1px solid rgba(99,179,164,0.2)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        color: "#63b3a4",
-        flexShrink: 0,
-    },
-    logoImage: {
-        width: "100%",
-        height: "100%",
-        objectFit: "cover",
-        borderRadius: "50%",
-        display: "block",
-    },
-    avatarUser: {
-        width: "32px",
-        height: "32px",
-        borderRadius: "10px",
-        background: "rgba(255,255,255,0.05)",
-        border: "1px solid rgba(255,255,255,0.09)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        color: "#718096",
-        flexShrink: 0,
-    },
-    content: {
-        display: "flex",
-        flexDirection: "column",
-        gap: "4px",
-        maxWidth: "72%",
-    },
-    contentUser: {
-        alignItems: "flex-end",
-    },
-    contentAssistant: {
-        alignItems: "flex-start",
-    },
-    author: {
-        fontSize: "11px",
-        fontWeight: "600",
-        color: "#63b3a4",
-        letterSpacing: "0.5px",
-        textTransform: "uppercase",
-        paddingLeft: "2px",
-    },
-    bubble: {
-        padding: "11px 15px",
-        borderRadius: "14px",
-        fontSize: "14px",
-        lineHeight: "1.6",
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-word",
-    },
-    bubbleUser: {
-        background: "linear-gradient(135deg, #63b3a4, #4a9080)",
-        color: "#0d1520",
-        fontWeight: "400",
-        borderBottomRightRadius: "4px",
-    },
-    bubbleAssistant: {
-        background: "#1e2d40",
-        border: "1px solid rgba(255,255,255,0.07)",
-        color: "#e2e8f0",
-        borderBottomLeftRadius: "4px",
-    },
-    typingBubble: {
-        display: "flex",
-        alignItems: "center",
-        gap: "5px",
-        padding: "14px 18px",
-    },
-    dot: {
-        width: "7px",
-        height: "7px",
-        borderRadius: "50%",
-        background: "#4a9080",
-        display: "inline-block",
-        animation: "typingBounce 1.2s ease-in-out infinite",
-    },
-    feedbackActions: {
-        display: "flex",
-        gap: "6px",
-        marginTop: "2px",
-        paddingLeft: "2px",
-    },
-    feedbackBtn: {
-        background: "transparent",
-        border: "none",
-        color: "var(--app-muted)",
-        cursor: "pointer",
-        padding: "4px",
-        borderRadius: "4px",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        transition: "color 0.2s, background 0.2s",
-    },
-    feedbackBtnActive: {
-        color: "#4a9080",
-    },
-};
-
-Object.assign(styles, {
-    row: {
         width: "min(780px, 100%)",
         display: "flex",
         alignItems: "flex-start",
@@ -261,6 +203,12 @@ Object.assign(styles, {
         flexShrink: 0,
         marginTop: "2px",
         overflow: "hidden",
+    },
+    logoImage: {
+        width: "100%",
+        height: "100%",
+        objectFit: "cover",
+        display: "block",
     },
     avatarUser: {
         width: "32px",
@@ -295,6 +243,18 @@ Object.assign(styles, {
         textTransform: "none",
         paddingLeft: "2px",
     },
+    authorRow: {
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: "7px",
+        minHeight: "18px",
+    },
+    modelNote: {
+        fontSize: "11px",
+        color: "var(--app-faint)",
+        overflowWrap: "anywhere",
+    },
     bubble: {
         padding: "0",
         borderRadius: "16px",
@@ -316,6 +276,37 @@ Object.assign(styles, {
         color: "var(--app-text)",
         borderBottomLeftRadius: "16px",
     },
+    sources: {
+        width: "100%",
+        paddingTop: "10px",
+        marginTop: "2px",
+        borderTop: "1px solid var(--app-border)",
+        color: "var(--app-muted)",
+    },
+    sourcesTitle: {
+        display: "block",
+        marginBottom: "5px",
+        fontSize: "12px",
+        fontWeight: "700",
+        letterSpacing: 0,
+    },
+    sourcesList: {
+        margin: 0,
+        paddingLeft: "18px",
+        display: "grid",
+        gap: "3px",
+    },
+    sourceItem: {
+        fontSize: "12px",
+        lineHeight: "1.45",
+        overflowWrap: "anywhere",
+    },
+    sourceLink: {
+        color: "var(--app-accent)",
+        fontWeight: "600",
+        textDecoration: "underline",
+        textUnderlineOffset: "2px",
+    },
     typingBubble: {
         display: "flex",
         alignItems: "center",
@@ -326,8 +317,29 @@ Object.assign(styles, {
         width: "7px",
         height: "7px",
         borderRadius: "50%",
-        background: "#b66a4e",
+        background: "var(--app-accent)",
         display: "inline-block",
         animation: "typingPulse 1.2s ease-in-out infinite",
     },
-});
+    feedbackActions: {
+        display: "flex",
+        gap: "6px",
+        marginTop: "2px",
+        paddingLeft: "2px",
+    },
+    feedbackBtn: {
+        background: "transparent",
+        border: "none",
+        color: "var(--app-muted)",
+        cursor: "pointer",
+        padding: "4px",
+        borderRadius: "4px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        transition: "color 0.2s, background 0.2s",
+    },
+    feedbackBtnActive: {
+        color: "var(--app-accent)",
+    },
+};

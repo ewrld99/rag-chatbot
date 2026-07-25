@@ -20,6 +20,16 @@ def log_audit(db: Session, setting_key: str, admin: str, new_value: Optional[str
     )
     db.add(audit)
 
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 def get_admin_id(db: Session, admin_username: str) -> Optional[int]:
     if not admin_username or admin_username == "Unknown Admin":
         return None
@@ -172,11 +182,9 @@ class FAQService:
         
         # Pre-processing and deduplication
         for index, row in df.iterrows():
-            question = str(row.get('Question', '')).strip()
-            answer = str(row.get('Answer', '')).strip()
-            category = str(row.get('Category', '')).strip()
-            if category == 'nan' or not category:
-                category = None
+            question = _cell_text(row.get('Question', ''))
+            answer = _cell_text(row.get('Answer', ''))
+            category = _cell_text(row.get('Category', '')) or None
                 
             if not question or not answer:
                 stats["skipped"] += 1

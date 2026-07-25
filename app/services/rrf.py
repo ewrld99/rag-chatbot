@@ -5,15 +5,9 @@ Reciprocal Rank Fusion (RRF) implementation.
 
 Formula
 -------
-    score(d) = Σ  1 / (k + rank(d, r))
-               r ∈ retrievers
+    score(d) = sum(1 / (k + rank(d, r))) for every retriever r
 
 where rank is 1-based (rank 1 = best result).
-
-References
-----------
-Cormack, Clarke & Buettcher (2009) — "Reciprocal Rank Fusion outperforms
-Condorcet and individual Rank Learning Methods."
 """
 
 from __future__ import annotations
@@ -25,19 +19,16 @@ from app.services.dense_retriever import DenseResult
 from app.services.sparse_retriever import SparseResult
 
 
-# ---------------------------------------------------------------------------
-# Output type
-# ---------------------------------------------------------------------------
 @dataclass
 class RRFResult:
     chunk_id: str
     document_id: str
     rrf_score: float
-    dense_rank: int | None          # 1-based; None if not in dense results
-    sparse_rank: int | None         # 1-based; None if not in sparse results
+    dense_rank: int | None
+    sparse_rank: int | None
     retrieval_sources: list[Literal["dense", "sparse"]]
-    text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,91 +38,79 @@ class RRFResult:
             "dense_rank": self.dense_rank,
             "sparse_rank": self.sparse_rank,
             "retrieval_sources": self.retrieval_sources,
-            "text": self.text,
             "metadata": self.metadata,
+            "text": self.text,
         }
 
 
-# ---------------------------------------------------------------------------
-# RRF engine
-# ---------------------------------------------------------------------------
 class ReciprocalRankFusion:
     """
-    Fuses dense and sparse ranked lists into a single merged ranking.
-
-    Parameters
-    ----------
-    k : int
-        RRF smoothing constant (default 60, per original paper).
-        Higher values reduce the influence of top-ranked documents.
+    Fuses dense and sparse ranked lists into one deterministic ranking.
     """
 
-    def __init__(self, k: int = 60) -> None:
-        self.k = k
-
-    # ------------------------------------------------------------------
     def fuse(
         self,
         dense_results: list[DenseResult],
         sparse_results: list[SparseResult],
-        k: int | None = None,
+        k: int = 60,
     ) -> list[RRFResult]:
-        """
-        Merge dense and sparse ranked lists using RRF.
+        if k < 0:
+            raise ValueError("RRF k must be greater than or equal to 0")
 
-        Parameters
-        ----------
-        dense_results :  ordered list from DenseRetriever (index 0 = rank 1)
-        sparse_results : ordered list from SparseRetriever (index 0 = rank 1)
-        k :              override the instance-level k if provided
-
-        Returns
-        -------
-        List of RRFResult sorted descending by rrf_score.
-        Tie-breaking is deterministic: secondary sort on chunk_id (lexicographic).
-        """
-        rrf_k = k if k is not None else self.k
-
-        # chunk_id → accumulator dict
         acc: dict[str, dict[str, Any]] = {}
 
-        def _ensure(chunk_id: str, text: str, doc_id: str, meta: dict) -> None:
+        def ensure(chunk_id: str, text: str, document_id: str, metadata: dict[str, Any]) -> None:
             if chunk_id not in acc:
                 acc[chunk_id] = {
                     "chunk_id": chunk_id,
-                    "document_id": doc_id,
+                    "document_id": document_id,
                     "rrf_score": 0.0,
                     "dense_rank": None,
                     "sparse_rank": None,
                     "retrieval_sources": [],
-                    "text": text,
-                    "metadata": meta,
+                    "metadata": dict(metadata or {}),
+                    "text": text or "",
                 }
 
-        # ── Dense pass ──────────────────────────────────────────────────────
-        for rank_0, result in enumerate(dense_results):
-            rank = rank_0 + 1  # 1-based
-            cid = result.chunk_id
-            _ensure(cid, result.text, result.document_id, result.metadata)
-            acc[cid]["rrf_score"] += 1.0 / (rrf_k + rank)
-            acc[cid]["dense_rank"] = rank
-            if "dense" not in acc[cid]["retrieval_sources"]:
-                acc[cid]["retrieval_sources"].append("dense")
+        seen_dense: set[str] = set()
+        for rank, result in enumerate(dense_results, start=1):
+            chunk_id = str(result.chunk_id)
+            if chunk_id in seen_dense:
+                continue
+            seen_dense.add(chunk_id)
 
-        # ── Sparse pass ─────────────────────────────────────────────────────
-        for rank_0, result in enumerate(sparse_results):
-            rank = rank_0 + 1  # 1-based
-            cid = result.chunk_id
-            _ensure(cid, result.text, result.document_id, result.metadata)
-            acc[cid]["rrf_score"] += 1.0 / (rrf_k + rank)
-            acc[cid]["sparse_rank"] = rank
-            if "sparse" not in acc[cid]["retrieval_sources"]:
-                acc[cid]["retrieval_sources"].append("sparse")
+            ensure(chunk_id, result.text, str(result.document_id), result.metadata)
+            acc[chunk_id]["metadata"].update(result.metadata or {})
+            acc[chunk_id]["metadata"]["dense_similarity_score"] = result.similarity_score
+            acc[chunk_id]["rrf_score"] += 1.0 / (k + rank)
+            acc[chunk_id]["dense_rank"] = rank
+            if "dense" not in acc[chunk_id]["retrieval_sources"]:
+                acc[chunk_id]["retrieval_sources"].append("dense")
 
-        # ── Sort: descending rrf_score, then ascending chunk_id (deterministic)
+        seen_sparse: set[str] = set()
+        for rank, result in enumerate(sparse_results, start=1):
+            chunk_id = str(result.chunk_id)
+            if chunk_id in seen_sparse:
+                continue
+            seen_sparse.add(chunk_id)
+
+            ensure(chunk_id, result.text, str(result.document_id), result.metadata)
+            acc[chunk_id]["metadata"].update(result.metadata or {})
+            acc[chunk_id]["metadata"]["sparse_fts_score"] = result.fts_score
+            acc[chunk_id]["rrf_score"] += 1.0 / (k + rank)
+            acc[chunk_id]["sparse_rank"] = rank
+            if "sparse" not in acc[chunk_id]["retrieval_sources"]:
+                acc[chunk_id]["retrieval_sources"].append("sparse")
+
         merged = sorted(
             acc.values(),
-            key=lambda x: (-x["rrf_score"], x["chunk_id"]),
+            key=lambda item: (
+                -item["rrf_score"],
+                item["dense_rank"] if item["dense_rank"] is not None else float("inf"),
+                item["sparse_rank"] if item["sparse_rank"] is not None else float("inf"),
+                item["document_id"],
+                item["chunk_id"],
+            ),
         )
 
         return [
@@ -142,8 +121,8 @@ class ReciprocalRankFusion:
                 dense_rank=item["dense_rank"],
                 sparse_rank=item["sparse_rank"],
                 retrieval_sources=item["retrieval_sources"],
-                text=item["text"],
                 metadata=item["metadata"],
+                text=item["text"],
             )
             for item in merged
         ]
