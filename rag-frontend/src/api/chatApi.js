@@ -1,5 +1,58 @@
-export const API_BASE = "http://localhost:8000";
-export const WS_BASE = "ws://localhost:8000/ws/chat";
+function localBackendBase() {
+    if (typeof window === "undefined") return "http://127.0.0.1:8000";
+    const { hostname, origin, protocol, port } = window.location;
+    const localBackendHost = hostname === "localhost" ? "127.0.0.1" : hostname;
+    if (port === "5173" || port === "4173") {
+        return `${protocol}//${localBackendHost}:8000`;
+    }
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
+        return `${protocol}//${localBackendHost}:8000`;
+    }
+    return origin;
+}
+
+function trimTrailingSlash(value) {
+    return value.replace(/\/+$/, "");
+}
+
+const configuredApiBase = import.meta.env.VITE_API_BASE?.trim();
+export const API_BASE = trimTrailingSlash(configuredApiBase || localBackendBase());
+
+function websocketBase() {
+    if (import.meta.env.VITE_WS_BASE?.trim()) {
+        return import.meta.env.VITE_WS_BASE.trim();
+    }
+    const origin = typeof window === "undefined" ? API_BASE : window.location.origin;
+    const url = new URL(API_BASE, origin);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/ws/chat";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+}
+
+export const WS_BASE = trimTrailingSlash(websocketBase());
+export const BACKEND_UNAVAILABLE_MESSAGE = `Cannot reach the backend server at ${API_BASE}. Make sure FastAPI is running and VITE_API_BASE is correct.`;
+
+function storedTokenFrom(key) {
+    if (typeof window === "undefined") return "";
+    try {
+        const raw = window.localStorage.getItem(key);
+        const session = raw ? JSON.parse(raw) : null;
+        return session?.token || "";
+    } catch {
+        return "";
+    }
+}
+
+export function getAuthToken() {
+    return storedTokenFrom("ragUser") || storedTokenFrom("ragAdminSession");
+}
+
+export function authHeaders() {
+    const token = getAuthToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 function formatApiError(data, fallback = "Request failed") {
     const detail = data?.detail;
@@ -36,12 +89,13 @@ async function request(path, options = {}) {
         res = await fetch(`${API_BASE}${path}`, {
             headers: {
                 "Content-Type": "application/json",
+                ...authHeaders(),
                 ...options.headers,
             },
             ...options,
         });
     } catch {
-        throw new Error("Cannot reach the backend server. Make sure FastAPI is running on http://localhost:8000.");
+        throw new Error(BACKEND_UNAVAILABLE_MESSAGE);
     }
 
     const contentType = res.headers.get("content-type") || "";
@@ -97,10 +151,6 @@ export function submitMessageFeedback(messageId, feedbackValue) {
 
 export function getFeedbackMessages(skip = 0, limit = 100) {
     return request(`/api/chat/feedback/messages?skip=${skip}&limit=${limit}`);
-}
-
-export function getGenerationModels() {
-    return request("/api/chat/models");
 }
 
 export function getChatSessions(userId) {

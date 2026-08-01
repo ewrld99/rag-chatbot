@@ -16,6 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_rag_pipeline, require_admin_user
+from app.api.limiter import RateLimiter
+from app.db.models import User
 from app.db.session import get_db
 from app.schemas.query import (
     HealthResponse,
@@ -25,12 +28,8 @@ from app.schemas.query import (
     RetrievedChunk,
     SourceItem,
 )
-from app.services.generation_service import GenerationService
 from app.services.generation_resilience import GenerationUnavailableError
-from app.services.model_router import ModelRouter
-from app.services.retrieval_service import RetrievalService
-from app.services.settings_service import SettingsService
-from app.services.source_service import format_source_records
+from app.services.rag_pipeline import RAGPipeline
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -42,70 +41,35 @@ logger = logging.getLogger(__name__)
 @router.post("/query", response_model=QueryResponse)
 def query(
     payload: QueryRequest,
-    db: Session = Depends(get_db),
+    rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    _: User = Depends(require_admin_user),
+    __: None = Depends(RateLimiter(limit=20, window=60)),
 ):
-    """
-    Full Hybrid RAG pipeline:
-
-    1. Dense retrieval  (pgvector cosine, top-DENSE_TOP_K)
-    2. Sparse retrieval (PostgreSQL FTS, top-SPARSE_TOP_K)
-    3. Reciprocal Rank Fusion
-    4. LLM generation with the top-K fused chunks as context
-    5. Returns answer, sources, retrieved_chunks, and wall-clock latency
-    """
+    """Run the same RAG pipeline as chat and include admin diagnostics."""
     t_start = time.perf_counter()
 
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # 1. Shared retrieval path: hybrid search, neighbor expansion, and reranking.
-    retrieval_service = RetrievalService(db=db, top_k=payload.top_k)
-    try:
-        scored_docs = retrieval_service.retrieve_with_scores(payload.question)
-    except Exception as exc:
-        logger.exception("Hybrid retrieval failed")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "RETRIEVAL_FAILED",
-                "message": "Unable to search the documents right now. Please try again.",
-            },
-        ) from exc
-
-    docs = [doc for doc, _score in scored_docs]
-    context = retrieval_service.format_context(docs)
-    safe_sources = format_source_records(docs)
-
     # ── 3. LLM generation ───────────────────────────────────────────────────
     try:
-        generator = GenerationService(
-            model_router=ModelRouter(SettingsService(db))
+        rag_pipeline.retrieval_service.set_top_k(payload.top_k)
+        result = rag_pipeline.run(
+            payload.question,
+            model_preference=payload.model_preference,
         )
-        generator.set_model_preference(payload.model_preference)
-        if not context or context.strip() == "No relevant context found.":
-            answer = generator.DOCUMENT_REFUSAL
-            evidence_ids: list[str] = []
-        else:
-            generation_result = generator.generate_response(
-                payload.question,
-                context,
-                documents=docs,
-            )
-            answer = generation_result["answer"]
-            evidence_ids = generation_result["evidence_ids"]
     except GenerationUnavailableError as exc:
         raise HTTPException(
             status_code=503,
-            detail=exc.public_payload(sources=safe_sources),
+            detail=exc.public_payload(),
         ) from exc
     except Exception as exc:
-        logger.exception("Unexpected LLM generation failure")
+        logger.exception("Admin query pipeline failed")
         raise HTTPException(
             status_code=500,
             detail={
-                "code": "GENERATION_FAILED",
-                "message": "Unable to generate an answer right now. Please try again.",
-                "sources": safe_sources,
+                "code": "QUERY_PROCESSING_FAILED",
+                "message": "Unable to process the query right now. Please try again.",
             },
         ) from exc
 
@@ -113,6 +77,7 @@ def query(
     latency_ms = round((t_end - t_start) * 1000, 1)
 
     # ── 4. Build response ────────────────────────────────────────────────────
+    scored_docs = rag_pipeline.last_retrieval()
     retrieved_chunks = [
         RetrievedChunk(
             chunk_id=str(doc.metadata.get("chunk_id", "")),
@@ -127,18 +92,36 @@ def query(
         for doc, score in scored_docs
     ]
 
-    grounded_docs = generator.grounding.filter_documents(docs, evidence_ids)
+    documents = [doc for doc, _score in scored_docs]
+    evidence_ids = result.get("grounding", {}).get("evidence_ids", [])
+    grounded_docs = rag_pipeline.generator.grounding.filter_documents(
+        documents,
+        evidence_ids,
+    )
+    if not grounded_docs and result.get("sources"):
+        source_ids = {
+            str(source.get("document_id"))
+            for source in result["sources"]
+            if source.get("document_id") is not None
+        }
+        grounded_docs = [
+            doc
+            for doc in documents
+            if str(doc.metadata.get("document_id")) in source_ids
+        ]
     sources = [
         SourceItem(content=doc.page_content, metadata=doc.metadata)
         for doc in grounded_docs
     ]
 
     return QueryResponse(
-        answer=answer,
+        answer=result["answer"],
         sources=sources,
         retrieved_chunks=retrieved_chunks,
         latency_ms=latency_ms,
-        **generator.model_metadata(),
+        requested_model=result.get("requested_model", payload.model_preference),
+        selected_model=result.get("selected_model"),
+        fallback_used=result.get("fallback_used", False),
     )
 
 

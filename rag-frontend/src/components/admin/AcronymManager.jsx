@@ -57,7 +57,9 @@ export default function AcronymManager() {
     }
 
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         loadData();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [searchTerm, filterCategory]);
 
     const totalAliasTerms = useMemo(
@@ -158,6 +160,7 @@ export default function AcronymManager() {
                     <span style={{ fontSize: "11px", fontWeight: 700, letterSpacing: "1.5px", textTransform: "uppercase", color: "var(--app-accent)" }}>Retrieval vocabulary</span>
                     <h2 style={{ fontSize: "20px", fontWeight: 700, margin: 0, color: "var(--app-text)" }}>Acronyms</h2>
                     <p style={{ margin: "6px 0 0", color: "var(--app-muted)", fontSize: "13px" }}>{aliases.length} terms, {totalAliasTerms} searchable words and phrases</p>
+                    <p style={{ margin: "4px 0 0", color: "var(--app-faint)", fontSize: "12px" }}>CSV headers: term/acronym and aliases/full form/meaning.</p>
                 </div>
                 <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
                     <label style={{ display: "flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "10px", background: "var(--app-bg)", border: "1px solid var(--app-border)", cursor: "pointer", fontSize: "13px", fontWeight: 600, color: "#4d4942" }}>

@@ -1,10 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { deleteDocument, getDocuments, getDocument, updateDocument, deleteDocumentsBatch, reindexDocument } from "../../api/documentApi";
 import { reindexAll } from "../../api/settingsApi";
 
 const emptyForm = { content: "", filename: "" };
-// keep ref outside component to avoid stale-closure issues
-let _pollInterval = null;
 
 const RefreshIcon = () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -115,7 +113,7 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const [limit] = useState(10);
     const [searchInput, setSearchInput] = useState("");
     const [searchQuery, setSearchQuery] = useState("");
-    const [totalDocs, setTotalDocs] = useState(0);
+    const [, setTotalDocs] = useState(0);
     const [totalPages, setTotalPages] = useState(1);
     const [form, setForm] = useState(emptyForm);
     const [editingId, setEditingId] = useState(null);
@@ -126,7 +124,6 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const [isReindexing, setIsReindexing] = useState(false);
     const [focused, setFocused] = useState(null);
     const [selectedIds, setSelectedIds] = useState(new Set());
-    const pollRef = useRef(null);
 
     const toggleSelection = (id) => {
         const newSet = new Set(selectedIds);
@@ -169,14 +166,40 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         () => documents.find((d) => d.id === editingId),
         [documents, editingId]
     );
+    const paginationItems = useMemo(() => {
+        const maxVisible = isNarrow ? 3 : 5;
+        const pages = new Set([1, totalPages, page]);
+        const radius = Math.floor(maxVisible / 2);
+
+        for (let offset = -radius; offset <= radius; offset += 1) {
+            const candidate = page + offset;
+            if (candidate >= 1 && candidate <= totalPages) {
+                pages.add(candidate);
+            }
+        }
+
+        const sorted = Array.from(pages).sort((a, b) => a - b);
+        const items = [];
+        sorted.forEach((value, index) => {
+            if (index > 0 && value - sorted[index - 1] > 1) {
+                items.push(`gap-${sorted[index - 1]}-${value}`);
+            }
+            items.push(value);
+        });
+        return items;
+    }, [isNarrow, page, totalPages]);
 
     const loadDocuments = useCallback(async ({ clearStatus = true } = {}) => {
         setIsLoading(true);
         try {
             const data = await getDocuments(page, limit, searchQuery);
+            const nextTotalPages = Math.max(1, Number(data.total_pages) || 1);
             setDocuments(data.items);
             setTotalDocs(data.total);
-            setTotalPages(data.total_pages);
+            setTotalPages(nextTotalPages);
+            if (page > nextTotalPages) {
+                setPage(nextTotalPages);
+            }
             if (clearStatus) { setStatus(""); setStatusType(""); }
         } catch (error) {
             setStatus(error.message);
@@ -199,24 +222,15 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         return () => window.clearTimeout(timer);
     }, [loadDocuments, refreshKey]);
 
-    // Poll every 3 s while any document is "processing"
+    // Poll gently while any document is still processing.
     useEffect(() => {
         const hasProcessing = documents.some((d) => d.status === "processing");
-        if (hasProcessing) {
-            if (!_pollInterval) {
-                _pollInterval = window.setInterval(() => loadDocuments({ clearStatus: false }), 3000);
-            }
-        } else {
-            if (_pollInterval) {
-                window.clearInterval(_pollInterval);
-                _pollInterval = null;
-            }
-        }
+        if (!hasProcessing) return undefined;
+        const timer = window.setTimeout(() => {
+            loadDocuments({ clearStatus: false });
+        }, 7000);
         return () => {
-            if (_pollInterval) {
-                window.clearInterval(_pollInterval);
-                _pollInterval = null;
-            }
+            window.clearTimeout(timer);
         };
     }, [documents, loadDocuments]);
 
@@ -322,6 +336,12 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
 
     const hasNeedsReindex = documents.some((d) => d.status === "needs_reindex");
     const isProcessing = documents.some((d) => d.status === "processing");
+    const goToPage = (nextPage) => {
+        const normalized = Number(nextPage);
+        if (!Number.isFinite(normalized)) return;
+        const maxPage = Math.max(1, totalPages);
+        setPage(Math.min(maxPage, Math.max(1, Math.trunc(normalized))));
+    };
 
     return (
         <section style={styles.page}>
@@ -573,28 +593,81 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
             </div>
 
             {/* Pagination Controls */}
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "16px", padding: "8px 16px", background: "var(--app-surface)", borderRadius: "12px", border: "1px solid var(--app-border)" }}>
+            <div style={{ ...styles.paginationBar, ...(isNarrow ? styles.paginationBarNarrow : {}) }}>
                 <div style={styles.paginationContainer}>
                     <button
                         type="button"
                         style={{ ...styles.pageButton, ...(page === 1 ? styles.disabledBtn : {}) }}
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
+                        onClick={() => goToPage(1)}
+                        disabled={page === 1}
+                    >
+                        First
+                    </button>
+                    <button
+                        type="button"
+                        style={{ ...styles.pageButton, ...(page === 1 ? styles.disabledBtn : {}) }}
+                        onClick={() => goToPage(page - 1)}
                         disabled={page === 1}
                     >
                         Previous
                     </button>
-                    <span style={styles.pageText}>
-                        Page {page} of {totalPages}
-                    </span>
+                    <div style={styles.pageNumberGroup}>
+                        {paginationItems.map((item) => (
+                            typeof item === "number" ? (
+                                <button
+                                    type="button"
+                                    key={item}
+                                    style={{
+                                        ...styles.pageNumberButton,
+                                        ...(item === page ? styles.pageNumberButtonActive : {}),
+                                    }}
+                                    onClick={() => goToPage(item)}
+                                    aria-current={item === page ? "page" : undefined}
+                                >
+                                    {item}
+                                </button>
+                            ) : (
+                                <span key={item} style={styles.pageGap}>...</span>
+                            )
+                        ))}
+                    </div>
                     <button
                         type="button"
                         style={{ ...styles.pageButton, ...(page === totalPages ? styles.disabledBtn : {}) }}
-                        onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                        onClick={() => goToPage(page + 1)}
                         disabled={page === totalPages}
                     >
                         Next
                     </button>
+                    <button
+                        type="button"
+                        style={{ ...styles.pageButton, ...(page === totalPages ? styles.disabledBtn : {}) }}
+                        onClick={() => goToPage(totalPages)}
+                        disabled={page === totalPages}
+                    >
+                        Last
+                    </button>
                 </div>
+                <form
+                    style={styles.pageJumpForm}
+                    onSubmit={(event) => {
+                        event.preventDefault();
+                        const formData = new FormData(event.currentTarget);
+                        goToPage(formData.get("page"));
+                        event.currentTarget.reset();
+                    }}
+                >
+                    <span style={styles.pageText}>Page {page} of {totalPages}</span>
+                    <input
+                        name="page"
+                        type="number"
+                        min="1"
+                        max={totalPages}
+                        placeholder="Go"
+                        style={styles.pageJumpInput}
+                        aria-label="Go to page"
+                    />
+                </form>
             </div>
         </section>
     );
@@ -643,11 +716,28 @@ const styles = {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        gap: "16px",
-        marginTop: "10px",
+        gap: "6px",
+        flexWrap: "wrap",
+    },
+    paginationBar: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: "12px",
+        marginTop: "16px",
+        padding: "10px 14px",
+        background: "var(--app-surface)",
+        borderRadius: "12px",
+        border: "1px solid var(--app-border)",
+        flexWrap: "wrap",
+    },
+    paginationBarNarrow: {
+        alignItems: "stretch",
+        flexDirection: "column",
     },
     pageButton: {
-        padding: "8px 16px",
+        minHeight: "34px",
+        padding: "7px 10px",
         borderRadius: "8px",
         border: "1px solid var(--app-border)",
         background: "var(--app-surface)",
@@ -656,6 +746,55 @@ const styles = {
         fontWeight: "600",
         cursor: "pointer",
         transition: "all 0.15s",
+    },
+    pageNumberGroup: {
+        display: "flex",
+        alignItems: "center",
+        gap: "4px",
+        flexWrap: "wrap",
+        justifyContent: "center",
+    },
+    pageNumberButton: {
+        width: "34px",
+        height: "34px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-border)",
+        background: "var(--app-bg)",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        fontWeight: "700",
+        cursor: "pointer",
+    },
+    pageNumberButtonActive: {
+        background: "var(--app-text)",
+        color: "var(--app-surface)",
+        borderColor: "var(--app-text)",
+    },
+    pageGap: {
+        minWidth: "22px",
+        textAlign: "center",
+        color: "var(--app-muted)",
+        fontSize: "13px",
+        fontWeight: "700",
+    },
+    pageJumpForm: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "flex-end",
+        gap: "8px",
+        flexWrap: "wrap",
+    },
+    pageJumpInput: {
+        width: "72px",
+        minHeight: "34px",
+        borderRadius: "8px",
+        border: "1px solid var(--app-border-strong)",
+        background: "var(--app-bg)",
+        color: "var(--app-text)",
+        fontSize: "13px",
+        padding: "6px 8px",
+        boxSizing: "border-box",
+        outline: "none",
     },
     pageText: {
         fontSize: "13px",

@@ -103,14 +103,16 @@ class GroundingService:
 
     def evidence_id(self, document: Document) -> str:
         metadata = document.metadata or {}
-        raw_identity = "|".join(
-            [
-                str(metadata.get("chunk_id") or ""),
-                str(metadata.get("document_id") or ""),
-                str(metadata.get("chunk_index") or ""),
-                document.page_content[:160],
-            ]
-        )
+        chunk_id = metadata.get("chunk_id")
+        if chunk_id:
+            raw_identity = f"chunk:{chunk_id}"
+        else:
+            document_id = metadata.get("document_id")
+            chunk_index = metadata.get("chunk_index")
+            if document_id is not None and chunk_index is not None:
+                raw_identity = f"document:{document_id}:chunk:{chunk_index}"
+            else:
+                raw_identity = f"content:{document.page_content[:240]}"
         digest = sha256(raw_identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
         return f"ev-{digest}"
 
@@ -144,10 +146,61 @@ class GroundingService:
         payload = self._extract_json_object(raw)
         if payload is None:
             return None, "The model did not return a JSON object."
+        payload = self._normalize_draft_payload(payload)
         try:
             return GroundedDraft.model_validate(payload), None
         except ValidationError as exc:
             return None, f"The grounded answer schema was invalid: {exc.errors(include_url=False)}"
+
+    def _normalize_draft_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(payload)
+        claims = normalized.get("claims")
+
+        if "coverage" not in normalized:
+            normalized["coverage"] = "partial" if claims else "none"
+
+        if isinstance(claims, list):
+            normalized_claims = []
+            for claim in claims:
+                if not isinstance(claim, dict):
+                    normalized_claims.append(claim)
+                    continue
+
+                normalized_claim = dict(claim)
+                if "evidence_ids" not in normalized_claim and "evidence" in normalized_claim:
+                    normalized_claim["evidence_ids"] = normalized_claim.get("evidence")
+                if "evidence_ids" not in normalized_claim and "evidence_id" in normalized_claim:
+                    normalized_claim["evidence_ids"] = [normalized_claim.get("evidence_id")]
+                normalized_claims.append(normalized_claim)
+            normalized["claims"] = normalized_claims
+
+            if not str(normalized.get("answer") or "").strip():
+                claim_texts = [
+                    str(claim.get("claim") or "").strip()
+                    for claim in normalized_claims
+                    if isinstance(claim, dict)
+                    and str(claim.get("claim") or "").strip()
+                ]
+                normalized["answer"] = "\n".join(
+                    f"- {claim_text}" for claim_text in claim_texts
+                )
+
+        return normalized
+
+    @staticmethod
+    def render_claim_answer(
+        draft: GroundedDraft,
+        *,
+        ordered: bool = False,
+    ) -> GroundedDraft:
+        """Render the user-facing answer from the canonical claim sequence."""
+        if draft.coverage == "none" or not draft.claims:
+            return draft
+        lines = []
+        for index, claim in enumerate(draft.claims, start=1):
+            prefix = f"{index}." if ordered else "-"
+            lines.append(f"{prefix} {claim.claim.strip()}")
+        return draft.model_copy(update={"answer": "\n".join(lines)})
 
     def reconcile_stub_answer(self, draft: GroundedDraft) -> GroundedDraft:
         """Recover details placed in claims when a model returns only an answer stub."""
@@ -164,6 +217,32 @@ class GroundingService:
             for claim in draft.claims
         )
         if has_claim_content:
+            return draft
+
+        rebuilt_answer = "\n".join(
+            f"- {claim.claim.strip()}"
+            for claim in draft.claims
+            if claim.claim.strip()
+        )
+        return draft.model_copy(update={"answer": rebuilt_answer})
+
+    def reconcile_claim_answer_alignment(self, draft: GroundedDraft) -> GroundedDraft:
+        """Use claim text as the canonical answer when model wording drifts."""
+        if draft.coverage == "none" or not draft.claims:
+            return draft
+
+        answer_units = self._answer_units(draft.answer)
+        normalized_answer = self._normalize_text(draft.answer)
+        claims_missing_from_answer = any(
+            self._normalize_text(claim.claim) not in normalized_answer
+            for claim in draft.claims
+            if self._normalize_text(claim.claim)
+        )
+        answer_has_unclaimed_units = any(
+            not any(self._unit_covered(unit, claim.claim) for claim in draft.claims)
+            for unit in answer_units
+        )
+        if not claims_missing_from_answer and not answer_has_unclaimed_units:
             return draft
 
         rebuilt_answer = "\n".join(
@@ -247,6 +326,8 @@ class GroundingService:
         draft: GroundedDraft,
         evidence: dict[str, EvidenceChunk],
         claim_indexes: Iterable[int],
+        max_evidence_chars: int | None = None,
+        query: str | None = None,
     ) -> dict[str, Any]:
         claims: list[dict[str, Any]] = []
         for index in claim_indexes:
@@ -258,14 +339,27 @@ class GroundingService:
                     "evidence": [
                         {
                             "evidence_id": evidence_id,
-                            "text": evidence[evidence_id].text,
+                            "text": self._verification_excerpt(
+                                evidence[evidence_id].text,
+                                max_evidence_chars,
+                            ),
                         }
                         for evidence_id in dict.fromkeys(claim.evidence_ids)
                         if evidence_id in evidence
                     ],
                 }
             )
-        return {"claims": claims}
+        payload: dict[str, Any] = {"claims": claims}
+        if query and query.strip():
+            payload["question"] = query.strip()
+        return payload
+
+    @staticmethod
+    def _verification_excerpt(text: str, max_chars: int | None) -> str:
+        clean = " ".join(str(text or "").split())
+        if max_chars is None or max_chars <= 0 or len(clean) <= max_chars:
+            return clean
+        return clean[:max_chars].rsplit(" ", 1)[0] + " ...[truncated]"
 
     def parse_verification(
         self,
@@ -333,12 +427,12 @@ class GroundingService:
             )
 
         if supported_indexes:
-            supported_claims = [
-                draft.claims[index].claim.strip()
-                for index in supported_indexes
-            ]
+            supported_answer = self._supported_answer_units(
+                draft,
+                supported_indexes,
+            )
             return GroundingOutcome(
-                answer="\n\n".join(dict.fromkeys(supported_claims)),
+                answer=supported_answer,
                 coverage="partial",
                 evidence_ids=tuple(self._claim_evidence_ids(draft, supported_indexes)),
                 claim_count=len(draft.claims),
@@ -369,6 +463,29 @@ class GroundingService:
             status="refused",
         )
 
+    def _supported_answer_units(
+        self,
+        draft: GroundedDraft,
+        indexes: Iterable[int],
+    ) -> str:
+        supported_claims = [draft.claims[index].claim.strip() for index in indexes]
+        supported_markdown: list[str] = []
+        seen_normalized: set[str] = set()
+
+        for unit in self._answer_markdown_units(draft.answer):
+            if not any(self._unit_covered(unit["plain"], claim) for claim in supported_claims):
+                continue
+            normalized = self._normalize_text(unit["plain"])
+            if not normalized or normalized in seen_normalized:
+                continue
+            seen_normalized.add(normalized)
+            supported_markdown.append(unit["markdown"])
+
+        if supported_markdown:
+            return "\n\n".join(supported_markdown)
+
+        return "\n\n".join(dict.fromkeys(supported_claims))
+
     def _claim_evidence_ids(
         self,
         draft: GroundedDraft,
@@ -397,7 +514,10 @@ class GroundingService:
         return None
 
     def _answer_units(self, answer: str) -> list[str]:
-        units: list[str] = []
+        return [unit["plain"] for unit in self._answer_markdown_units(answer)]
+
+    def _answer_markdown_units(self, answer: str) -> list[dict[str, str]]:
+        units: list[dict[str, str]] = []
         for raw_line in answer.splitlines():
             line = raw_line.strip()
             if not line or re.fullmatch(r"[-:| ]+", line):
@@ -410,10 +530,24 @@ class GroundingService:
             if is_heading or (len(words) <= 3 and not _NUMBER_RE.search(clean)):
                 continue
 
-            for sentence in _SENTENCE_BOUNDARY_RE.split(clean):
+            sentences = [
+                sentence.strip()
+                for sentence in _SENTENCE_BOUNDARY_RE.split(clean)
+                if sentence.strip()
+            ]
+            marker = re.match(r"^\s*(?P<marker>(?:[-*+]|\d+[.)])\s+)", raw_line)
+            for sentence in sentences:
                 sentence = sentence.strip()
                 if len(_WORD_RE.findall(sentence)) >= 3 or _NUMBER_RE.search(sentence):
-                    units.append(sentence)
+                    markdown = raw_line.strip()
+                    if len(sentences) > 1:
+                        markdown = f"{marker.group('marker') if marker else ''}{sentence}"
+                    units.append(
+                        {
+                            "plain": sentence,
+                            "markdown": markdown,
+                        }
+                    )
         return units
 
     def _unit_covered(self, unit: str, claim: str) -> bool:

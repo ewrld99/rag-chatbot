@@ -26,6 +26,7 @@ class UserResponse(BaseModel):
     id: int
     username: str
     role: str = "user"
+    token: Optional[str] = None
     registration_number: Optional[str] = None
     programme: Optional[str] = None
     campus: Optional[str] = None

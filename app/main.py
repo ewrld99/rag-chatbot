@@ -8,9 +8,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import admin, auth, chat, query, ws_chat
+from app.core.logging import configure_logging
 from app.db.session import init_db
 from app.core.scheduler import start_scheduler, stop_scheduler
 from app.core.config import settings
+from app.core.security import validate_auth_configuration
+
+configure_logging()
 
 _START_TIME = time.monotonic()          # wall-clock seconds since process start
 _START_DATETIME = datetime.now(timezone.utc).isoformat()
@@ -18,6 +22,7 @@ _START_DATETIME = datetime.now(timezone.utc).isoformat()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_auth_configuration()
     # ✅ Single init_db() call — inside lifespan only
     init_db()
     from app.db.session import SessionLocal
@@ -28,8 +33,18 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     start_scheduler()
-    yield
-    stop_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+        from app.api.limiter import close_rate_limiter
+        from app.services.embedding_service import close_embedding_clients
+        from app.services.generation_service import close_generation_clients
+        from app.services.reranker_service import close_reranker_client
+        await close_rate_limiter()
+        close_embedding_clients()
+        close_reranker_client()
+        await close_generation_clients()
 
 
 app = FastAPI(title="RAG Chatbot", lifespan=lifespan)

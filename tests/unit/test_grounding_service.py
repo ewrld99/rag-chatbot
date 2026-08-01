@@ -114,6 +114,33 @@ def test_invalid_evidence_id_and_uncovered_answer_sentence_are_rejected():
     assert any("without claim records" in error for error in validation.errors)
 
 
+def test_parse_draft_normalizes_fallback_schema_variants():
+    service = GroundingService()
+    raw = json.dumps(
+        {
+            "answer": "The annual fee is TZS 1,500,000.00.",
+            "claims": [
+                {
+                    "claim": "The annual fee is TZS 1,500,000.00.",
+                    "evidence": ["ev-1234567890abcdef"],
+                },
+                {
+                    "claim": "Supplementary examinations start on 2026-10-12.",
+                    "evidence_id": "ev-68b82f7b90d78d78",
+                }
+            ],
+        }
+    )
+
+    draft, error = service.parse_draft(raw)
+
+    assert error is None
+    assert draft is not None
+    assert draft.coverage == "partial"
+    assert draft.claims[0].evidence_ids == ["ev-1234567890abcdef"]
+    assert draft.claims[1].evidence_ids == ["ev-68b82f7b90d78d78"]
+
+
 def test_partial_outcome_keeps_only_semantically_supported_claims():
     service = GroundingService()
     document = _document(
@@ -123,7 +150,11 @@ def test_partial_outcome_keeps_only_semantically_supported_claims():
     evidence_id = service.evidence_id(document)
     draft = GroundedDraft(
         coverage="full",
-        answer="GPA uses grade points.\n\nEvery course has equal weight.",
+        answer=(
+            "**GPA calculation**\n\n"
+            "- GPA uses grade points.\n"
+            "- Every course has equal weight."
+        ),
         claims=[
             GroundedClaim(
                 claim="GPA uses grade points.",
@@ -150,7 +181,7 @@ def test_partial_outcome_keeps_only_semantically_supported_claims():
     )
 
     assert outcome.status == "partial"
-    assert outcome.answer == "GPA uses grade points."
+    assert outcome.answer == "- GPA uses grade points."
     assert outcome.supported_claim_count == 1
 
 
@@ -210,6 +241,42 @@ def test_reconciliation_does_not_replace_a_detailed_answer():
     assert service.reconcile_stub_answer(draft) is draft
 
 
+def test_reconcile_claim_answer_alignment_uses_claims_as_canonical_answer():
+    service = GroundingService()
+    document = _document(
+        "A student submits a postponement request through SR2. "
+        "The request must be submitted by the twelfth week."
+    )
+    evidence_id = service.evidence_id(document)
+    evidence = service.build_evidence([document])
+    draft = GroundedDraft(
+        coverage="full",
+        answer=(
+            "Submit the request online using SR2. "
+            "It must reach the University no later than week twelve."
+        ),
+        claims=[
+            GroundedClaim(
+                claim="A student submits a postponement request through SR2.",
+                evidence_ids=[evidence_id],
+            ),
+            GroundedClaim(
+                claim="The request must be submitted by the twelfth week.",
+                evidence_ids=[evidence_id],
+            ),
+        ],
+    )
+
+    reconciled = service.reconcile_claim_answer_alignment(draft)
+    validation = service.validate(reconciled, evidence)
+
+    assert reconciled.answer == (
+        "- A student submits a postponement request through SR2.\n"
+        "- The request must be submitted by the twelfth week."
+    )
+    assert validation.valid
+
+
 def test_verifier_requires_every_expected_claim():
     service = GroundingService()
     report = service.parse_verification(
@@ -220,6 +287,42 @@ def test_verifier_requires_every_expected_claim():
     assert report.verdicts[0] == "SUPPORTED"
     assert report.verdicts[1] == "NOT_ENOUGH_INFORMATION"
     assert report.errors
+
+
+def test_verification_payload_compacts_long_evidence():
+    service = GroundingService()
+    document = _document(" ".join(["evidence"] * 300))
+    evidence = service.build_evidence([document])
+    evidence_id = service.evidence_id(document)
+    draft = _draft("The policy is supported by evidence.", evidence_id)
+
+    payload = service.verification_payload(
+        draft,
+        evidence,
+        [0],
+        max_evidence_chars=120,
+    )
+
+    text = payload["claims"][0]["evidence"][0]["text"]
+    assert len(text) <= 135
+    assert text.endswith("...[truncated]")
+
+
+def test_verification_payload_includes_resolved_question_for_relevance():
+    service = GroundingService()
+    document = _document("Issued by the Deputy Vice Chancellor.")
+    evidence = service.build_evidence([document])
+    evidence_id = service.evidence_id(document)
+    draft = _draft("Issued by the Deputy Vice Chancellor.", evidence_id)
+
+    payload = service.verification_payload(
+        draft,
+        evidence,
+        [0],
+        query="who is the Chancellor of UDOM; provide the person's full name",
+    )
+
+    assert payload["question"].startswith("who is the Chancellor")
 
 
 class _StubGenerationService(GenerationService):
@@ -238,11 +341,201 @@ class _StubGenerationService(GenerationService):
     def _document_completion(self, *_args, **_kwargs) -> str:
         return json.dumps(self.answer_payloads.pop(0))
 
+    def _repair_completion(self, **_kwargs) -> str:
+        return json.dumps(self.answer_payloads.pop(0))
+
     def _semantic_verify(self, *_args, **_kwargs) -> VerificationReport:
         return self.verification_reports.pop(0)
 
 
-def test_generation_repairs_an_unsupported_claim_before_publishing():
+class _RepairUnavailableGenerationService(_StubGenerationService):
+    def _repair_completion(self, **kwargs) -> str:
+        if kwargs.get("operation") == "document_answer_repair":
+            from app.services.generation_resilience import GenerationUnavailableError
+
+            raise GenerationUnavailableError(retry_after=30)
+        return super()._repair_completion(**kwargs)
+
+
+class _CaptureRepairGenerationService(_StubGenerationService):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.repair_kwargs = None
+
+    def _repair_completion(self, **kwargs) -> str:
+        self.repair_kwargs = kwargs
+        return super()._repair_completion(**kwargs)
+
+
+def test_generation_returns_verified_partial_without_repair_by_default():
+    document = _document(
+        "GPA uses grade points. Course weights are used in the calculation."
+    )
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": "GPA uses grade points. Every course has equal weight.",
+        "claims": [
+            {
+                "claim": "GPA uses grade points.",
+                "evidence_ids": [evidence_id],
+            },
+            {
+                "claim": "Every course has equal weight.",
+                "evidence_ids": [evidence_id],
+            },
+        ],
+    }
+    generator = _StubGenerationService(
+        [initial],
+        [
+            VerificationReport(
+                verdicts={0: "SUPPORTED", 1: "NOT_ENOUGH_INFORMATION"}
+            )
+        ],
+    )
+
+    result = generator.generate_response(
+        "How is GPA calculated?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert result["answer"] == "GPA uses grade points."
+    assert result["grounding"]["repaired"] is False
+    assert result["grounding"]["status"] == "partial"
+    assert result["evidence_ids"] == [evidence_id]
+
+
+def test_procedure_partial_answer_runs_repair_before_returning(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.config.settings.GENERATION_ENABLE_ANSWER_REPAIR",
+        True,
+    )
+    document = _document(
+        "A student may postpone a year of study with approval from the relevant authority. "
+        "The student must submit a postponement request through SR2. "
+        "The student must attach supporting reasons for the postponement."
+    )
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": (
+            "A student may postpone a year of study with approval from the relevant authority.\n\n"
+            "The student must collect a paper form from the office."
+        ),
+        "claims": [
+            {
+                "claim": "A student may postpone a year of study with approval from the relevant authority.",
+                "evidence_ids": [evidence_id],
+            },
+            {
+                "claim": "The student must collect a paper form from the office.",
+                "evidence_ids": [evidence_id],
+            },
+        ],
+    }
+    repaired = {
+        "coverage": "full",
+        "answer": (
+            "A student may postpone a year of study with approval from the relevant authority.\n\n"
+            "The student must submit a postponement request through SR2.\n\n"
+            "The student must attach supporting reasons for the postponement."
+        ),
+        "claims": [
+            {
+                "claim": "A student may postpone a year of study with approval from the relevant authority.",
+                "evidence_ids": [evidence_id],
+            },
+            {
+                "claim": "The student must submit a postponement request through SR2.",
+                "evidence_ids": [evidence_id],
+            },
+            {
+                "claim": "The student must attach supporting reasons for the postponement.",
+                "evidence_ids": [evidence_id],
+            },
+        ],
+    }
+    generator = _CaptureRepairGenerationService(
+        [initial, repaired],
+        [
+            VerificationReport(
+                verdicts={0: "SUPPORTED", 1: "NOT_ENOUGH_INFORMATION"}
+            ),
+            VerificationReport(
+                verdicts={0: "SUPPORTED", 1: "SUPPORTED", 2: "SUPPORTED"}
+            ),
+        ],
+    )
+
+    result = generator.generate_response(
+        "What are the procedures to postpone a year of study?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert "submit a postponement request through SR2" in result["answer"]
+    assert "attach supporting reasons" in result["answer"]
+    assert result["grounding"]["repaired"] is True
+    assert result["grounding"]["supported_claim_count"] == 3
+    assert generator.repair_kwargs is not None
+
+
+def test_repair_uses_compact_evidence_not_full_context(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.config.settings.GENERATION_ENABLE_ANSWER_REPAIR",
+        True,
+    )
+    document = _document("GPA uses grade points.")
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": "Every course has equal weight.",
+        "claims": [
+            {
+                "claim": "Every course has equal weight.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    repaired = {
+        "coverage": "partial",
+        "answer": "GPA uses grade points.",
+        "claims": [
+            {
+                "claim": "GPA uses grade points.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    generator = _CaptureRepairGenerationService(
+        [initial, repaired],
+        [
+            VerificationReport(verdicts={0: "NOT_ENOUGH_INFORMATION"}),
+            VerificationReport(verdicts={0: "SUPPORTED"}),
+        ],
+    )
+
+    result = generator.generate_response(
+        "How is GPA calculated?",
+        "<documents>very large context that should not be sent to repair</documents>",
+        chat_history=[{"role": "user", "content": "large history should not be sent"}],
+        documents=[document],
+    )
+
+    assert result["answer"] == "GPA uses grade points."
+    assert generator.repair_kwargs["mode"] == "evidence"
+    assert "context" not in generator.repair_kwargs
+    assert "chat_history" not in generator.repair_kwargs
+    assert generator.repair_kwargs["evidence"][evidence_id].text == "GPA uses grade points."
+
+
+def test_generation_repairs_when_enabled_and_no_claims_are_supported(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.config.settings.GENERATION_ENABLE_ANSWER_REPAIR",
+        True,
+    )
     document = _document(
         "GPA uses grade points. Course weights are used in the calculation."
     )
@@ -275,7 +568,7 @@ def test_generation_repairs_an_unsupported_claim_before_publishing():
         [initial, repaired],
         [
             VerificationReport(
-                verdicts={0: "SUPPORTED", 1: "NOT_ENOUGH_INFORMATION"}
+                verdicts={0: "NOT_ENOUGH_INFORMATION", 1: "NOT_ENOUGH_INFORMATION"}
             ),
             VerificationReport(verdicts={0: "SUPPORTED"}),
         ],
@@ -291,6 +584,186 @@ def test_generation_repairs_an_unsupported_claim_before_publishing():
     assert result["grounding"]["repaired"] is True
     assert result["grounding"]["status"] == "partial"
     assert result["evidence_ids"] == [evidence_id]
+
+
+def test_generation_recovers_repair_payload_mislabeled_as_none(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.config.settings.GENERATION_ENABLE_ANSWER_REPAIR",
+        True,
+    )
+    document = _document(
+        "A student must apply for postponement through UDOM SR2 using form UDOM/PGS.F8."
+    )
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": "A student must apply for postponement through a paper letter.",
+        "claims": [
+            {
+                "claim": "A student must apply for postponement through a paper letter.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    repaired = {
+        "coverage": "none",
+        "answer": "A student must apply for postponement through UDOM SR2 using form UDOM/PGS.F8.",
+        "claims": [
+            {
+                "claim": "A student must apply for postponement through UDOM SR2 using form UDOM/PGS.F8.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    generator = _StubGenerationService(
+        [initial, repaired],
+        [
+            VerificationReport(verdicts={0: "NOT_ENOUGH_INFORMATION"}),
+            VerificationReport(verdicts={0: "SUPPORTED"}),
+        ],
+    )
+
+    result = generator.generate_response(
+        "How do I postpone a year of study?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert result["answer"] == repaired["answer"]
+    assert result["grounding"]["status"] == "partial"
+    assert result["grounding"]["repaired"] is True
+    assert result["evidence_ids"] == [evidence_id]
+
+
+def test_generation_skips_repair_when_disabled_and_no_claims_are_supported(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.config.settings.GENERATION_ENABLE_ANSWER_REPAIR",
+        False,
+    )
+    document = _document("GPA uses grade points.")
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": "Every course has equal weight.",
+        "claims": [
+            {
+                "claim": "Every course has equal weight.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    repair_payload = {
+        "coverage": "partial",
+        "answer": "GPA uses grade points.",
+        "claims": [
+            {
+                "claim": "GPA uses grade points.",
+                "evidence_ids": [evidence_id],
+            }
+        ],
+    }
+    generator = _StubGenerationService(
+        [initial, repair_payload],
+        [VerificationReport(verdicts={0: "NOT_ENOUGH_INFORMATION"})],
+    )
+
+    result = generator.generate_response(
+        "How is GPA calculated?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert result["answer"] == GenerationService.DOCUMENT_REFUSAL
+    assert result["grounding"]["repaired"] is False
+    assert result["grounding"]["status"] == "refused"
+    assert generator.answer_payloads == [repair_payload]
+
+
+def test_generation_returns_verified_partial_when_repair_is_unavailable():
+    document = _document(
+        "A student may postpone a year of study with approval from the relevant authority."
+    )
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "full",
+        "answer": (
+            "A student may postpone a year of study with approval from the relevant authority.\n\n"
+            "The form must be submitted within seven days."
+        ),
+        "claims": [
+            {
+                "claim": "A student may postpone a year of study with approval from the relevant authority.",
+                "evidence_ids": [evidence_id],
+            },
+            {
+                "claim": "The form must be submitted within seven days.",
+                "evidence_ids": [evidence_id],
+            },
+        ],
+    }
+    generator = _RepairUnavailableGenerationService(
+        [initial],
+        [
+            VerificationReport(
+                verdicts={
+                    0: "SUPPORTED",
+                    1: "NOT_ENOUGH_INFORMATION",
+                }
+            )
+        ],
+    )
+
+    result = generator.generate_response(
+        "How do I postpone a year of study?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert result["answer"] == (
+        "1. A student may postpone a year of study with approval from the relevant authority."
+    )
+    assert result["grounding"]["status"] == "partial"
+    assert result["grounding"]["repaired"] is False
+    assert result["evidence_ids"] == [evidence_id]
+
+
+def test_semantic_verification_batches_claims(monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.GENERATION_VERIFICATION_BATCH_SIZE", 2)
+    document = _document("A. B. C.")
+    evidence_id = GroundingService().evidence_id(document)
+    generator = _StubGenerationService([], [])
+    calls = []
+
+    def verify(_draft, _evidence, indexes):
+        calls.append(list(indexes))
+        return VerificationReport(
+            verdicts={index: "SUPPORTED" for index in indexes}
+        )
+
+    generator._semantic_verify = verify
+    draft = GroundedDraft(
+        coverage="full",
+        answer="A.\n\nB.\n\nC.",
+        claims=[
+            GroundedClaim(claim="A.", evidence_ids=[evidence_id]),
+            GroundedClaim(claim="B.", evidence_ids=[evidence_id]),
+            GroundedClaim(claim="C.", evidence_ids=[evidence_id]),
+        ],
+    )
+
+    report = GenerationService._semantic_verify(
+        generator,
+        draft,
+        GroundingService().build_evidence([document]),
+        [0, 1, 2],
+    )
+
+    assert calls == [[0, 1], [2]]
+    assert report.verdicts == {
+        0: "SUPPORTED",
+        1: "SUPPORTED",
+        2: "SUPPORTED",
+    }
 
 
 def test_generation_refuses_after_two_malformed_drafts():

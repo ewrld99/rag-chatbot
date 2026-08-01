@@ -1,15 +1,7 @@
-from pydantic import BaseModel
-from typing import List, Dict, Any, Literal, Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any, Optional
 
-
-ModelPreference = Literal[
-    "auto",
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-]
+from app.services.model_catalog import validate_model_preference
 
 
 class ChatRequest(BaseModel):
@@ -18,7 +10,12 @@ class ChatRequest(BaseModel):
     # Optional: provided by the SSE stream endpoint to persist history
     session_id: Optional[int] = None
     user_id: Optional[int] = None
-    model_preference: ModelPreference = "auto"
+    model_preference: str = "auto"
+    conversation_token: Optional[str] = Field(default=None, max_length=4096)
+
+    _validate_model_preference = field_validator("model_preference")(
+        validate_model_preference
+    )
 
 
 class Source(BaseModel):
@@ -34,6 +31,8 @@ class ChatResponse(BaseModel):
     requested_model: str = "auto"
     selected_model: Optional[str] = None
     fallback_used: bool = False
+    conversation: Dict[str, Any] = Field(default_factory=dict)
+    conversation_token: Optional[str] = None
 
 
 class MessageFeedbackRequest(BaseModel):

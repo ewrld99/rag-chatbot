@@ -1,6 +1,7 @@
 import { getAdminSession } from "../utils/adminAuth.js";
+import { API_BASE } from "./chatApi";
 
-const API_BASE = "http://localhost:8000/api/admin/faqs";
+const FAQ_API_BASE = `${API_BASE}/api/admin/faqs`;
 
 function getHeaders() {
     const session = getAdminSession();
@@ -16,7 +17,7 @@ export async function fetchFaqs({ skip = 0, limit = 100, search = "", category =
     if (category) params.append("category", category);
     if (is_active !== "") params.append("is_active", is_active);
 
-    const res = await fetch(`${API_BASE}/?${params.toString()}`, {
+    const res = await fetch(`${FAQ_API_BASE}/?${params.toString()}`, {
         headers: getHeaders(),
     });
     if (!res.ok) throw new Error("Failed to fetch FAQs");
@@ -24,7 +25,7 @@ export async function fetchFaqs({ skip = 0, limit = 100, search = "", category =
 }
 
 export async function createFaq(data) {
-    const res = await fetch(`${API_BASE}/`, {
+    const res = await fetch(`${FAQ_API_BASE}/`, {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify(data),
@@ -34,7 +35,7 @@ export async function createFaq(data) {
 }
 
 export async function updateFaq(id, data) {
-    const res = await fetch(`${API_BASE}/${id}`, {
+    const res = await fetch(`${FAQ_API_BASE}/${id}`, {
         method: "PUT",
         headers: getHeaders(),
         body: JSON.stringify(data),
@@ -44,7 +45,7 @@ export async function updateFaq(id, data) {
 }
 
 export async function deleteFaq(id) {
-    const res = await fetch(`${API_BASE}/${id}`, {
+    const res = await fetch(`${FAQ_API_BASE}/${id}`, {
         method: "DELETE",
         headers: getHeaders(),
     });
@@ -57,7 +58,7 @@ export async function importFaqs(file) {
     formData.append("file", file);
 
     const session = getAdminSession();
-    const res = await fetch(`${API_BASE}/import`, {
+    const res = await fetch(`${FAQ_API_BASE}/import`, {
         method: "POST",
         headers: {
             Authorization: session?.token ? `Bearer ${session.token}` : "",

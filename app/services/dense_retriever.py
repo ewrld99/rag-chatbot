@@ -10,15 +10,38 @@ without importing LangChain types.
 
 from __future__ import annotations
 
-from typing import Any
 import logging
+import threading
+from typing import Any
+
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import DocumentChunk, FAQModel
 from app.services.embedding_service import EmbeddingServiceError, get_embedding
+from app.services.retrieval_metadata import document_metadata, faq_metadata
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Thread-local failure flag
+#
+# Set to True by retrieve() when the embedding service is unavailable.
+# HybridRetriever reads this flag to distinguish:
+#   - dense_results=[]  because embedding is DOWN  → degraded mode, be lenient
+#   - dense_results=[]  because no docs matched    → normal empty result
+# ---------------------------------------------------------------------------
+_dense_state = threading.local()
+
+
+def dense_embedding_failed() -> bool:
+    """Return True if the most recent retrieve() call failed due to embedding."""
+    return bool(getattr(_dense_state, "embedding_failed", False))
+
+
+def _set_embedding_failed(value: bool) -> None:
+    _dense_state.embedding_failed = value
+
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -88,9 +111,17 @@ class DenseRetriever:
         Returns
         -------
         List of DenseResult ordered best → worst (descending similarity).
+        When the embedding service is unavailable, returns [] and sets the
+        thread-local dense_embedding_failed() flag to True so callers can
+        switch to degraded (sparse-only) mode gracefully.
         """
         if not query or not query.strip():
+            _set_embedding_failed(False)
             return []
+
+        # Reset failure flag at the start of each call so callers always see
+        # the result of THIS request, not a previous one on the same thread.
+        _set_embedding_failed(False)
 
         try:
             query_embedding = get_embedding(query, self.db)
@@ -126,7 +157,7 @@ class DenseRetriever:
                     )
 
             rows = doc_query.order_by("dist").limit(top_k).all()
-            
+
             faq_rows = (
                 self.db.query(
                     FAQModel,
@@ -137,22 +168,36 @@ class DenseRetriever:
                 .limit(top_k)
                 .all()
             )
+
         except EmbeddingServiceError as exc:
-            log = logger.debug if exc.provider_cooldown else logger.warning
-            log("DenseRetriever embedding unavailable; using sparse retrieval only: %s", exc)
+            self.db.rollback()
+            _set_embedding_failed(True)
+            # Always log at WARNING — even a circuit-breaker cooldown is a
+            # service degradation that admins need to see in the logs.
+            logger.warning(
+                "DenseRetriever: embedding service unavailable — dense retrieval "
+                "disabled for this request. Sparse (FTS) retrieval will run alone. "
+                "Reason: %s",
+                exc,
+            )
             return []
         except Exception as exc:
-            logger.warning("DenseRetriever query failed; using sparse retrieval only: %s", exc)
-            return []
+            self.db.rollback()
+            _set_embedding_failed(False)
+            logger.exception(
+                "DenseRetriever: unexpected error — dense retrieval disabled for "
+                "this request. Sparse (FTS) retrieval will run alone. Reason: %s",
+                exc,
+            )
+            raise
 
-        # Merge and sort
+        # Merge doc chunks + FAQ rows and sort by distance (ascending = most similar first)
         combined = []
         for chunk, dist in rows:
             combined.append((dist, chunk, "doc"))
-            
         for faq, dist in faq_rows:
             combined.append((dist, faq, "faq"))
-            
+
         combined.sort(key=lambda item: (float(item[0]), str(item[1].id)))
         combined = combined[:top_k]
 
@@ -164,27 +209,18 @@ class DenseRetriever:
                 chunk_id = str(chunk.id)
                 doc_filename = chunk.document.filename if chunk.document and chunk.document.filename else "database"
                 doc_id = str(chunk.document_id)
-                metadata = dict(chunk.metadata_ or {})
-                metadata.update(
-                    {
-                        "source": doc_filename,
-                        "chunk_index": chunk.chunk_index,
-                        "source_type": "document",
-                        "similarity_score": similarity_score,
-                    }
+                metadata = document_metadata(
+                    chunk.metadata_,
+                    source=doc_filename,
+                    chunk_index=chunk.chunk_index,
+                    page_number=chunk.page_number,
+                    document_title=chunk.document.title if chunk.document else None,
+                    source_url=chunk.document.source_url if chunk.document else None,
+                    document_status=chunk.document.status if chunk.document else None,
+                    content_hash=chunk.document.content_hash if chunk.document else None,
+                    document_uploaded_at=chunk.document.upload_date if chunk.document else None,
+                    extra={"similarity_score": similarity_score},
                 )
-                if chunk.page_number is not None:
-                    metadata["page_number"] = chunk.page_number
-                if chunk.document and chunk.document.title:
-                    metadata["document_title"] = chunk.document.title
-                if chunk.document and chunk.document.source_url:
-                    metadata["source_url"] = chunk.document.source_url
-                if chunk.document:
-                    metadata["document_status"] = chunk.document.status or "active"
-                    if chunk.document.content_hash:
-                        metadata["content_hash"] = chunk.document.content_hash
-                    if chunk.document.upload_date:
-                        metadata["document_uploaded_at"] = chunk.document.upload_date.isoformat()
 
                 results.append(
                     DenseResult(
@@ -197,16 +233,11 @@ class DenseRetriever:
                 )
             else:
                 faq = item
-                metadata = dict(faq.metadata_ or {})
-                metadata.update(
-                    {
-                        "source": f"FAQ - {faq.category}" if faq.category else "FAQ",
-                        "chunk_index": 0,
-                        "source_type": "faq",
-                        "faq_id": str(faq.id),
-                        "category": faq.category,
-                        "similarity_score": similarity_score,
-                    }
+                metadata = faq_metadata(
+                    faq.metadata_,
+                    faq_id=str(faq.id),
+                    category=faq.category,
+                    extra={"similarity_score": similarity_score},
                 )
                 results.append(
                     DenseResult(

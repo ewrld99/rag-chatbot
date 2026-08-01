@@ -60,10 +60,9 @@ function SourceList({ sources }) {
 }
 
 const MODEL_LABELS = {
+    "gemma3:4b": "Gemma 3 4B Local",
+    "gemini-3.6-flash": "Gemini 3.6 Flash",
     "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
-    "openai/gpt-oss-120b": "GPT-OSS 120B",
-    "qwen/qwen3.6-27b": "Qwen 3.6 27B",
-    "openai/gpt-oss-20b": "GPT-OSS 20B",
     "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
 };
 
@@ -78,6 +77,10 @@ const MessageBubble = memo(function MessageBubble({
     fallbackUsed = false,
 }) {
     const isUser = role === "user";
+
+    const formattedContent = typeof content === "string"
+        ? content.replace(/([^\n])\n([^\n\s\-*\d#|>])/g, "$1\n\n$2")
+        : content;
 
     return (
         <article style={{ ...styles.row, ...(isUser ? styles.rowUser : styles.rowAssistant) }}>
@@ -108,16 +111,19 @@ const MessageBubble = memo(function MessageBubble({
                             remarkPlugins={[remarkGfm]}
                             components={{
                                 a: ({children}) => <span>{children}</span>,
-                                p: ({node, ...props}) => <p style={{ margin: "0 0 12px 0", ...(node.parent && node.parent.tagName === 'li' ? { margin: 0 } : {}) }} {...props} />,
-                                ul: ({node, ...props}) => <ul style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
-                                ol: ({node, ...props}) => <ol style={{ margin: "0 0 12px 0", paddingLeft: "24px" }} {...props} />,
-                                li: ({node, ...props}) => <li style={{ margin: "2px 0" }} {...props} />,
-                                table: ({node, ...props}) => <table style={{ borderCollapse: "collapse", width: "100%", marginBottom: "16px" }} {...props} />,
-                                th: ({node, ...props}) => <th style={{ border: "1px solid var(--app-border)", padding: "8px", backgroundColor: "var(--app-bg)" }} {...props} />,
-                                td: ({node, ...props}) => <td style={{ border: "1px solid var(--app-border)", padding: "8px" }} {...props} />
+                                p: ({node, ...props}) => <p style={{ margin: "0 0 12px 0", lineHeight: "1.6", ...(node.parent && node.parent.tagName === 'li' ? { margin: 0 } : {}) }} {...props} />,
+                                h1: (props) => <h1 style={{ margin: "16px 0 8px 0", fontSize: "1.25em", fontWeight: 600 }} {...props} />,
+                                h2: (props) => <h2 style={{ margin: "16px 0 8px 0", fontSize: "1.15em", fontWeight: 600 }} {...props} />,
+                                h3: (props) => <h3 style={{ margin: "14px 0 6px 0", fontSize: "1.05em", fontWeight: 600 }} {...props} />,
+                                ul: (props) => <ul style={{ margin: "0 0 12px 0", paddingLeft: "20px" }} {...props} />,
+                                ol: (props) => <ol style={{ margin: "0 0 12px 0", paddingLeft: "20px" }} {...props} />,
+                                li: (props) => <li style={{ margin: "4px 0", lineHeight: "1.5" }} {...props} />,
+                                table: (props) => <table style={{ borderCollapse: "collapse", width: "100%", marginBottom: "16px" }} {...props} />,
+                                th: (props) => <th style={{ border: "1px solid var(--app-border)", padding: "8px", backgroundColor: "var(--app-bg)" }} {...props} />,
+                                td: (props) => <td style={{ border: "1px solid var(--app-border)", padding: "8px" }} {...props} />
                             }}
                         >
-                            {content}
+                            {formattedContent}
                         </ReactMarkdown>
                     )}
                 </div>
@@ -157,7 +163,7 @@ const MessageBubble = memo(function MessageBubble({
 
 export default MessageBubble;
 
-export function TypingBubble() {
+export function TypingBubble({ status = "" }) {
     return (
         <article style={styles.row}>
             <div style={styles.avatar}>
@@ -165,6 +171,7 @@ export function TypingBubble() {
             </div>
             <div style={styles.content}>
                 <span style={styles.author}>Assistant</span>
+                {status && <span style={styles.typingStatus}>{status}</span>}
                 <div style={{ ...styles.bubble, ...styles.bubbleAssistant, ...styles.typingBubble }} aria-label="Assistant is thinking">
                     <span style={{ ...styles.dot, animationDelay: "0ms" }} />
                     <span style={{ ...styles.dot, animationDelay: "180ms" }} />
@@ -312,6 +319,13 @@ const styles = {
         alignItems: "center",
         gap: "5px",
         padding: "10px 0",
+    },
+    typingStatus: {
+        display: "block",
+        margin: "3px 0 6px",
+        color: "var(--app-muted)",
+        fontSize: "12px",
+        fontWeight: "600",
     },
     dot: {
         width: "7px",

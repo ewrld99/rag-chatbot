@@ -41,6 +41,19 @@ def test_guest_history_limits_messages_and_total_content_from_newest_first():
     ]
 
 
+def test_guest_history_truncates_at_sentence_boundary_when_possible():
+    history = [
+        {
+            "role": "assistant",
+            "content": "The first sentence is complete. The second sentence is too long to keep fully.",
+        }
+    ]
+
+    assert deps.normalize_guest_history(history, max_message_chars=54) == [
+        {"role": "assistant", "content": "The first sentence is complete."}
+    ]
+
+
 def test_guest_history_resolver_uses_client_history_only_without_ids():
     history = [{"role": "user", "content": "What about its classification?"}]
 

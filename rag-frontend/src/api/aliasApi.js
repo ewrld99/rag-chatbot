@@ -1,4 +1,4 @@
-import { API_BASE } from "./chatApi";
+import { API_BASE, BACKEND_UNAVAILABLE_MESSAGE } from "./chatApi";
 import { getAdminToken } from "../utils/adminAuth";
 
 async function requestAlias(path, options = {}) {
@@ -15,7 +15,7 @@ async function requestAlias(path, options = {}) {
             headers,
         });
     } catch {
-        throw new Error("Cannot reach the backend server. Make sure FastAPI is running on http://localhost:8000.");
+        throw new Error(BACKEND_UNAVAILABLE_MESSAGE);
     }
 
     const contentType = res.headers.get("content-type") || "";

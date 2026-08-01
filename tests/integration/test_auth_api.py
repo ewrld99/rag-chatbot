@@ -1,5 +1,6 @@
 import pytest
 from app.db.models import User
+from app.core.config import settings
 from app.core.security import verify_password
 
 def test_register_user(client, db_session):
@@ -13,6 +14,7 @@ def test_register_user(client, db_session):
     assert data["username"] == "testuser"
     assert "id" in data
     assert data["role"] == "user"
+    assert data["token"]
     
     # Verify in DB
     user = db_session.query(User).filter_by(username="testuser").first()
@@ -35,6 +37,18 @@ def test_register_duplicate_username(client, db_session):
     assert response.status_code == 409
     assert "already exists" in response.json()["detail"]
 
+
+def test_register_rejects_reserved_admin_username(client, monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_USERNAMES", "reservedadmin")
+
+    response = client.post(
+        "/api/auth/register",
+        json={"username": "reservedadmin", "password": "securepassword"},
+    )
+
+    assert response.status_code == 403
+    assert "reserved" in response.json()["detail"]
+
 def test_login_user(client, db_session):
     # Register first
     client.post(
@@ -52,6 +66,7 @@ def test_login_user(client, db_session):
     data = response.json()
     assert data["username"] == "loginuser"
     assert "id" in data
+    assert data["token"]
 
 def test_login_invalid_password(client, db_session):
     client.post(

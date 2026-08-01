@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import LoginForm from "../components/admin/loginForm.jsx";
 import { loginUser } from "../api/chatApi.js";
-import { isAdminAuthenticated, saveAdminSession } from "../utils/adminAuth.js";
+import { clearAdminSession, isAdminAuthenticated, saveAdminSession } from "../utils/adminAuth.js";
 
 function navigate(to) {
     window.history.replaceState({}, "", to);
@@ -25,6 +25,7 @@ export default function AdminLoginPage() {
             return;
         }
 
+        clearAdminSession();
         window.localStorage.setItem("ragUser", JSON.stringify(user));
         navigate("/chat");
     };

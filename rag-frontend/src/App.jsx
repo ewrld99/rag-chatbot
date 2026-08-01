@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import "./App.css";
-import PublicLayout from "./layouts/PublicLayout.jsx";
-import AdminLayout from "./layouts/AdminLayout.jsx";
-import ChatPage from "./pages/ChatPage.jsx";
-import AdminLoginPage from "./pages/AdminLoginPage.jsx";
-import RegisterPage from "./pages/RegisterPage.jsx";
-import AdminDashboardPage from "./pages/AdminDashboardPage.jsx";
 import ThemeToggle from "./components/ThemeToggle.jsx";
 import { clearAdminSession, isAdminAuthenticated } from "./utils/adminAuth.js";
+
+const PublicLayout = lazy(() => import("./layouts/PublicLayout.jsx"));
+const AdminLayout = lazy(() => import("./layouts/AdminLayout.jsx"));
+const ChatPage = lazy(() => import("./pages/ChatPage.jsx"));
+const AdminLoginPage = lazy(() => import("./pages/AdminLoginPage.jsx"));
+const RegisterPage = lazy(() => import("./pages/RegisterPage.jsx"));
+const AdminDashboardPage = lazy(() => import("./pages/AdminDashboardPage.jsx"));
 
 function normalizePath(pathname) {
     if (pathname.length > 1 && pathname.endsWith("/")) {
@@ -32,6 +33,10 @@ function ProtectedAdminRoute({ children }) {
     }
 
     return children;
+}
+
+function RouteFallback() {
+    return <div className="app-loading" aria-label="Loading" />;
 }
 
 export default function App() {
@@ -73,7 +78,9 @@ export default function App() {
     if (path === "/login") {
         return (
             <>
-                <AdminLoginPage />
+                <Suspense fallback={<RouteFallback />}>
+                    <AdminLoginPage />
+                </Suspense>
                 <ThemeToggle theme={theme} onToggle={toggleTheme} className="theme-toggle-admin" />
             </>
         );
@@ -82,7 +89,9 @@ export default function App() {
     if (path === "/register") {
         return (
             <>
-                <RegisterPage />
+                <Suspense fallback={<RouteFallback />}>
+                    <RegisterPage />
+                </Suspense>
                 <ThemeToggle theme={theme} onToggle={toggleTheme} />
             </>
         );
@@ -95,11 +104,13 @@ export default function App() {
     if (path === "/admin/dashboard") {
         return (
             <>
-                <ProtectedAdminRoute>
-                    <AdminLayout>
-                        <AdminDashboardPage />
-                    </AdminLayout>
-                </ProtectedAdminRoute>
+                <Suspense fallback={<RouteFallback />}>
+                    <ProtectedAdminRoute>
+                        <AdminLayout>
+                            <AdminDashboardPage />
+                        </AdminLayout>
+                    </ProtectedAdminRoute>
+                </Suspense>
                 <ThemeToggle theme={theme} onToggle={toggleTheme} />
             </>
         );
@@ -112,9 +123,11 @@ export default function App() {
 
     return (
         <>
-            <PublicLayout>
-                {publicRoutes[path] ?? <Redirect to="/" />}
-            </PublicLayout>
+            <Suspense fallback={<RouteFallback />}>
+                <PublicLayout>
+                    {publicRoutes[path] ?? <Redirect to="/" />}
+                </PublicLayout>
+            </Suspense>
             <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </>
     );

@@ -29,7 +29,11 @@ class JinaProviderCircuit:
             raise JinaProviderCooldownError(max(1, math.ceil(remaining)))
 
     def record_account_failure(self) -> None:
-        cooldown = max(1.0, float(settings.JINA_AUTH_COOLDOWN_SECONDS))
+        # Use the configured cooldown but cap the minimum at 60 s so a single
+        # transient Jina auth/balance error does not block dense retrieval for
+        # the full JINA_AUTH_COOLDOWN_SECONDS (default 300 s) without any
+        # way to recover sooner. Sparse retrieval still works during cooldown.
+        cooldown = max(60.0, float(settings.JINA_AUTH_COOLDOWN_SECONDS))
         with self._lock:
             self._open_until = max(self._open_until, time.monotonic() + cooldown)
 

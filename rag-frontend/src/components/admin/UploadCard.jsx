@@ -153,6 +153,8 @@ export default function UploadCard({ onUploaded }) {
                     >
                         <option value="auto">Advanced (High-fidelity tables via pdfplumber)</option>
                         <option value="fast">Fast (Raw text via pypdf - best for long books)</option>
+                        <option value="almanac">Academic Almanac (one calendar event per chunk)</option>
+                        <option value="curriculum">Curriculum Guidebook (one course per chunk)</option>
                     </select>
                 </div>
             )}

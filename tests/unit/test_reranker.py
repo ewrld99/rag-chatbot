@@ -1,14 +1,16 @@
 import pytest
 
 from app.services.jina_resilience import jina_provider_circuit
-from app.services.reranker_service import RerankService
+from app.services.reranker_service import RerankService, close_reranker_client
 from app.services.rrf import RRFResult
 
 
 @pytest.fixture(autouse=True)
 def reset_jina_circuit():
     jina_provider_circuit.reset()
+    close_reranker_client()
     yield
+    close_reranker_client()
     jina_provider_circuit.reset()
 
 
@@ -34,6 +36,9 @@ class _FakeClient:
 
     def __exit__(self, exc_type, exc, traceback):
         return False
+
+    def close(self):
+        return None
 
     def post(self, *args, **kwargs):
         self.payload = kwargs["json"]
@@ -130,6 +135,31 @@ def test_sparse_anchor_survives_even_when_blended_score_is_lower(monkeypatch):
     )
 
     assert [result.chunk_id for result in results] == ["sparse"]
+
+
+def test_reranker_reuses_http_transport(monkeypatch):
+    from app.services import reranker_service
+
+    created = 0
+
+    class CountingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            nonlocal created
+            created += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(reranker_service.httpx, "Client", CountingClient)
+    candidates = [
+        _candidate("one", "First result", 0.02, 1, 1),
+        _candidate("two", "Second result", 0.01, 2, 2),
+    ]
+
+    for _ in range(2):
+        service = RerankService()
+        service._headers = {"Authorization": "Bearer test"}
+        service.rerank("First result", candidates, top_k=1)
+
+    assert created == 1
 
 
 def test_jina_cooldown_uses_local_reranker_without_http_call(monkeypatch):

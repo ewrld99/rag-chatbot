@@ -4,7 +4,7 @@ import ChatInput from "./ChatInput";
 import { useSSEChat } from "../../hooks/useSSEChat";
 import {
     createChatSession, deleteChatSession, getChatSession, getChatSessions, changePassword,
-    getGenerationModels, submitMessageFeedback
+    submitMessageFeedback
 } from "../../api/chatApi";
 import udomLogo from "../../assets/udom-logo.svg";
 
@@ -12,11 +12,6 @@ import udomLogo from "../../assets/udom-logo.svg";
 const PlusIcon = () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
         <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
-    </svg>
-);
-const MenuIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="18" x2="21" y2="18" />
     </svg>
 );
 const SidebarIcon = () => (
@@ -39,21 +34,6 @@ const TrashIcon = () => (
 const UserIcon = () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
-    </svg>
-);
-const UserPlusIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-        <circle cx="9" cy="7" r="4" />
-        <line x1="19" y1="8" x2="19" y2="14" />
-        <line x1="16" y1="11" x2="22" y2="11" />
-    </svg>
-);
-const LoginIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-        <polyline points="10 17 15 12 10 7" />
-        <line x1="15" y1="12" x2="3" y2="12" />
     </svg>
 );
 const LogOutIcon = () => (
@@ -101,18 +81,6 @@ const eveningGreetings = [
     "Good evening",
     "Welcome back",
     "Hope you had a great day"
-];
-
-const FALLBACK_MODEL_OPTIONS = [
-    {
-        id: "llama-3.3-70b-versatile",
-        label: "Llama 3.3 70B Versatile",
-        is_default: true,
-    },
-    { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
-    { id: "qwen/qwen3.6-27b", label: "Qwen 3.6 27B" },
-    { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
-    { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant" },
 ];
 
 function getTimeGreeting(date = new Date()) {
@@ -163,15 +131,11 @@ export default function ChatWindow() {
     const [activeSessionId, setActiveSessionId] = useState(null);
     const [messages, setMessages] = useState([]);
     const [isWaiting, setIsWaiting] = useState(false);
+    const [streamStatus, setStreamStatus] = useState("");
     const [isSidebarOpen, setIsSidebarOpen] = useState(() => !isNarrow);
-    const [isAuthMenuOpen, setIsAuthMenuOpen] = useState(false);
     const [historyError, setHistoryError] = useState("");
-    const [modelOptions, setModelOptions] = useState(FALLBACK_MODEL_OPTIONS);
-    const [modelSelectionEnabled, setModelSelectionEnabled] = useState(true);
-    const [modelPreference, setModelPreference] = useState(() => (
-        window.localStorage.getItem("ragModelPreference") || "auto"
-    ));
     const messageListRef = useRef(null);
+    const guestConversationTokenRef = useRef(null);
 
     // Password Change State
     const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
@@ -196,45 +160,15 @@ export default function ChatWindow() {
         }
     }, [user]);
 
-    useEffect(() => {
-        let active = true;
-
-        getGenerationModels()
-            .then((policy) => {
-                if (!active) return;
-                const options = Array.isArray(policy?.models) ? policy.models : [];
-                if (options.length > 0) setModelOptions(options);
-
-                const selectionEnabled = policy?.selection_enabled !== false;
-                setModelSelectionEnabled(selectionEnabled);
-                setModelPreference((current) => {
-                    const allowed = new Set(options.map((option) => option.id));
-                    const next = (
-                        selectionEnabled
-                        && (current === "auto" || allowed.has(current))
-                    ) ? current : "auto";
-                    window.localStorage.setItem("ragModelPreference", next);
-                    return next;
-                });
-            })
-            .catch(() => {
-                // Static allowlisted options remain available if policy loading fails.
-            });
-
-        return () => {
-            active = false;
-        };
-    }, []);
-
-    const handleModelChange = (event) => {
-        const preference = event.target.value;
-        setModelPreference(preference);
-        window.localStorage.setItem("ragModelPreference", preference);
-    };
-
     const handleSSEEvent = useCallback((event) => {
+        if (event.type === "status") {
+            setIsWaiting(true);
+            setStreamStatus(event.message || "Working on the answer...");
+            return;
+        }
         if (event.type === "stream") {
             setIsWaiting(false);
+            setStreamStatus("");
             setMessages((prev) => {
                 const last = prev[prev.length - 1];
                 if (last?.role === "assistant") {
@@ -243,8 +177,23 @@ export default function ChatWindow() {
                 return [...prev, { role: "assistant", content: event.token, sources: [] }];
             });
         }
+        if (event.type === "replace") {
+            setIsWaiting(Boolean(event.provisional));
+            setStreamStatus(event.provisional ? "Checking the draft against retrieved sources..." : "");
+            setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last?.role === "assistant") {
+                    return [...prev.slice(0, -1), { ...last, content: event.answer || "" }];
+                }
+                return [...prev, { role: "assistant", content: event.answer || "", sources: [] }];
+            });
+        }
         if (event.type === "done") {
             setIsWaiting(false);
+            setStreamStatus("");
+            if (event.conversation_token) {
+                guestConversationTokenRef.current = event.conversation_token;
+            }
             if (
                 event.message_id
                 || Array.isArray(event.sources)
@@ -266,25 +215,21 @@ export default function ChatWindow() {
         }
         if (event.type === "error") {
             setIsWaiting(false);
+            setStreamStatus("");
             const safeMessage = event.message || "Unable to complete the answer right now. Please try again.";
+            const sources = Array.isArray(event.sources) ? event.sources : [];
 
-            if (event.code === "GENERATION_TEMPORARILY_UNAVAILABLE") {
-                setHistoryError("");
-                setMessages((prev) => {
-                    const sources = Array.isArray(event.sources) ? event.sources : [];
-                    const last = prev[prev.length - 1];
-                    if (last?.role === "assistant") {
-                        return [
-                            ...prev.slice(0, -1),
-                            { ...last, content: safeMessage, sources },
-                        ];
-                    }
-                    return [...prev, { role: "assistant", content: safeMessage, sources }];
-                });
-                return;
-            }
-
-            setHistoryError(safeMessage);
+            setHistoryError("");
+            setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last?.role === "assistant") {
+                    return [
+                        ...prev.slice(0, -1),
+                        { ...last, content: safeMessage, sources },
+                    ];
+                }
+                return [...prev, { role: "assistant", content: safeMessage, sources }];
+            });
         }
     }, [loadSessions]);
 
@@ -301,6 +246,7 @@ export default function ChatWindow() {
         setSessions([]);
         setActiveSessionId(null);
         setMessages([]);
+        guestConversationTokenRef.current = null;
     };
 
     const handleChangePasswordSubmit = async (e) => {
@@ -333,6 +279,7 @@ export default function ChatWindow() {
     };
 
     const handleNewChat = async () => {
+        guestConversationTokenRef.current = null;
         if (!user) { setActiveSessionId(null); setMessages([]); setHistoryError(""); return; }
         try {
             const session = await createChatSession(user.id);
@@ -346,6 +293,7 @@ export default function ChatWindow() {
 
     const handleSelectSession = async (sessionId) => {
         if (!user) return;
+        guestConversationTokenRef.current = null;
         try {
             const session = await getChatSession(user.id, sessionId);
             setActiveSessionId(session.id);
@@ -383,7 +331,11 @@ export default function ChatWindow() {
         if (!user) return;
         try {
             await deleteChatSession(user.id, sessionId);
-            if (activeSessionId === sessionId) { setActiveSessionId(null); setMessages([]); }
+            if (activeSessionId === sessionId) {
+                setActiveSessionId(null);
+                setMessages([]);
+                guestConversationTokenRef.current = null;
+            }
             await loadSessions();
         } catch (error) {
             setHistoryError(error.message);
@@ -398,6 +350,7 @@ export default function ChatWindow() {
 
         setMessages((prev) => [...prev, { role: "user", content: text }]);
         setIsWaiting(true);
+        setStreamStatus("Understanding your question...");
         if (user && !sessionId) {
             try {
                 const session = await createChatSession(user.id, text.slice(0, 80));
@@ -415,7 +368,7 @@ export default function ChatWindow() {
             sessionId,
             user?.id ?? null,
             recentHistory,
-            modelPreference,
+            user ? null : guestConversationTokenRef.current,
         );
     };
 
@@ -575,10 +528,6 @@ export default function ChatWindow() {
                                 onSend={handleSend}
                                 disabled={isWaiting}
                                 placement="center"
-                                modelOptions={modelOptions}
-                                modelPreference={modelPreference}
-                                modelSelectionEnabled={modelSelectionEnabled}
-                                onModelChange={handleModelChange}
                             />
                         </section>
                     ) : (
@@ -591,17 +540,13 @@ export default function ChatWindow() {
                         ))
                     )}
 
-                    {isWaiting && <TypingBubble />}
+                    {isWaiting && <TypingBubble status={streamStatus} />}
                 </div>
 
                 {messages.length > 0 && (
                     <ChatInput
                         onSend={handleSend}
                         disabled={isWaiting}
-                        modelOptions={modelOptions}
-                        modelPreference={modelPreference}
-                        modelSelectionEnabled={modelSelectionEnabled}
-                        onModelChange={handleModelChange}
                     />
                 )}
             </div>

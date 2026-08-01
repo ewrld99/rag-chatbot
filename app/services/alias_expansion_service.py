@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.db.models import RetrievalAlias
 from app.services.query_normalization import (
     FALLBACK_ALIAS_EXPANSIONS,
+    QUESTION_STOPWORDS,
     clean_query_text,
     tokenize,
 )
@@ -125,7 +126,7 @@ class AliasExpansionService:
         normalized_query: str,
     ) -> list[str]:
         keys: list[str] = []
-        if record.term in tokens:
+        if record.term in tokens and record.term not in QUESTION_STOPWORDS:
             keys.append(record.term)
 
         for alias in record.aliases:
@@ -134,7 +135,7 @@ class AliasExpansionService:
                 if alias_phrase.strip() and alias_phrase in normalized_query:
                     keys.append(record.term)
                 continue
-            if alias in tokens:
+            if alias in tokens and alias not in QUESTION_STOPWORDS:
                 keys.append(alias)
 
         return list(dict.fromkeys(keys))

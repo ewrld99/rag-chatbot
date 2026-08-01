@@ -5,6 +5,7 @@ import pandas as pd
 from unittest.mock import patch, MagicMock
 
 from app.main import app
+from app.api.deps import require_admin_user
 from app.db.models import FAQModel, AuditLog
 from app.services.faq_service import FAQService
 from app.services.hybrid_retriever import HybridRetriever
@@ -21,8 +22,14 @@ def mock_db_session():
 
 @pytest.fixture
 def mock_admin_token():
-    # Helper to generate a mock token for admin
-    return "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFkbWluIn0.signature"
+    class AdminUser:
+        username = "admin"
+
+    app.dependency_overrides[require_admin_user] = lambda: AdminUser()
+    try:
+        yield "Bearer test-token"
+    finally:
+        app.dependency_overrides.pop(require_admin_user, None)
 
 # ---------------------------------------------------------
 # API Endpoints & Validation Tests
@@ -31,7 +38,7 @@ def mock_admin_token():
 def test_create_faq_unauthorized():
     response = client.post("/api/admin/faqs/", json={"question": "Q", "answer": "A"})
     assert response.status_code == 401
-    assert "Unauthorized" in response.json()["detail"]
+    assert "Authentication required" in response.json()["detail"]
 
 @patch("app.api.routes.admin.FAQService.create_faq")
 def test_create_faq_authorized(mock_create, mock_admin_token):

@@ -1,9 +1,10 @@
 import httpx
 import pytest
-from groq import APIConnectionError, PermissionDeniedError, RateLimitError
+from groq import APIConnectionError, InternalServerError, PermissionDeniedError, RateLimitError
 
 from app.core.config import settings
 from app.services.generation_resilience import (
+    EmptyGenerationResponseError,
     GenerationUnavailableError,
     generation_resilience,
 )
@@ -43,6 +44,30 @@ def _permission_error() -> PermissionDeniedError:
     response = httpx.Response(403, request=request, json=body)
     return PermissionDeniedError(
         "model_permission_blocked_project",
+        response=response,
+        body=body,
+    )
+
+
+def _over_capacity_error() -> InternalServerError:
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    body = {
+        "error": {
+            "message": (
+                "qwen/qwen3.6-27b is currently over capacity. "
+                "Please try again and back off exponentially."
+            ),
+            "type": "internal_server_error",
+        }
+    }
+    response = httpx.Response(
+        503,
+        request=request,
+        headers={"retry-after": "40"},
+        json=body,
+    )
+    return InternalServerError(
+        "qwen/qwen3.6-27b is currently over capacity. Please try again and back off exponentially.",
         response=response,
         body=body,
     )
@@ -189,4 +214,73 @@ def test_failed_json_generation_does_not_open_model_circuit(monkeypatch):
     )
 
     assert result == "ok"
+    assert calls == 1
+
+
+def test_empty_generation_response_quarantines_only_that_model(monkeypatch):
+    monkeypatch.setattr(settings, "GENERATION_EMPTY_RESPONSE_COOLDOWN_SECONDS", 120.0)
+    calls = {"empty": 0, "healthy": 0}
+
+    def empty_response():
+        calls["empty"] += 1
+        raise EmptyGenerationResponseError(
+            "Generation provider returned empty streamed content."
+        )
+
+    with pytest.raises(GenerationUnavailableError) as captured:
+        generation_resilience.call(
+            "document_answer_stream",
+            empty_response,
+            circuit_key="groq:empty-model",
+            model="empty-model",
+        )
+
+    assert captured.value.retry_after == 120
+
+    with pytest.raises(GenerationUnavailableError):
+        generation_resilience.call(
+            "document_answer_repair_stream",
+            empty_response,
+            circuit_key="groq:empty-model",
+            model="empty-model",
+        )
+
+    result = generation_resilience.call(
+        "document_answer_stream",
+        lambda: calls.__setitem__("healthy", calls["healthy"] + 1) or "ok",
+        circuit_key="groq:healthy-model",
+        model="healthy-model",
+    )
+
+    assert result == "ok"
+    assert calls == {"empty": 1, "healthy": 1}
+
+
+def test_over_capacity_is_not_retried_and_opens_model_circuit():
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        raise _over_capacity_error()
+
+    with pytest.raises(GenerationUnavailableError) as captured:
+        generation_resilience.call(
+            "grounding_verification",
+            fail,
+            circuit_key="groq:qwen/qwen3.6-27b",
+            model="qwen/qwen3.6-27b",
+        )
+
+    assert captured.value.retry_after == 40
+    assert calls == 1
+
+    with pytest.raises(GenerationUnavailableError):
+        generation_resilience.call(
+            "grounding_verification",
+            fail,
+            circuit_key="groq:qwen/qwen3.6-27b",
+            model="qwen/qwen3.6-27b",
+        )
+
     assert calls == 1

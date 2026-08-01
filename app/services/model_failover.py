@@ -5,11 +5,13 @@ from dataclasses import dataclass
 import logging
 from typing import Generic, NoReturn, TypeVar
 
+from app.core.logging import format_log_event
 from app.services.generation_resilience import (
     GenerationResilience,
     GenerationUnavailableError,
     generation_resilience,
 )
+from app.services.model_catalog import model_provider
 from app.services.model_router import ModelRouter
 
 
@@ -45,13 +47,21 @@ class ModelFailoverService:
         requested_model = self.router.normalize_preference(preference)
         candidates = self.router.candidates(operation, requested_model)
         failures: list[GenerationUnavailableError] = []
+        logger.info(
+            format_log_event(
+                "Generation model candidates",
+                operation=operation,
+                requested_model=requested_model,
+                candidates=candidates,
+            )
+        )
 
         for index, model in enumerate(candidates):
             try:
                 value = self.resilience.call(
                     operation,
                     lambda model=model: callback(model),
-                    circuit_key=f"groq:{model}",
+                    circuit_key=f"{model_provider(model)}:{model}",
                     model=model,
                 )
                 return ModelExecutionResult(
@@ -63,10 +73,11 @@ class ModelFailoverService:
             except GenerationUnavailableError as exc:
                 failures.append(exc)
                 logger.info(
-                    "Generation model unavailable; trying fallback | "
-                    "operation=%s model=%s",
-                    operation,
-                    model,
+                    format_log_event(
+                        "Generation model unavailable; trying fallback",
+                        operation=operation,
+                        model=model,
+                    )
                 )
 
         self._raise_exhausted(failures)
@@ -80,13 +91,21 @@ class ModelFailoverService:
         requested_model = self.router.normalize_preference(preference)
         candidates = self.router.candidates(operation, requested_model)
         failures: list[GenerationUnavailableError] = []
+        logger.info(
+            format_log_event(
+                "Generation model candidates",
+                operation=operation,
+                requested_model=requested_model,
+                candidates=candidates,
+            )
+        )
 
         for index, model in enumerate(candidates):
             try:
                 value = await self.resilience.call_async(
                     operation,
                     lambda model=model: callback(model),
-                    circuit_key=f"groq:{model}",
+                    circuit_key=f"{model_provider(model)}:{model}",
                     model=model,
                 )
                 return ModelExecutionResult(
@@ -98,10 +117,11 @@ class ModelFailoverService:
             except GenerationUnavailableError as exc:
                 failures.append(exc)
                 logger.info(
-                    "Generation model unavailable; trying fallback | "
-                    "operation=%s model=%s",
-                    operation,
-                    model,
+                    format_log_event(
+                        "Generation model unavailable; trying fallback",
+                        operation=operation,
+                        model=model,
+                    )
                 )
 
         self._raise_exhausted(failures)
@@ -117,6 +137,14 @@ class ModelFailoverService:
         ]
         retry_after = min(retry_values) if retry_values else None
         error_id = failures[-1].error_id if failures else None
+        logger.warning(
+            format_log_event(
+                "Generation model failover exhausted",
+                failures=len(failures),
+                retry_after=retry_after,
+                error_id=error_id,
+            )
+        )
         raise GenerationUnavailableError(
             retry_after=retry_after,
             error_id=error_id,

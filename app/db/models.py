@@ -47,6 +47,7 @@ class ChatMessage(Base):
     role = Column(Text, nullable=False)
     content = Column(Text, nullable=False)
     sources = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    turn_context = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     feedback = Column(Integer, nullable=True)  # 1: Thumbs Up, -1: Thumbs Down
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

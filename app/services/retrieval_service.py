@@ -15,11 +15,14 @@ Fusion (RRF).
 from __future__ import annotations
 
 from html import escape
+import logging
+import time
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.documents import Document
 from sqlalchemy.orm import Session
 
+from app.core.logging import format_log_event
 from app.services.alias_expansion_service import AliasExpansionService
 from app.services.embedding_service import get_embedding
 from app.services.grounding_service import GroundingService
@@ -27,6 +30,9 @@ from app.services.hybrid_retriever import HybridRetriever
 from app.services.reranker_service import RerankService
 from app.services.source_service import document_name
 from app.services.settings_service import SettingsService
+
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalService:
@@ -53,6 +59,11 @@ class RetrievalService:
             sparse_top_k=self._settings.top_k_sparse,
             rrf_k=self._settings.rrf_k,
         )
+
+    def set_top_k(self, top_k: int) -> None:
+        """Update the final result limit for this request-scoped service."""
+        self.top_k = max(1, int(top_k))
+        self._hybrid.top_k = self.top_k
 
     # -----------------------------------------------------------------------
     # 1. Embed Query  (kept for backward compatibility)
@@ -84,19 +95,25 @@ class RetrievalService:
             # Jina ever sees them. The union can be up to DENSE_TOP_K + SPARSE_TOP_K
             # unique chunks after RRF deduplication.
             pool_size = self._settings.top_k_dense + self._settings.top_k_sparse
-            alias_expansions = AliasExpansionService(self.db).get_expansions(query)
             raw = self._hybrid.retrieve_raw(
                 query,
                 filters=filters,
                 pool_size=pool_size,
                 include_neighbors=False,
             )
-            reranked = self._reranker.rerank(
-                query,
-                raw,
-                top_k=self.top_k,
-                alias_expansions=alias_expansions,
-            )
+            if self._should_skip_neural_rerank(raw):
+                reranked = raw[:self.top_k]
+                for result in reranked:
+                    result.metadata["reranker"] = "skipped_high_confidence"
+                    result.metadata["rerank_strategy"] = "rrf_high_confidence"
+            else:
+                alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+                reranked = self._reranker.rerank(
+                    query,
+                    raw,
+                    top_k=self.top_k,
+                    alias_expansions=alias_expansions,
+                )
             reranked = self._hybrid.expand_neighbor_chunks(reranked)
             from app.services.hybrid_retriever import _rrf_to_langchain
             return [_rrf_to_langchain(r) for r in reranked]
@@ -111,23 +128,67 @@ class RetrievalService:
         Score is the Jina relevance score (if reranker is on) or RRF score.
         """
         if self._settings.enable_reranker:
+            started_at = time.perf_counter()
             pool_size = self._settings.top_k_dense + self._settings.top_k_sparse
-            alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+            raw_started_at = time.perf_counter()
             raw = self._hybrid.retrieve_raw(
                 query,
                 filters=filters,
                 pool_size=pool_size,
                 include_neighbors=False,
             )
-            raw = self._reranker.rerank(
-                query,
-                raw,
-                top_k=self.top_k,
-                alias_expansions=alias_expansions,
-            )
+            candidate_count = len(raw)
+            raw_ms = round((time.perf_counter() - raw_started_at) * 1000, 1)
+            skip_rerank = self._should_skip_neural_rerank(raw)
+            rerank_started_at = time.perf_counter()
+            if skip_rerank:
+                alias_ms = 0.0
+                raw = raw[:self.top_k]
+                for result in raw:
+                    result.metadata["reranker"] = "skipped_high_confidence"
+                    result.metadata["rerank_strategy"] = "rrf_high_confidence"
+                rerank_ms = 0.0
+            else:
+                alias_started_at = time.perf_counter()
+                alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+                alias_ms = round((time.perf_counter() - alias_started_at) * 1000, 1)
+                raw = self._reranker.rerank(
+                    query,
+                    raw,
+                    top_k=self.top_k,
+                    alias_expansions=alias_expansions,
+                )
+                rerank_ms = round((time.perf_counter() - rerank_started_at) * 1000, 1)
+            neighbor_started_at = time.perf_counter()
             raw = self._hybrid.expand_neighbor_chunks(raw)
+            neighbor_ms = round((time.perf_counter() - neighbor_started_at) * 1000, 1)
+            logger.info(
+                format_log_event(
+                    "Retrieval latency",
+                    total_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                    alias_ms=alias_ms,
+                    raw_hybrid_ms=raw_ms,
+                    rerank_ms=rerank_ms,
+                    neighbor_ms=neighbor_ms,
+                    candidates=candidate_count,
+                    returned=len(raw),
+                    reranker_enabled=True,
+                    rerank_skipped=skip_rerank,
+                    query=query[:120],
+                )
+            )
         else:
+            started_at = time.perf_counter()
             raw = self._hybrid.retrieve_raw(query, filters=filters)
+            logger.info(
+                format_log_event(
+                    "Retrieval latency",
+                    total_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                    returned=len(raw),
+                    reranker_enabled=False,
+                    query=query[:120],
+                )
+            )
 
         output: List[Tuple[Document, float]] = []
         for result in raw:
@@ -147,6 +208,28 @@ class RetrievalService:
             output.append((doc, score))
 
         return output
+
+    def _should_skip_neural_rerank(self, raw: List[Any]) -> bool:
+        if not self._settings.adaptive_rerank_skip_high_confidence:
+            return False
+        if len(raw) < self.top_k:
+            return False
+        top = raw[0] if raw else None
+        if top is None:
+            return False
+
+        retrieval_sources = set(top.retrieval_sources or [])
+        has_hybrid_top = {"dense", "sparse"}.issubset(retrieval_sources)
+        dense_rank = top.dense_rank
+        sparse_rank = top.sparse_rank
+        top_rank_strong = (
+            isinstance(dense_rank, int)
+            and isinstance(sparse_rank, int)
+            and dense_rank <= 3
+            and sparse_rank <= 3
+        )
+        top_rrf = float(top.rrf_score or 0.0)
+        return bool(has_hybrid_top and top_rank_strong and top_rrf >= 0.03)
 
     # -----------------------------------------------------------------------
     # 4. Format Context
@@ -195,7 +278,8 @@ class RetrievalService:
                         f'  </document>'
                     )
                     formatted_chunks.append(chunk_text)
-                break  # current_length update omitted — we exit immediately
+                    current_length += len(chunk_text)
+                break
 
             formatted_chunks.append(chunk_text)
             current_length += len(chunk_text)

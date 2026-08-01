@@ -12,8 +12,8 @@ scored as equivalent during fallback reranking.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 import logging
-import re
 from typing import List
 
 import httpx
@@ -24,7 +24,7 @@ from app.services.jina_resilience import (
     is_jina_account_failure,
     jina_provider_circuit,
 )
-from app.services.query_normalization import significant_tokens
+from app.services.query_normalization import metadata_search_text, significant_tokens, token_set, tokenize
 from app.services.rrf import RRFResult
 from app.services.tls_service import system_ssl_context
 
@@ -33,6 +33,20 @@ logger = logging.getLogger(__name__)
 _JINA_RERANK_URL = "https://api.jina.ai/v1/rerank"
 _JINA_RERANK_MODEL = "jina-reranker-v2-base-multilingual"
 _REQUEST_TIMEOUT = 10.0
+
+
+@lru_cache(maxsize=1)
+def get_reranker_client() -> httpx.Client:
+    return httpx.Client(
+        timeout=_REQUEST_TIMEOUT,
+        verify=system_ssl_context(),
+    )
+
+
+def close_reranker_client() -> None:
+    if get_reranker_client.cache_info().currsize:
+        get_reranker_client().close()
+        get_reranker_client.cache_clear()
 
 
 class RerankService:
@@ -99,16 +113,12 @@ class RerankService:
                 "top_n": len(candidates),
             }
 
-            with httpx.Client(
-                timeout=_REQUEST_TIMEOUT,
-                verify=system_ssl_context(),
-            ) as client:
-                response = client.post(
-                    _JINA_RERANK_URL,
-                    headers=self._headers,
-                    json=payload,
-                )
-                response.raise_for_status()
+            response = get_reranker_client().post(
+                _JINA_RERANK_URL,
+                headers=self._headers,
+                json=payload,
+            )
+            response.raise_for_status()
 
             jina_provider_circuit.record_success()
             jina_scores: dict[int, float] = {}
@@ -256,7 +266,7 @@ class RerankService:
         """Deterministic local fallback reranker used when Jina is unavailable."""
         query_terms = set(significant_tokens(query))
         if not query_terms:
-            query_terms = {term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2}
+            query_terms = {term for term in tokenize(query) if len(term) > 2}
 
         alias_single_terms, alias_phrases = self._alias_terms(alias_expansions or {})
         query_terms.update(alias_single_terms)
@@ -265,15 +275,10 @@ class RerankService:
             return candidates[:top_k]
 
         scored: list[tuple[float, int, str, str, RRFResult]] = []
-        safe_metadata_keys = ("source", "document_title", "source_url", "category")
 
         for index, candidate in enumerate(candidates):
-            metadata_text = " ".join(
-                str(candidate.metadata.get(key, "")).lower()
-                for key in safe_metadata_keys
-            )
-            haystack = f"{candidate.text.lower()} {metadata_text}"
-            content_tokens = set(re.findall(r"[a-z0-9]+", haystack))
+            haystack = f"{candidate.text} {metadata_search_text(candidate.metadata)}".lower()
+            content_tokens = token_set(haystack)
 
             overlap = len(query_terms & content_tokens)
             phrase_bonus = sum(2.0 for phrase in alias_phrases if phrase in haystack)
@@ -307,7 +312,7 @@ class RerankService:
         for term, aliases in alias_expansions.items():
             values = [term, *list(aliases or [])]
             for value in values:
-                tokens = re.findall(r"[a-z0-9]+", str(value).lower())
+                tokens = tokenize(str(value))
                 if not tokens:
                     continue
                 if len(tokens) == 1:

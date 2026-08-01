@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getSettings, updateSetting, triggerFullCrawler, triggerAnnouncementCrawler, getCrawlerStatus } from "../../api/settingsApi";
+import { useCallback, useEffect, useState } from "react";
+import { cancelCrawler, getSettings, updateSetting, triggerFullCrawler, resumeFullCrawler, triggerAnnouncementCrawler, getCrawlerStatus } from "../../api/settingsApi";
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
 const SaveIcon = () => (
@@ -26,10 +26,10 @@ const RefreshIcon = () => (
 
 // ─── Setting metadata ──────────────────────────────────────────────────────────
 const GENERATION_MODELS = [
+    "qwen3.5:4b",
+    "gemma3:4b",
+    "gemini-3.6-flash",
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
 ];
 
@@ -41,8 +41,11 @@ const SETTING_META = {
     top_k_final:        { label: "Final Top K",          type: "number", min: 1,    max: 20,   step: 1,   reindex: false },
     rrf_k:              { label: "RRF Constant",         type: "number", min: 10,   max: 200,  step: 5,   reindex: false },
     enable_reranker:    { label: "Enable Reranker",      type: "toggle",                                  reindex: false },
+    adaptive_rerank_skip_high_confidence:
+                         { label: "Skip Rerank On High Confidence", type: "toggle",                       reindex: false },
     embedding_model:    { label: "Embedding Model",      type: "select", 
                           options: [
+                              'bge-m3',
                               'jina-embeddings-v2-base-en', 'jina-embeddings-v2-base-zh', 'jina-embeddings-v2-base-de', 
                               'jina-embeddings-v2-base-es', 'jina-embeddings-v2-base-code', 'jina-embeddings-v3', 
                               'jina-embeddings-v5-text-nano', 'jina-embeddings-v5-text-small', 'jina-embeddings-v5-omni-small', 
@@ -71,11 +74,6 @@ const SETTING_META = {
         type: "text",
         reindex: false,
     },
-    generation_user_selection_enabled: {
-        label: "Allow User Model Selection",
-        type: "toggle",
-        reindex: false,
-    },
     max_upload_size_mb: { label: "Max Upload Size (MB)", type: "number", min: 1,    max: 100,  step: 1,   reindex: false },
     allowed_extensions: { label: "Allowed Extensions",  type: "text",                                    reindex: false },
     crawler_allowlist:  { label: "Crawler Allowlist (Domains)", type: "text",                            reindex: false },
@@ -96,7 +94,7 @@ const GROUPS = [
         label: "Retrieval",
         eyebrow: "Hybrid Search",
         description: "Tune dense + sparse retrieval and Reciprocal Rank Fusion.",
-        keys: ["top_k_dense", "top_k_sparse", "top_k_final", "rrf_k", "enable_reranker"],
+        keys: ["top_k_dense", "top_k_sparse", "top_k_final", "rrf_k", "enable_reranker", "adaptive_rerank_skip_high_confidence"],
     },
     {
         id: "embeddings",
@@ -115,7 +113,6 @@ const GROUPS = [
             "generation_allowed_models",
             "generation_answer_model_order",
             "generation_utility_model_order",
-            "generation_user_selection_enabled",
         ],
     },
     {
@@ -151,14 +148,15 @@ function Toast({ toasts }) {
 // ─── Individual setting row ────────────────────────────────────────────────────
 function SettingRow({ setting, meta, onSaved }) {
     const [value, setValue] = useState(setting.value ?? "");
+    const [originalValue, setOriginalValue] = useState(setting.value ?? "");
     const [saving, setSaving] = useState(false);
     const [localError, setLocalError] = useState("");
-    const originalValue = useRef(setting.value ?? "");
 
     // Sync when parent refreshes
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setValue(setting.value ?? "");
-        originalValue.current = setting.value ?? "";
+        setOriginalValue(setting.value ?? "");
     }, [setting.value]);
 
     const validate = (v) => {
@@ -180,7 +178,7 @@ function SettingRow({ setting, meta, onSaved }) {
         setSaving(true);
         try {
             await updateSetting(setting.key, value);
-            originalValue.current = value;
+            setOriginalValue(value);
             onSaved(setting.key, value, meta?.reindex ? "reindex" : "ok");
         } catch (e) {
             onSaved(setting.key, value, "error", e.message);
@@ -189,7 +187,7 @@ function SettingRow({ setting, meta, onSaved }) {
         }
     };
 
-    const dirty = value !== originalValue.current;
+    const dirty = value !== originalValue;
 
     const renderInput = () => {
         if (meta?.type === "toggle") {
@@ -320,12 +318,13 @@ export default function RagSettings() {
         try {
             const status = await getCrawlerStatus();
             setCrawlerStatus(status);
-        } catch (e) {
+        } catch {
             // Ignore silent errors for polling
         }
     }, []);
 
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         fetchCrawlerStatus();
         const interval = setInterval(fetchCrawlerStatus, 3000);
         return () => clearInterval(interval);
@@ -350,7 +349,10 @@ export default function RagSettings() {
         }
     }, []);
 
-    useEffect(() => { loadSettings(); }, [loadSettings]);
+    useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        loadSettings();
+    }, [loadSettings]);
 
     const handleSaved = useCallback((key, _value, outcome, errMsg) => {
         if (outcome === "error") {
@@ -372,7 +374,17 @@ export default function RagSettings() {
     const handleTriggerFull = async () => {
         try {
             await triggerFullCrawler();
-            addToast("Full crawler triggered in the background.", "success");
+            addToast("Fresh full crawler started in the background.", "success");
+            fetchCrawlerStatus();
+        } catch (e) {
+            addToast(e.message, "error");
+        }
+    };
+
+    const handleResumeFull = async () => {
+        try {
+            await resumeFullCrawler();
+            addToast("Full crawler resume started in the background.", "success");
             fetchCrawlerStatus();
         } catch (e) {
             addToast(e.message, "error");
@@ -394,7 +406,6 @@ export default function RagSettings() {
 
     const handleCancel = async (jobType) => {
         try {
-            const { cancelCrawler } = await import("../../api/settingsApi");
             await cancelCrawler(jobType);
             addToast(`${jobType} crawler stop requested. It will reset shortly.`, "success");
             fetchCrawlerStatus();
@@ -404,6 +415,10 @@ export default function RagSettings() {
     };
 
     const settingMap = Object.fromEntries(settings.map((s) => [s.key, s]));
+    const crawlerEnabled = crawlerStatus?.enabled !== false;
+    const announcementsRunning = crawlerStatus?.announcements?.status === "running";
+    const fullRunning = crawlerStatus?.full?.status === "running";
+    const crawlerStartDisabled = isLoading || !crawlerEnabled;
 
     return (
         <section style={styles.page}>
@@ -421,19 +436,30 @@ export default function RagSettings() {
                 <div style={{ display: 'flex', gap: '8px' }}>
                     <button
                         type="button"
-                        style={{ ...styles.ghostBtn, ...((isLoading || crawlerStatus?.announcements?.status === "running") ? styles.ghostBtnDisabled : {}) }}
+                        style={{ ...styles.ghostBtn, ...((crawlerStartDisabled || announcementsRunning) ? styles.ghostBtnDisabled : {}) }}
                         onClick={handleTriggerAnnouncements}
-                        disabled={isLoading || crawlerStatus?.announcements?.status === "running"}
+                        disabled={crawlerStartDisabled || announcementsRunning}
+                        title={crawlerEnabled ? "Start the announcement crawler" : "Crawler is disabled"}
                     >
                         Trigger Announcement Crawler
                     </button>
                     <button
                         type="button"
-                        style={{ ...styles.ghostBtn, ...((isLoading || crawlerStatus?.full?.status === "running") ? styles.ghostBtnDisabled : {}) }}
+                        style={{ ...styles.ghostBtn, ...((crawlerStartDisabled || fullRunning) ? styles.ghostBtnDisabled : {}) }}
                         onClick={handleTriggerFull}
-                        disabled={isLoading || crawlerStatus?.full?.status === "running"}
+                        disabled={crawlerStartDisabled || fullRunning}
+                        title={crawlerEnabled ? "Clear the full crawler queue and start from the homepage" : "Crawler is disabled"}
                     >
-                        Trigger Full Crawler
+                        Start Fresh Full Crawl
+                    </button>
+                    <button
+                        type="button"
+                        style={{ ...styles.ghostBtn, ...((crawlerStartDisabled || fullRunning) ? styles.ghostBtnDisabled : {}) }}
+                        onClick={handleResumeFull}
+                        disabled={crawlerStartDisabled || fullRunning}
+                        title={crawlerEnabled ? "Continue the existing full crawler queue without deleting pending URLs" : "Crawler is disabled"}
+                    >
+                        Resume Full Crawl
                     </button>
                     <button
                         type="button"
@@ -446,6 +472,13 @@ export default function RagSettings() {
                     </button>
                 </div>
             </div>
+
+            {!crawlerEnabled && (
+                <div style={styles.infoBanner}>
+                    <AlertTriangleIcon />
+                    <span>Web crawler is disabled.</span>
+                </div>
+            )}
 
             {loadError && (
                 <div style={styles.errorBanner}>
@@ -462,32 +495,13 @@ export default function RagSettings() {
                     ].map(job => {
                         const rawData = crawlerStatus[job.key];
                         if (!rawData) return null;
-                        
-                        // Bridge to new UI model if backend still sends old format
-                        const mappedData = rawData.overallProgress !== undefined ? rawData : {
-                            status: rawData.status || "idle",
-                            overallProgress: rawData.max > 0 ? Math.min(100, Math.round((rawData.crawled / rawData.max) * 100)) : 0,
-                            stage: rawData.status === "running" ? "Crawling Website" : "",
-                            stageProgress: rawData.max > 0 ? Math.min(100, Math.round((rawData.crawled / rawData.max) * 100)) : 0,
-                            pagesDiscovered: rawData.crawled || 0,
-                            pagesCrawled: rawData.crawled || 0,
-                            filesDownloaded: 0,
-                            documentsProcessed: 0,
-                            chunksCreated: 0,
-                            embeddingsGenerated: 0,
-                            databaseInserted: 0,
-                            currentItem: rawData.current_url || "",
-                            recentEvents: [],
-                            warnings: [],
-                            errors: [],
-                            elapsed: rawData.last_run ? new Date(rawData.last_run).toLocaleString() : ""
-                        };
 
                         return (
                             <CrawlerDashboard 
                                 key={job.key}
-                                title={job.title} 
-                                data={mappedData} 
+                                jobType={job.key}
+                                title={job.title}
+                                data={rawData}
                                 onCancel={() => handleCancel(job.key)}
                             />
                         );
@@ -584,6 +598,17 @@ const styles = {
         background: "var(--app-danger-soft)",
         border: "1px solid #f1c4b2",
         color: "var(--app-danger)",
+        fontSize: "13px",
+    },
+    infoBanner: {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        padding: "12px 16px",
+        borderRadius: "10px",
+        background: "var(--app-surface-muted)",
+        border: "1px solid var(--app-border)",
+        color: "var(--text-muted, var(--app-faint))",
         fontSize: "13px",
     },
     groupGrid: {

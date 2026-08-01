@@ -26,7 +26,9 @@ export async function uploadDocument(file, onProgress, onStatus, strategy = "aut
             try {
                 const errData = await response.json();
                 errorMsg = errData.detail || errorMsg;
-            } catch (e) {}
+            } catch {
+                // Keep the generic upload error when the backend response is not JSON.
+            }
             throw new Error(errorMsg);
         }
 
@@ -68,7 +70,10 @@ export async function uploadDocument(file, onProgress, onStatus, strategy = "aut
         }
         return finalData || { message: "Document processed successfully" };
     } catch (error) {
-        throw new Error(error.message || "Document upload failed. Make sure the backend server is running.");
+        throw new Error(
+            error.message || "Document upload failed. Make sure the backend server is running.",
+            { cause: error },
+        );
     }
 }
 

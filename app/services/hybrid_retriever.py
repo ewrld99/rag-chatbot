@@ -8,7 +8,9 @@ LangChain-compatible Document output.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import time
 from typing import Any
 from uuid import UUID
 
@@ -16,8 +18,15 @@ from langchain_core.documents import Document
 from sqlalchemy import tuple_
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.config import settings
+from app.core.logging import format_log_event
 from app.db.models import DocumentChunk
-from app.services.dense_retriever import DenseRetriever
+from app.db.session import SessionLocal
+from app.services.dense_retriever import (
+    DenseRetriever,
+    _set_embedding_failed,
+    dense_embedding_failed,
+)
 from app.services.rrf import ReciprocalRankFusion, RRFResult
 from app.services.sparse_retriever import SparseRetriever
 from app.services.settings_service import SettingsService
@@ -97,12 +106,22 @@ class HybridRetriever:
         """
         effective_size = pool_size if pool_size is not None else self.top_k
 
-        dense_r = DenseRetriever(self.db)
-        sparse_r = SparseRetriever(self.db)
         rrf = ReciprocalRankFusion()
 
-        dense_results = dense_r.retrieve(query, top_k=self.dense_top_k, filters=filters)
-        sparse_results = sparse_r.retrieve(query, top_k=self.sparse_top_k, filters=filters)
+        started_at = time.perf_counter()
+        if settings.HYBRID_PARALLEL_RETRIEVAL:
+            dense_results, sparse_results, dense_ms, sparse_ms = self._retrieve_parallel(
+                query,
+                filters,
+            )
+            retrieval_mode = "parallel"
+        else:
+            dense_results, sparse_results, dense_ms, sparse_ms = self._retrieve_sequential(
+                query,
+                filters,
+                self.db,
+            )
+            retrieval_mode = "sequential"
 
         logger.debug(
             "HybridRetriever: dense=%d sparse=%d query=%r",
@@ -111,11 +130,112 @@ class HybridRetriever:
             query[:80],
         )
 
+        # Parallel retrieval propagates the dense worker's failure flag back
+        # to this thread, so one check covers both sequential and parallel mode.
+        embedding_down = dense_embedding_failed()
+        if embedding_down:
+            logger.warning(
+                "HybridRetriever: running in SPARSE-ONLY degraded mode because "
+                "the embedding service is unavailable. Dense retrieval is disabled "
+                "for this request. query=%r",
+                query[:120],
+            )
+
+        fusion_started_at = time.perf_counter()
         fused = rrf.fuse(dense_results, sparse_results, k=self.rrf_k)
+        fusion_ms = round((time.perf_counter() - fusion_started_at) * 1000, 1)
         selected = fused[:effective_size]
+
+        # Stamp degraded flag so _assess_retrieval can widen its thresholds.
+        if embedding_down:
+            for result in selected:
+                result.metadata["dense_retrieval_degraded"] = True
+
+        logger.info(
+            format_log_event(
+                "Hybrid retrieval latency",
+                total_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                dense_ms=dense_ms,
+                sparse_ms=sparse_ms,
+                fusion_ms=fusion_ms,
+                dense_results=len(dense_results),
+                sparse_results=len(sparse_results),
+                fused=len(fused),
+                selected=len(selected),
+                include_neighbors=include_neighbors,
+                mode=retrieval_mode,
+                degraded=embedding_down,
+                query=query[:120],
+            )
+        )
         if not include_neighbors:
             return selected
         return self.expand_neighbor_chunks(selected)
+
+    def _retrieve_parallel(
+        self,
+        query: str,
+        filters: dict | None,
+    ) -> tuple[list[Any], list[Any], float, float]:
+        def dense_task() -> tuple[list[Any], float, bool]:
+            with SessionLocal() as db:
+                started_at = time.perf_counter()
+                results = DenseRetriever(db).retrieve(
+                    query,
+                    top_k=self.dense_top_k,
+                    filters=filters,
+                )
+                failed = dense_embedding_failed()
+                return results, round((time.perf_counter() - started_at) * 1000, 1), failed
+
+        def sparse_task() -> tuple[list[Any], float]:
+            with SessionLocal() as db:
+                started_at = time.perf_counter()
+                results = SparseRetriever(db).retrieve(
+                    query,
+                    top_k=self.sparse_top_k,
+                    filters=filters,
+                )
+                return results, round((time.perf_counter() - started_at) * 1000, 1)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-retrieval") as executor:
+                dense_future = executor.submit(dense_task)
+                sparse_future = executor.submit(sparse_task)
+                dense_results, dense_ms, dense_failed = dense_future.result()
+                sparse_results, sparse_ms = sparse_future.result()
+            # Propagate this request's result in both directions so a previous
+            # failure cannot poison a later request on the coordinator thread.
+            _set_embedding_failed(dense_failed)
+            return dense_results, sparse_results, dense_ms, sparse_ms
+        except Exception as exc:
+            logger.warning(
+                "HybridRetriever: parallel retrieval failed; retrying sequentially: %s",
+                exc,
+            )
+            return self._retrieve_sequential(query, filters, self.db)
+
+    def _retrieve_sequential(
+        self,
+        query: str,
+        filters: dict | None,
+        db: Session,
+    ) -> tuple[list[Any], list[Any], float, float]:
+        dense_started_at = time.perf_counter()
+        dense_results = DenseRetriever(db).retrieve(
+            query,
+            top_k=self.dense_top_k,
+            filters=filters,
+        )
+        dense_ms = round((time.perf_counter() - dense_started_at) * 1000, 1)
+        sparse_started_at = time.perf_counter()
+        sparse_results = SparseRetriever(db).retrieve(
+            query,
+            top_k=self.sparse_top_k,
+            filters=filters,
+        )
+        sparse_ms = round((time.perf_counter() - sparse_started_at) * 1000, 1)
+        return dense_results, sparse_results, dense_ms, sparse_ms
 
     def retrieve(
         self,
@@ -217,6 +337,9 @@ class HybridRetriever:
             )
             neighbors_by_parent.setdefault(parent.chunk_id, []).append(neighbor)
 
+        # Keep the reranker's central hits together at the front. Interleaving
+        # neighbors after each hit lets low-signal surrounding text consume the
+        # LLM's small document budget before later, stronger central hits.
         expanded: list[RRFResult] = []
         seen: set[str] = set()
         for result in results:
@@ -224,6 +347,7 @@ class HybridRetriever:
                 expanded.append(result)
                 seen.add(result.chunk_id)
 
+        for result in results:
             neighbors = sorted(
                 neighbors_by_parent.get(result.chunk_id, []),
                 key=lambda item: (abs(item.metadata.get("neighbor_offset", 0)), item.metadata.get("chunk_index", 0), item.chunk_id),

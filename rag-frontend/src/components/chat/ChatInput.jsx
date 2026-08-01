@@ -29,10 +29,6 @@ export default function ChatInput({
     onSend,
     disabled = false,
     placement = "bottom",
-    modelOptions = [],
-    modelPreference = "auto",
-    modelSelectionEnabled = true,
-    onModelChange,
 }) {
     const isNarrow = useMediaQuery("(max-width: 760px)");
     const [text, setText] = useState("");
@@ -79,26 +75,6 @@ export default function ChatInput({
                     disabled={disabled}
                     style={{ ...styles.textarea, ...(isNarrow ? styles.textareaNarrow : {}) }}
                 />
-                <select
-                    value={modelPreference}
-                    onChange={onModelChange}
-                    disabled={disabled || !modelSelectionEnabled}
-                    aria-label="Answer model"
-                    title="Choose an answer model. Automatic fallback remains enabled."
-                    style={{
-                        ...styles.modelSelect,
-                        ...(isNarrow ? styles.modelSelectNarrow : {}),
-                    }}
-                >
-                    <option value="auto">{isNarrow ? "Auto" : "Auto (recommended)"}</option>
-                    {modelOptions.map((option) => (
-                        <option key={option.id} value={option.id}>
-                            {isNarrow
-                                ? option.label.replace(" Instant", "").replace(" Versatile", "")
-                                : `${option.label}${option.is_default ? " (recommended)" : ""}`}
-                        </option>
-                    ))}
-                </select>
                 <button
                     type="button"
                     onClick={handleSend}
@@ -143,9 +119,11 @@ const styles = {
     },
     inputRow: {
         width: "min(780px, 100%)",
+        minHeight: "60px",
+        boxSizing: "border-box",
         margin: "0 auto",
         display: "flex",
-        alignItems: "flex-end",
+        alignItems: "center",
         gap: "12px",
         background: "var(--app-surface)",
         border: "1px solid var(--app-border)",
@@ -155,6 +133,7 @@ const styles = {
         transition: "border-color 0.2s, box-shadow 0.2s",
     },
     inputRowNarrow: {
+        minHeight: "54px",
         gap: "8px",
         padding: "8px 10px 8px 16px",
         borderRadius: "20px",
@@ -172,36 +151,19 @@ const styles = {
         resize: "none",
         fontSize: "15px",
         lineHeight: "1.55",
+        height: "32px",
+        minHeight: "32px",
+        maxHeight: "32px",
         color: "var(--app-text)",
-        maxHeight: "160px",
         overflowY: "auto",
-        padding: "6px 0",
+        padding: "4px 0",
         fontFamily: "inherit",
     },
     textareaNarrow: {
         fontSize: "14px",
-        maxHeight: "112px",
-    },
-    modelSelect: {
-        width: "178px",
-        minWidth: 0,
-        height: "38px",
-        padding: "0 28px 0 10px",
-        border: "1px solid var(--app-border)",
-        borderRadius: "8px",
-        background: "var(--app-surface-muted)",
-        color: "var(--app-text)",
-        fontSize: "12px",
-        fontWeight: "600",
-        fontFamily: "inherit",
-        outline: "none",
-        cursor: "pointer",
-        textOverflow: "ellipsis",
-        flexShrink: 0,
-    },
-    modelSelectNarrow: {
-        width: "132px",
-        fontSize: "11px",
+        height: "30px",
+        minHeight: "30px",
+        maxHeight: "30px",
     },
     sendBtn: {
         width: "38px",

@@ -6,10 +6,12 @@ from app.core.config import settings
 from app.services.model_catalog import (
     DEFAULT_ANSWER_MODEL_ORDER,
     DEFAULT_MODEL,
-    DEFAULT_UTILITY_MODEL_ORDER,
+    GROUNDING_VERIFICATION_MODEL_ORDER,
     MODEL_OPTIONS,
     SUPPORTED_MODEL_IDS,
+    UTILITY_MODEL_IDS,
     parse_model_csv,
+    parse_utility_model_csv,
 )
 
 
@@ -42,7 +44,7 @@ class ModelRouter:
             configured = list(self.settings_service.generation_allowed_models)
         else:
             configured = parse_model_csv(
-                settings.GROQ_ALLOWED_MODELS,
+                settings.GENERATION_ALLOWED_MODELS or settings.GROQ_ALLOWED_MODELS,
                 DEFAULT_ANSWER_MODEL_ORDER,
             )
 
@@ -58,7 +60,7 @@ class ModelRouter:
         if self.settings_service is not None:
             configured = self.settings_service.generation_default_model
         else:
-            configured = settings.GROQ_MODEL
+            configured = settings.GENERATION_MODEL or settings.GROQ_MODEL
         return configured if configured in self.allowed_models else self.allowed_models[0]
 
     def normalize_preference(self, preference: str | None) -> str:
@@ -74,18 +76,25 @@ class ModelRouter:
         return normalized
 
     def candidates(self, operation: str, preference: str | None = None) -> list[str]:
-        normalized = self.normalize_preference(preference)
-        allowed = self.allowed_models
-
         if self._is_answer_operation(operation):
+            normalized = self.normalize_preference(preference)
+            allowed = self.allowed_models
             configured = self._answer_order()
             ordered = [self.default_model, *configured, *allowed]
             if normalized != "auto":
                 ordered.insert(0, normalized)
-        else:
-            ordered = [*self._utility_order(), *allowed]
+            return self._deduplicate_allowed(ordered, allowed)
 
-        return self._deduplicate_allowed(ordered, allowed)
+        if operation == "grounding_verification":
+            ordered = [
+                *GROUNDING_VERIFICATION_MODEL_ORDER,
+                *self._utility_order(),
+            ]
+            return self._deduplicate_allowed(ordered, UTILITY_MODEL_IDS)
+
+        # Utility work has its own allowlist so small local helper models can be
+        # used without exposing them as user-selectable answer models.
+        return self._deduplicate_allowed(self._utility_order(), UTILITY_MODEL_IDS)
 
     def public_policy(self) -> dict[str, Any]:
         labels = {option["id"]: option for option in MODEL_OPTIONS}
@@ -106,18 +115,21 @@ class ModelRouter:
             configured = list(self.settings_service.generation_answer_model_order)
         else:
             configured = parse_model_csv(
-                settings.GROQ_ANSWER_MODEL_ORDER,
+                settings.GENERATION_ANSWER_MODEL_ORDER
+                or settings.GROQ_ANSWER_MODEL_ORDER,
                 DEFAULT_ANSWER_MODEL_ORDER,
             )
         return configured
 
     def _utility_order(self) -> list[str]:
         if self.settings_service is not None:
-            configured = list(self.settings_service.generation_utility_model_order)
+            configured = parse_utility_model_csv(
+                ",".join(self.settings_service.generation_utility_model_order)
+            )
         else:
-            configured = parse_model_csv(
-                settings.GROQ_UTILITY_MODEL_ORDER,
-                DEFAULT_UTILITY_MODEL_ORDER,
+            configured = parse_utility_model_csv(
+                settings.GENERATION_UTILITY_MODEL_ORDER
+                or settings.GROQ_UTILITY_MODEL_ORDER
             )
         return configured
 

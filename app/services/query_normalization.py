@@ -22,7 +22,9 @@ class QueryVariant:
     weight: float
 
 
-MAX_EXPANDED_TERMS = 30
+MAX_EXPANDED_TERMS = 12
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+SAFE_METADATA_TEXT_KEYS = ("source", "document_title", "source_url", "category")
 
 DOMAIN_TERMS = {
     "udom",
@@ -77,9 +79,42 @@ FALLBACK_ALIAS_EXPANSIONS: dict[str, list[str]] = {
         "grading system",
         "course weight",
         "total score",
+        "wastani wa alama",
+        "alama za gpa",
+        "alama za kozi",
+        "uzito wa kozi",
     ],
-    "cgpa": ["cgpa", "cumulative grade point average", "grade point average"],
-    "ca": ["continuous assessment"],
+    "cgpa": ["cgpa", "cumulative grade point average", "grade point average", "wastani wa jumla wa alama"],
+    "ca": ["continuous assessment", "coursework", "alama za kazi za darasani", "alama za coursework"],
+    "coursework": ["coursework", "continuous assessment", "ca", "alama za kazi za darasani"],
+    "examination": ["examination", "exam", "university examination", "mtihani", "mitihani"],
+    "postponement": [
+        "postponement",
+        "postpone",
+        "deferment",
+        "defer",
+        "intermission",
+        "kuahirisha",
+        "ahirisha",
+        "kuahirisha masomo",
+        "kusitisha masomo",
+    ],
+    "registration": ["registration", "register", "student registration", "usajili", "kujisajili"],
+    "appeal": ["appeal", "appeals", "rufaa", "kata rufaa"],
+    "fee": ["fee", "fees", "tuition", "ada", "malipo"],
+    "idit": [
+        "idit",
+        "idt",
+        "instructional design and information technology",
+        "bachelor of science in instructional design and information technology",
+        "bachelor of science in instructional design & information technology",
+        "dm074",
+    ],
+    "admission": ["admission", "admissions", "application", "udahili", "maombi"],
+    "graduation": ["graduation", "graduate", "mahafali", "kuhitimu"],
+    "transcript": ["transcript", "academic transcript", "nakala ya matokeo", "matokeo"],
+    "dress code": ["dress code", "dressing code", "attire", "mavazi", "kanuni za mavazi"],
+    "discipline": ["discipline", "conduct", "student conduct", "nidhamu", "maadili"],
     "sr": [
         "sr",
         "sr2",
@@ -89,6 +124,8 @@ FALLBACK_ALIAS_EXPANSIONS: dict[str, list[str]] = {
         "student registration",
         "student information system",
         "student portal",
+        "mfumo wa taarifa za wanafunzi",
+        "mfumo wa mwanafunzi",
     ],
     "sr2": [
         "sr2",
@@ -96,6 +133,7 @@ FALLBACK_ALIAS_EXPANSIONS: dict[str, list[str]] = {
         "student records",
         "student records system",
         "student portal",
+        "mfumo wa taarifa za wanafunzi",
     ],
     "tcu": ["tanzania commission for universities"],
     "nactvet": ["national council for technical and vocational education and training"],
@@ -109,7 +147,17 @@ def clean_query_text(query: str) -> str:
 
 
 def tokenize(query: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", query.lower())
+    return TOKEN_RE.findall(query.lower())
+
+
+def token_set(text: str) -> set[str]:
+    return set(tokenize(text))
+
+
+def metadata_search_text(metadata: Mapping[str, object] | None) -> str:
+    if not metadata:
+        return ""
+    return " ".join(str(metadata.get(key, "")) for key in SAFE_METADATA_TEXT_KEYS)
 
 
 def significant_tokens(query: str) -> list[str]:

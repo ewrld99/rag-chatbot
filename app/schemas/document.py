@@ -21,6 +21,7 @@ class DocumentUpdate(DocumentBase):
 
 class DocumentResponse(DocumentBase):
     id: str
+    source_url: Optional[str] = None
     uploaded_by: Optional[int] = None
     upload_date: datetime
     chunk_count: int = 0

@@ -94,6 +94,45 @@ def test_procedure_prompt_requires_supported_ordered_details():
     assert "Do not reduce a documented procedure to a generic summary" in prompt
 
 
+def test_document_system_prompt_has_unambiguous_json_contract():
+    service = object.__new__(GenerationService)
+
+    prompt = service.system_prompt()
+
+    assert "Always follow the JSON output contract" in prompt
+    assert "Return ONLY one valid JSON object" in prompt
+    assert "answer normally" not in prompt
+    assert "The claims array is the answer" in prompt
+    assert "do not add or repeat an answer field" in prompt
+    assert "application supplies the refusal phrase" in prompt
+
+
+def test_grounding_verifier_requires_answer_relevance_and_role_identity():
+    service = object.__new__(GenerationService)
+
+    prompt = service._verification_system_prompt()
+
+    assert "materially answers that question" in prompt
+    assert "true and supported yet still be irrelevant" in prompt
+    assert "Chancellor, Vice Chancellor, and Deputy Vice Chancellor" in prompt
+
+
+def test_personalization_filter_does_not_force_unsupported_profile_match():
+    service = object.__new__(GenerationService)
+
+    prompt = service.system_prompt(
+        {
+            "year_of_study": "2",
+            "programme": "BSc Computer Science",
+            "campus": "Main",
+        }
+    )
+
+    assert "use programme/year/campus filters only when the retrieved evidence clearly identifies them" in prompt
+    assert "retrieved evidence does not specify it" in prompt
+    assert "respond ONLY with info matching this context" not in prompt
+
+
 def test_structured_sources_are_deduplicated_and_keep_server_url():
     documents = [
         Document(

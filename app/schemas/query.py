@@ -7,7 +7,9 @@ Pydantic request / response models for the POST /query and GET /health endpoints
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.services.model_catalog import validate_model_preference
 
 
 # ---------------------------------------------------------------------------
@@ -16,14 +18,11 @@ from pydantic import BaseModel, Field
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, description="User question")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
-    model_preference: Literal[
-        "auto",
-        "llama-3.3-70b-versatile",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.6-27b",
-        "openai/gpt-oss-20b",
-        "llama-3.1-8b-instant",
-    ] = "auto"
+    model_preference: str = "auto"
+
+    _validate_model_preference = field_validator("model_preference")(
+        validate_model_preference
+    )
 
 
 class RetrievedChunk(BaseModel):

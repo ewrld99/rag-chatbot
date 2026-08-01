@@ -1,3 +1,5 @@
+import pytest
+
 from app.api.deps import get_rag_pipeline
 from app.main import app
 from app.services.generation_resilience import GenerationUnavailableError
@@ -8,6 +10,11 @@ SAFE_SOURCE = {
     "name": "regulations.pdf",
     "url": "/uploads/regulations.pdf",
 }
+
+
+@pytest.fixture(autouse=True)
+def configure_generation_keys(monkeypatch):
+    monkeypatch.setattr("app.services.generation_service.settings.GEMINI_API_KEY", "test-gemini-key")
 
 
 class FailingPipeline:
@@ -43,6 +50,16 @@ def test_chat_hides_generation_provider_error(client):
     assert "tokens per day" not in response.text.lower()
 
 
+def test_chat_debug_requires_admin(client):
+    response = client.post(
+        "/api/chat/?debug=true",
+        json={"message": "How is GPA calculated?"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Debug mode requires admin access"
+
+
 def test_chat_stream_hides_generation_provider_error_and_keeps_sources(client):
     app.dependency_overrides[get_rag_pipeline] = lambda: FailingPipeline()
 
@@ -68,11 +85,11 @@ def test_model_catalog_exposes_only_the_approved_models(client):
     body = response.json()
     assert body["default"] == "auto"
     assert [model["id"] for model in body["models"]] == [
+        "gemma3:4b",
+        "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "openai/gpt-oss-120b",
-        "qwen/qwen3.6-27b",
-        "openai/gpt-oss-20b",
         "llama-3.1-8b-instant",
+        "qwen3.5:4b",
     ]
 
 
@@ -82,6 +99,56 @@ def test_chat_rejects_a_model_outside_the_allowlist(client):
         json={
             "message": "How is GPA calculated?",
             "model_preference": "unapproved/model",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_chat_accepts_gemini_flash_model_preference(client):
+    app.dependency_overrides[get_rag_pipeline] = lambda: FailingPipeline()
+
+    response = client.post(
+        "/api/chat/",
+        json={
+            "message": "How is GPA calculated?",
+            "model_preference": "gemini-3.6-flash",
+        },
+    )
+
+    assert response.status_code == 503
+
+
+def test_chat_rejects_disabled_gpt_oss_120b_model(client):
+    response = client.post(
+        "/api/chat/",
+        json={
+            "message": "How is GPA calculated?",
+            "model_preference": "openai/gpt-oss-120b",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_chat_rejects_disabled_gpt_oss_20b_model(client):
+    response = client.post(
+        "/api/chat/",
+        json={
+            "message": "How is GPA calculated?",
+            "model_preference": "openai/gpt-oss-20b",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_chat_rejects_removed_qwen_model(client):
+    response = client.post(
+        "/api/chat/",
+        json={
+            "message": "How is GPA calculated?",
+            "model_preference": "qwen/qwen3.6-27b",
         },
     )
 

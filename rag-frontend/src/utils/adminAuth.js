@@ -1,34 +1,11 @@
-import { API_BASE } from "../api/chatApi";
+import { API_BASE, BACKEND_UNAVAILABLE_MESSAGE } from "../api/chatApi";
 
 const ADMIN_SESSION_KEY = "ragAdminSession";
-const ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 8;
-
-function base64UrlEncode(value) {
-    return window
-        .btoa(JSON.stringify(value))
-        .replaceAll("+", "-")
-        .replaceAll("/", "_")
-        .replaceAll("=", "");
-}
 
 function base64UrlDecode(value) {
     const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
     const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
     return JSON.parse(window.atob(padded));
-}
-
-function createJwtLikeToken(user) {
-    const now = Math.floor(Date.now() / 1000);
-    const header = base64UrlEncode({ alg: "HS256", typ: "JWT" });
-    const payload = base64UrlEncode({
-        sub: String(user.id),
-        username: user.username,
-        role: "admin",
-        iat: now,
-        exp: now + ADMIN_TOKEN_TTL_SECONDS,
-    });
-
-    return `${header}.${payload}.frontend-session`;
 }
 
 export function getAdminSession() {
@@ -46,11 +23,14 @@ export function getAdminToken() {
 }
 
 export function saveAdminSession(user) {
+    if (!user?.token) {
+        throw new Error("Admin login did not return a session token.");
+    }
     const session = {
         id: user.id,
         username: user.username,
         role: "admin",
-        token: createJwtLikeToken(user),
+        token: user.token,
     };
 
     window.localStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(session));
@@ -107,7 +87,7 @@ export async function loginAdmin(username, password) {
             body: JSON.stringify({ username, password }),
         });
     } catch {
-        throw new Error("Cannot reach the backend server. Make sure FastAPI is running on http://localhost:8000.");
+        throw new Error(BACKEND_UNAVAILABLE_MESSAGE);
     }
 
     const data = await res.json();

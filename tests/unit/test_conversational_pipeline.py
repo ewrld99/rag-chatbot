@@ -67,8 +67,9 @@ def test_static_swahili_greeting_streams_without_generation_or_retrieval():
 
     events = asyncio.run(collect_events())
 
-    assert events[0]["type"] == "stream"
-    assert events[0]["token"].startswith("Marahaba!")
-    assert events[1]["type"] == "model"
-    assert events[1]["selected_model"] is None
-    assert events[2] == {"type": "sources", "sources": []}
+    assert events[0]["type"] == "routing"
+    assert events[1]["type"] == "stream"
+    assert events[1]["token"].startswith("Marahaba!")
+    assert events[2]["type"] == "model"
+    assert events[2]["selected_model"] is None
+    assert events[3] == {"type": "sources", "sources": []}

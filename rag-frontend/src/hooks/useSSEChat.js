@@ -22,7 +22,7 @@
  */
 
 import { useRef, useCallback } from "react";
-import { API_BASE } from "../api/chatApi";
+import { API_BASE, BACKEND_UNAVAILABLE_MESSAGE, authHeaders } from "../api/chatApi";
 
 const STREAM_URL = `${API_BASE}/api/chat/stream`;
 
@@ -43,7 +43,7 @@ export function useSSEChat(onEvent) {
      * @param {number|null} sessionId  DB session id (null for guest)
      * @param {number|null} userId     DB user id    (null for guest)
      * @param {Array}   history    Recent chat history for context
-     * @param {string}  modelPreference  Approved answer model or "auto"
+     * @param {string|null} conversationToken Signed guest conversation state
      */
     const sendMessage = useCallback(
         async (
@@ -51,7 +51,7 @@ export function useSSEChat(onEvent) {
             sessionId = null,
             userId = null,
             history = [],
-            modelPreference = "auto",
+            conversationToken = null,
         ) => {
             // Cancel any previous stream before starting a new one
             abort();
@@ -62,19 +62,20 @@ export function useSSEChat(onEvent) {
             try {
                 response = await fetch(STREAM_URL, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json", ...authHeaders() },
                     body: JSON.stringify({
                         message,
                         session_id: sessionId ?? undefined,
                         user_id: userId ?? undefined,
                         history,
-                        model_preference: modelPreference,
+                        model_preference: "auto",
+                        conversation_token: conversationToken ?? undefined,
                     }),
                     signal: controller.signal,
                 });
             } catch (err) {
                 if (err.name === "AbortError") return;
-                onEvent({ type: "error", message: "Cannot reach the backend server." });
+                onEvent({ type: "error", message: BACKEND_UNAVAILABLE_MESSAGE });
                 return;
             }
 
@@ -96,7 +97,7 @@ export function useSSEChat(onEvent) {
                             retry_after: body.detail.retry_after,
                         };
                     }
-                } catch (_) { /* ignore */ }
+                } catch { /* ignore */ }
                 onEvent(errorEvent);
                 return;
             }
@@ -129,7 +130,7 @@ export function useSSEChat(onEvent) {
                         try {
                             const event = JSON.parse(raw);
                             onEvent(event);
-                        } catch (_) {
+                        } catch {
                             // Malformed JSON — skip
                         }
                     }

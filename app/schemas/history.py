@@ -25,6 +25,7 @@ class ChatMessageResponse(BaseModel):
     role: str
     content: str
     sources: List[Dict[str, Any]] = Field(default_factory=list)
+    turn_context: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
     class Config:

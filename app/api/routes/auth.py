@@ -4,38 +4,27 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.security import (
+    create_access_token,
     hash_password,
     is_password_hash,
     verify_legacy_plaintext_password,
     verify_password,
 )
-from app.core.config import settings
 from app.db.models import User
 from app.db.session import get_db
+from app.api.deps import get_current_user, get_user_role, normalize_username
 from app.schemas.auth import AuthRequest, RegisterRequest, UserResponse, ChangePasswordRequest
 
 router = APIRouter()
 
 
-def normalize_username(username: str) -> str:
-    return username.strip().lower()
-
-
-def get_user_role(username: str) -> str:
-    admin_usernames = {
-        normalize_username(admin_username)
-        for admin_username in settings.ADMIN_USERNAMES.split(",")
-        if admin_username.strip()
-    }
-
-    return "admin" if normalize_username(username) in admin_usernames else "user"
-
-
 def serialize_user(user: User) -> UserResponse:
+    role = get_user_role(user.username)
     return UserResponse(
         id=user.id,
         username=user.username,
-        role=get_user_role(user.username),
+        role=role,
+        token=create_access_token({"sub": str(user.id), "username": user.username, "role": role}),
         registration_number=user.registration_number,
         programme=user.programme,
         campus=user.campus,
@@ -48,6 +37,11 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     username = normalize_username(payload.username)
     if not username:
         raise HTTPException(status_code=400, detail="Username is required")
+    if get_user_role(username) == "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="This username is reserved. Ask an existing administrator to create the admin account.",
+        )
 
     user = User(
         username=username,
@@ -92,7 +86,14 @@ def login(payload: AuthRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/change-password", response_model=dict)
-def change_password(payload: ChangePasswordRequest, db: Session = Depends(get_db)):
+def change_password(
+    payload: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.id != payload.user_id:
+        raise HTTPException(status_code=403, detail="Cannot change another user's password")
+
     user = db.query(User).filter(User.id == payload.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

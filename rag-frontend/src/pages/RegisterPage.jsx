@@ -1,6 +1,6 @@
 import RegisterForm from "../components/admin/RegisterForm.jsx";
 import { registerUser } from "../api/chatApi.js";
-import { saveAdminSession } from "../utils/adminAuth.js";
+import { clearAdminSession, saveAdminSession } from "../utils/adminAuth.js";
 
 function navigate(to) {
     window.history.replaceState({}, "", to);
@@ -18,6 +18,7 @@ export default function RegisterPage() {
             return;
         }
 
+        clearAdminSession();
         window.localStorage.setItem("ragUser", JSON.stringify(user));
         navigate("/chat");
     };

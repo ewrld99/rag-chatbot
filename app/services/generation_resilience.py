@@ -86,6 +86,10 @@ class GenerationUnavailableError(RuntimeError):
         return payload
 
 
+class EmptyGenerationResponseError(RuntimeError):
+    """Provider/model produced a successful response envelope with no text."""
+
+
 class GenerationCircuitBreaker:
     """Process-local circuit breaker for one provider/model key."""
 
@@ -293,6 +297,13 @@ class GenerationResilience:
             }
 
         if isinstance(exc, (APIConnectionError, APITimeoutError, InternalServerError)):
+            if self._is_provider_over_capacity(message):
+                return {
+                    "retryable": False,
+                    "retry_after": retry_after or settings.GENERATION_CIRCUIT_COOLDOWN_SECONDS,
+                    "open_immediately": True,
+                    "count_failure": True,
+                }
             return {
                 "retryable": True,
                 "retry_after": retry_after,
@@ -301,6 +312,13 @@ class GenerationResilience:
             }
 
         if isinstance(exc, APIStatusError) and getattr(exc, "status_code", 0) >= 500:
+            if self._is_provider_over_capacity(message):
+                return {
+                    "retryable": False,
+                    "retry_after": retry_after or settings.GENERATION_CIRCUIT_COOLDOWN_SECONDS,
+                    "open_immediately": True,
+                    "count_failure": True,
+                }
             return {
                 "retryable": True,
                 "retry_after": retry_after,
@@ -316,6 +334,14 @@ class GenerationResilience:
                 "count_failure": False,
             }
 
+        if isinstance(exc, EmptyGenerationResponseError):
+            return {
+                "retryable": False,
+                "retry_after": settings.GENERATION_EMPTY_RESPONSE_COOLDOWN_SECONDS,
+                "open_immediately": True,
+                "count_failure": True,
+            }
+
         return {
             "retryable": False,
             "retry_after": retry_after,
@@ -329,6 +355,17 @@ class GenerationResilience:
         base = settings.GENERATION_RETRY_BASE_SECONDS * (2 ** attempt)
         jitter = random.uniform(0.0, max(0.0, settings.GENERATION_RETRY_JITTER_SECONDS))
         return min(base + jitter, settings.GENERATION_MAX_SHORT_RETRY_SECONDS)
+
+    @staticmethod
+    def _is_provider_over_capacity(message: str) -> bool:
+        return any(
+            marker in message
+            for marker in (
+                "currently over capacity",
+                "over capacity",
+                "back off exponentially",
+            )
+        )
 
     def _retry_after_seconds(self, exc: Exception) -> float | None:
         response = getattr(exc, "response", None)

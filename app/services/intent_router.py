@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 import re
@@ -11,6 +11,7 @@ from typing import Any, Literal
 from sqlalchemy.orm import Session
 
 from app.services.alias_expansion_service import AliasExpansionService
+from app.services.conversation_context import ConversationContextResolver, ConversationDecision
 from app.services.conversation_service import conversational_kind
 from app.services.query_normalization import clean_query_text, significant_tokens, tokenize
 
@@ -66,15 +67,16 @@ Rules:
 5. If a known UDOM alias/acronym match is provided, prefer
    UDOM_DOCUMENT_SEARCH unless the user is clearly asking for study advice.
 6. Use recent conversation to resolve references such as "it",
-   "that regulation", and "the second programme".
+   "that regulation", "what about IDIT students", and "the second programme".
 7. Choose CLARIFY only when missing information prevents correct routing.
-8. Return only valid JSON.
+8. When generating the standalone_query, explicitly correct any spelling mistakes or typos (e.g., fix "udmo" to "UDOM").
+9. Return only valid JSON. Keep reason under 12 words.
 
 Output:
 {
   "intent": "CONVERSATIONAL | STUDENT_SUPPORT | UDOM_DOCUMENT_SEARCH | CLARIFY | OUT_OF_SCOPE",
   "confidence": 0.0,
-  "reason": "Brief explanation",
+  "reason": "Brief reason under 12 words",
   "standalone_query": "Resolved standalone query or null"
 }"""
 
@@ -88,6 +90,7 @@ class IntentDecision:
     normalized_query: str
     source: str = "llm"
     filters: dict[str, Any] = field(default_factory=dict)
+    conversation: ConversationDecision | None = None
 
     @property
     def action(self) -> str:
@@ -100,7 +103,7 @@ class IntentDecision:
         }[self.intent]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "intent": self.intent,
             "action": self.action,
             "confidence": round(self.confidence, 4),
@@ -110,6 +113,9 @@ class IntentDecision:
             "source": self.source,
             "filters": self.filters,
         }
+        if self.conversation is not None:
+            payload["conversation"] = self.conversation.to_dict()
+        return payload
 
 
 RoutingDecision = IntentDecision
@@ -117,6 +123,20 @@ RoutingDecision = IntentDecision
 
 class IntentRouter:
     """Conversational fast path plus LLM classification and guardrails."""
+
+    _ELLIPTICAL_FOLLOW_UP_RE = re.compile(
+        r"^\s*(?:"
+        r"(?:and\s+)?(?:what|who|when|where|which)\s+(?:exactly|then|next)|"
+        r"(?:what|who)\s+(?:is|are)\s+(?:the\s+|his\s+|her\s+|their\s+)?(?:name|date|number|title)|"
+        r"(?:please\s+)?(?:give|tell|show|state|provide|mention)\s+"
+        r"(?:me\s+)?(?:the\s+)?(?:name|names|date|dates|number|numbers|"
+        r"title|titles|details?|answer|source|sources)(?:\s+(?:only|instead|exactly))?|"
+        r"(?:more|further)\s+(?:details?|information)|"
+        r"(?:explain|elaborate)(?:\s+(?:more|further|on\s+that))?|"
+        r"(?:nipe\s+jina|jina\s+lake|eleza\s+zaidi|endelea)"
+        r")\s*[?.!]*\s*$",
+        re.IGNORECASE,
+    )
 
     UDOM_TERMS = {
         "udom", "dodoma", "university of dodoma", "admission", "admissions",
@@ -128,7 +148,13 @@ class IntentRouter:
         "supplementary", "discontinuation", "undergraduate", "postgraduate",
         "certificate", "diploma", "degree", "student records", "student record",
         "student records system", "student portal", "sr", "sr2", "oas", "tcu",
-        "nactvet",
+        "nactvet", "dress", "dressing", "dress code", "dressing code", "attire",
+        "uniform", "conduct", "discipline", "student conduct", "code of conduct",
+        "postpone", "postponement", "defer", "deferment", "intermission",
+        "year of study", "masomo", "mwaka wa masomo", "kozi", "ada",
+        "usajili", "udahili", "mtihani", "mitihani", "alama", "matokeo",
+        "kuahirisha", "ahirisha", "kusitisha masomo", "rufaa", "mahafali",
+        "mavazi", "kanuni za mavazi", "nidhamu", "maadili",
     }
     OFFICIAL_DOCUMENT_TERMS = {
         "admission", "admissions", "programme", "programmes", "program",
@@ -144,7 +170,14 @@ class IntentRouter:
         "transcript", "graduation", "supplementary", "discontinuation",
         "undergraduate", "postgraduate", "certificate", "diploma", "degree",
         "student records", "student record", "student portal", "sr", "sr2",
-        "oas", "tcu", "nactvet",
+        "oas", "tcu", "nactvet", "dress", "dressing", "dress code",
+        "dressing code", "attire", "uniform", "conduct", "discipline",
+        "student conduct", "code of conduct", "postpone", "postponement",
+        "defer", "deferment", "intermission", "year of study",
+        "masomo", "mwaka wa masomo", "kozi", "ada", "usajili", "udahili",
+        "mtihani", "mitihani", "alama", "matokeo", "kuahirisha", "ahirisha",
+        "kusitisha masomo", "rufaa", "mahafali", "mavazi",
+        "kanuni za mavazi", "nidhamu", "maadili",
     }
 
     STUDENT_SUPPORT_TERMS = {
@@ -162,6 +195,7 @@ class IntentRouter:
     def __init__(self, db: Session, generator: Any | None = None) -> None:
         self.db = db
         self.generator = generator
+        self.context_resolver = ConversationContextResolver(generator)
 
     def classify(
         self,
@@ -170,22 +204,84 @@ class IntentRouter:
         user_profile: dict[str, Any] | None = None,
     ) -> IntentDecision:
         normalized_query = self._lightweight_normalize(query)
+        conversation = self.context_resolver.resolve(query, chat_history)
 
         if not clean_query_text(query):
-            return self._decision("CLARIFY", 1.0, "The query is empty.", None, normalized_query, "validation")
+            return self._attach_conversation(
+                self._decision("CLARIFY", 1.0, "The query is empty.", None, normalized_query, "validation"),
+                conversation,
+            )
+
+        if conversation.relation == "ambiguous":
+            source = (
+                "rule:unresolved_follow_up"
+                if conversation.source == "rule" and conversation.referenced_message_id is None
+                else f"conversation:{conversation.source}"
+            )
+            return self._attach_conversation(
+                self._decision(
+                    "CLARIFY",
+                    max(0.8, conversation.confidence),
+                    conversation.reason,
+                    None,
+                    normalized_query,
+                    source,
+                ),
+                conversation,
+            )
 
         social_turn = conversational_kind(query)
         if social_turn is not None:
-            return self._decision(
-                "CONVERSATIONAL",
-                1.0,
-                f"Exact {social_turn} phrase matched the conversational fast path.",
-                clean_query_text(query),
-                normalized_query,
-                "rule:conversational",
+            return self._attach_conversation(
+                self._decision(
+                    "CONVERSATIONAL",
+                    1.0,
+                    f"Exact {social_turn} phrase matched the conversational fast path.",
+                    clean_query_text(query),
+                    normalized_query,
+                    "rule:conversational",
+                ),
+                conversation,
             )
 
+        follow_up_decision = self._conversation_follow_up_decision(
+            conversation, normalized_query, chat_history, user_profile
+        )
+        if follow_up_decision is not None:
+            return self._attach_conversation(follow_up_decision, conversation)
+
+        if conversation.source == "model" and conversation.intent in {
+            "CONVERSATIONAL",
+            "STUDENT_SUPPORT",
+            "UDOM_DOCUMENT_SEARCH",
+            "CLARIFY",
+            "OUT_OF_SCOPE",
+        }:
+            model_decision = self._decision(
+                conversation.intent,  # type: ignore[arg-type]
+                conversation.confidence,
+                conversation.reason,
+                conversation.standalone_query,
+                normalized_query,
+                "conversation:model",
+                (
+                    self._profile_filters(user_profile)
+                    if conversation.intent == "UDOM_DOCUMENT_SEARCH"
+                    else {}
+                ),
+            )
+            return self._attach_conversation(model_decision, conversation)
+
         aliases = self._matched_aliases(query)
+        rule_decision = self._rule_document_search_decision(
+            query,
+            normalized_query,
+            aliases,
+            chat_history,
+            user_profile,
+        )
+        if rule_decision is not None:
+            return self._attach_conversation(rule_decision, conversation)
 
         try:
             payload = self._classify_with_llm(query, normalized_query, aliases, chat_history)
@@ -194,7 +290,147 @@ class IntentRouter:
             logger.warning("Intent classifier failed; using fallback routing: %s", exc)
             decision = self._fallback_decision(query, normalized_query, aliases, chat_history, user_profile)
 
-        return self._apply_guardrails(decision, query, aliases, chat_history, user_profile)
+        decision = self._apply_guardrails(decision, query, aliases, chat_history, user_profile)
+        return self._attach_conversation(decision, conversation)
+
+    def _conversation_follow_up_decision(
+        self,
+        conversation: ConversationDecision,
+        normalized_query: str,
+        chat_history: list[dict[str, Any]] | None,
+        user_profile: dict[str, Any] | None,
+    ) -> IntentDecision | None:
+        if conversation.is_follow_up is not True or not conversation.standalone_query:
+            return None
+
+        intent = conversation.intent
+        if intent is None and self._history_has_document_signal(chat_history):
+            intent = "UDOM_DOCUMENT_SEARCH"
+
+        if intent == "UDOM_DOCUMENT_SEARCH":
+            return self._decision(
+                "UDOM_DOCUMENT_SEARCH",
+                max(0.80, conversation.confidence),
+                "Follow-up resolved from structured document-search context.",
+                conversation.standalone_query,
+                normalized_query,
+                "rule:document_follow_up" if conversation.source == "rule" else "conversation:model",
+                self._profile_filters(user_profile),
+            )
+        if intent == "STUDENT_SUPPORT":
+            return self._decision(
+                "STUDENT_SUPPORT",
+                max(0.80, conversation.confidence),
+                "Follow-up resolved from structured student-support context.",
+                conversation.standalone_query,
+                normalized_query,
+                "rule:student_support_follow_up" if conversation.source == "rule" else "conversation:model",
+            )
+        if intent == "CONVERSATIONAL":
+            return self._decision(
+                "CONVERSATIONAL",
+                max(0.80, conversation.confidence),
+                "Follow-up resolved from structured conversational context.",
+                conversation.standalone_query,
+                normalized_query,
+                "rule:conversational_follow_up",
+            )
+        if intent == "OUT_OF_SCOPE":
+            return self._decision(
+                "OUT_OF_SCOPE",
+                max(0.80, conversation.confidence),
+                "Follow-up remains outside the supported scope.",
+                conversation.standalone_query,
+                normalized_query,
+                "rule:out_of_scope_follow_up",
+            )
+        return None
+
+    @staticmethod
+    def _attach_conversation(
+        decision: IntentDecision,
+        conversation: ConversationDecision,
+    ) -> IntentDecision:
+        resolved_conversation = conversation.with_routing(
+            decision.intent,
+            decision.standalone_query,
+        )
+        logger.info(
+            "Conversation routing finalized | version=%s relation=%s is_follow_up=%s "
+            "confidence=%.3f topic_id=%s referenced_message_id=%s resolver_source=%s "
+            "intent=%s standalone_query=%s",
+            resolved_conversation.version,
+            resolved_conversation.relation,
+            resolved_conversation.is_follow_up,
+            resolved_conversation.confidence,
+            resolved_conversation.topic_id,
+            resolved_conversation.referenced_message_id,
+            resolved_conversation.source,
+            decision.intent,
+            resolved_conversation.standalone_query,
+        )
+        return replace(
+            decision,
+            conversation=resolved_conversation,
+        )
+
+    def _elliptical_follow_up_decision(
+        self,
+        query: str,
+        normalized_query: str,
+        chat_history: list[dict[str, str]] | None,
+        user_profile: dict[str, Any] | None,
+    ) -> IntentDecision | None:
+        if not self._is_elliptical_follow_up(query):
+            return None
+
+        previous_query = self._last_substantive_user_query(chat_history)
+        if previous_query and self._history_has_document_signal(chat_history):
+            return self._decision(
+                "UDOM_DOCUMENT_SEARCH",
+                0.95,
+                "Elliptical follow-up resolved from document-search history.",
+                self._resolve_follow_up_query(previous_query, query),
+                normalized_query,
+                "rule:document_follow_up",
+                self._profile_filters(user_profile),
+            )
+
+        return self._decision(
+            "CLARIFY",
+            0.9,
+            "The short follow-up has no prior topic to resolve.",
+            None,
+            normalized_query,
+            "rule:unresolved_follow_up",
+        )
+
+    @classmethod
+    def _is_elliptical_follow_up(cls, query: str) -> bool:
+        return bool(cls._ELLIPTICAL_FOLLOW_UP_RE.match(clean_query_text(query)))
+
+    @classmethod
+    def _last_substantive_user_query(
+        cls,
+        chat_history: list[dict[str, str]] | None,
+    ) -> str | None:
+        for item in reversed(chat_history or []):
+            if item.get("role") != "user":
+                continue
+            content = clean_query_text(str(item.get("content", "")))
+            if content and not cls._is_elliptical_follow_up(content):
+                return content
+        return None
+
+    @staticmethod
+    def _resolve_follow_up_query(previous_query: str, follow_up: str) -> str:
+        cleaned_previous = previous_query.rstrip(" ?.!")
+        lowered_follow_up = clean_query_text(follow_up).lower()
+        if re.search(r"\b(?:name|names|jina)\b", lowered_follow_up):
+            return f"{cleaned_previous}; provide the person's full name"
+        if re.search(r"\b(?:date|dates|when)\b", lowered_follow_up):
+            return f"{cleaned_previous}; provide the exact date"
+        return f"{cleaned_previous}; follow-up request: {clean_query_text(follow_up)}"
 
     def route(
         self,
@@ -203,6 +439,29 @@ class IntentRouter:
         user_profile: dict[str, Any] | None = None,
     ) -> IntentDecision:
         return self.classify(query, chat_history=chat_history, user_profile=user_profile)
+
+    def _rule_document_search_decision(
+        self,
+        query: str,
+        normalized_query: str,
+        aliases: dict[str, list[str]],
+        chat_history: list[dict[str, str]] | None,
+        user_profile: dict[str, Any] | None,
+    ) -> IntentDecision | None:
+        terms = self._expanded_terms(query, aliases)
+        if self._has_reference_without_anchor(terms, bool(chat_history)):
+            return None
+        if not self._requires_document_search(terms, aliases):
+            return None
+        return self._decision(
+            "UDOM_DOCUMENT_SEARCH",
+            0.9,
+            "Official UDOM terms matched rule-based document routing.",
+            clean_query_text(query),
+            normalized_query,
+            "rule:document_search",
+            self._profile_filters(user_profile),
+        )
 
     def _classify_with_llm(
         self,
@@ -214,7 +473,7 @@ class IntentRouter:
         if self.generator is None:
             raise RuntimeError("No generation service available for LLM classification")
 
-        response = self.generator.create_completion(
+        response = self.generator._create_utility_completion(
             "intent_classifier",
             model=self.generator.model,
             messages=[
@@ -222,7 +481,8 @@ class IntentRouter:
                 {"role": "user", "content": self._classifier_input(query, normalized_query, aliases, chat_history)},
             ],
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=320,
+            response_format={"type": "json_object"},
         )
         return self._parse_json(response.choices[0].message.content.strip())
 
@@ -245,7 +505,7 @@ class IntentRouter:
             "Classify the latest user query and return only the JSON object."
         )
 
-    def _history_text(self, chat_history: list[dict[str, str]] | None, limit: int = 6) -> str:
+    def _history_text(self, chat_history: list[dict[str, str]] | None, limit: int = 12) -> str:
         rows: list[str] = []
         for item in (chat_history or [])[-limit:]:
             role = item.get("role")
@@ -308,6 +568,22 @@ class IntentRouter:
     ) -> IntentDecision:
         terms = self._expanded_terms(query, aliases)
         has_history = bool(chat_history)
+
+        if (
+            has_history
+            and terms & self.REFERENCE_TERMS
+            and decision.intent != "UDOM_DOCUMENT_SEARCH"
+            and self._history_has_document_signal(chat_history)
+        ):
+            return self._decision(
+                "UDOM_DOCUMENT_SEARCH",
+                max(decision.confidence, 0.76),
+                "Follow-up reference resolved from recent document-search context.",
+                decision.standalone_query or clean_query_text(query),
+                decision.normalized_query,
+                f"{decision.source}+guardrail",
+                self._profile_filters(user_profile),
+            )
 
         if self._has_reference_without_anchor(terms, has_history) and decision.intent != "CLARIFY":
             return self._decision(
@@ -409,6 +685,21 @@ class IntentRouter:
         non_reference_terms = terms - self.REFERENCE_TERMS
         return len(non_reference_terms) <= 3 and not bool(non_reference_terms & self.UDOM_TERMS)
 
+    def _history_has_document_signal(self, chat_history: list[dict[str, Any]] | None) -> bool:
+        if any(
+            isinstance(item.get("turn_context"), dict)
+            and item["turn_context"].get("intent") == "UDOM_DOCUMENT_SEARCH"
+            for item in (chat_history or [])[-12:]
+        ):
+            return True
+        history_text = " ".join(
+            clean_query_text(str(item.get("content", "")))
+            for item in (chat_history or [])[-12:]
+            if item.get("role") in {"user", "assistant"}
+        )
+        terms = set(tokenize(history_text)) | set(significant_tokens(history_text))
+        return bool(terms & (self.UDOM_TERMS | self.OFFICIAL_DOCUMENT_TERMS))
+
     def _profile_filters(self, user_profile: dict[str, Any] | None) -> dict[str, Any]:
         if not user_profile:
             return {}
@@ -447,8 +738,37 @@ class IntentRouter:
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
             if match:
-                return json.loads(match.group(0))
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+            recovered = self._recover_truncated_json(raw)
+            if recovered is not None:
+                logger.warning(
+                    "Recovered truncated classifier JSON prefix: %s",
+                    raw[:120],
+                )
+                return recovered
         raise ValueError(f"Classifier did not return valid JSON: {raw[:120]}")
+
+    def _recover_truncated_json(self, raw: str) -> dict[str, Any] | None:
+        intent_match = re.search(
+            r'"intent"\s*:\s*"(?P<intent>CONVERSATIONAL|STUDENT_SUPPORT|UDOM_DOCUMENT_SEARCH|CLARIFY|OUT_OF_SCOPE)"',
+            raw,
+        )
+        if not intent_match:
+            return None
+
+        confidence_match = re.search(r'"confidence"\s*:\s*(?P<confidence>0(?:\.\d+)?|1(?:\.0+)?)', raw)
+        reason_match = re.search(r'"reason"\s*:\s*"(?P<reason>[^"]*)', raw)
+        standalone_match = re.search(r'"standalone_query"\s*:\s*"(?P<query>[^"]*)', raw)
+
+        return {
+            "intent": intent_match.group("intent"),
+            "confidence": float(confidence_match.group("confidence")) if confidence_match else 0.55,
+            "reason": clean_query_text(reason_match.group("reason")) if reason_match else "Recovered truncated classifier output.",
+            "standalone_query": clean_query_text(standalone_match.group("query")) if standalone_match else None,
+        }
 
     def _normalize_intent(self, value: Any) -> SupportedIntent:
         cleaned = re.sub(r"[^A-Z_]", "", str(value or "").upper())

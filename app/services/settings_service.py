@@ -8,6 +8,7 @@ from app.services.model_catalog import (
     DEFAULT_MODEL,
     DEFAULT_UTILITY_MODEL_ORDER,
     SUPPORTED_MODEL_IDS,
+    UTILITY_MODEL_IDS,
 )
 
 # Keys that require all documents to be reindexed when changed
@@ -21,11 +22,12 @@ DEFAULT_SETTINGS = [
     {"key": "top_k_final", "value": "5", "description": "Final number of chunks passed to the LLM", "category": "retrieval"},
     {"key": "rrf_k", "value": "60", "description": "RRF smoothing constant ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â higher values reduce top-rank influence", "category": "retrieval"},
     {"key": "enable_reranker", "value": "true", "description": "Enable reranking after fusion; uses Jina when configured and local lexical fallback otherwise", "category": "retrieval"},
+    {"key": "adaptive_rerank_skip_high_confidence", "value": "true", "description": "Skip neural reranking when dense and sparse retrieval already strongly agree", "category": "retrieval"},
     {"key": "embedding_model", "value": env_settings.EMBEDDING_MODEL, "description": "Model used to generate embeddings", "category": "embeddings"},
     {"key": "generation_default_model", "value": DEFAULT_MODEL, "description": "Primary model used when users select Auto", "category": "generation"},
     {"key": "generation_allowed_models", "value": ",".join(SUPPORTED_MODEL_IDS), "description": "Models users and automatic failover may use", "category": "generation"},
     {"key": "generation_answer_model_order", "value": ",".join(DEFAULT_ANSWER_MODEL_ORDER), "description": "Fallback priority for user-facing answers", "category": "generation"},
-    {"key": "generation_utility_model_order", "value": ",".join(DEFAULT_UTILITY_MODEL_ORDER), "description": "Fallback priority for intent classification and query rewriting", "category": "generation"},
+    {"key": "generation_utility_model_order", "value": ",".join(DEFAULT_UTILITY_MODEL_ORDER), "description": "Fallback priority for intent classification, query rewriting, clarification checks, and grounding verification", "category": "generation"},
     {"key": "generation_user_selection_enabled", "value": "true", "description": "Allow users to select an enabled answer model", "category": "generation"},
     {"key": "similarity_metric", "value": "cosine", "description": "Vector similarity metric", "category": "retrieval"},
     {"key": "max_upload_size_mb", "value": "20", "description": "Maximum allowed upload size in megabytes", "category": "upload"},
@@ -35,8 +37,48 @@ DEFAULT_SETTINGS = [
     {"key": "crawler_max_age_days", "value": "90", "description": "Maximum age of announcements in days (0 to disable)", "category": "crawler"},
 ]
 
+
+_LEGACY_GENERATION_VALUES = {
+    "generation_allowed_models": {
+        "qwen3.5:4b,gemma3:4b,gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "gemma3:4b,gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "openai/gpt-oss-120b,qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile,openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile,qwen/qwen3.6-27b,llama-3.1-8b-instant",
+    },
+    "generation_answer_model_order": {
+        "qwen3.5:4b,gemma3:4b,gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "gemma3:4b,qwen3.5:4b,gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "gemma3:4b,gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "openai/gpt-oss-120b,qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile,openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile,qwen/qwen3.6-27b,llama-3.1-8b-instant",
+    },
+    "generation_utility_model_order": {
+        "qwen2.5:1.5b,qwen3.5:4b,gemma3:4b,llama-3.1-8b-instant,llama-3.3-70b-versatile",
+        "qwen2.5:1.5b,gemma3:4b,llama-3.1-8b-instant,llama-3.3-70b-versatile",
+        "gemma3:4b,llama-3.1-8b-instant,llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant,llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant,qwen/qwen3.6-27b",
+        "openai/gpt-oss-20b,llama-3.1-8b-instant,qwen/qwen3.6-27b,openai/gpt-oss-120b",
+        "llama-3.1-8b-instant,llama-3.3-70b-versatile,qwen/qwen3.6-27b",
+        "gemini-3.6-flash,llama-3.1-8b-instant,llama-3.3-70b-versatile",
+        "gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
+    },
+    "generation_default_model": {
+        "qwen3.5:4b",
+        "gemma3:4b",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.6-27b",
+        "llama-3.3-70b-versatile",
+    },
+}
+
+
 def seed_default_settings(db: Session):
-    """Seed default system settings into the DB if they don't exist."""
+    """Seed defaults and safely upgrade known stale generation settings."""
     for setting_data in DEFAULT_SETTINGS:
         existing = db.query(SystemSetting).filter_by(key=setting_data["key"]).first()
         if existing is None:
@@ -47,7 +89,89 @@ def seed_default_settings(db: Session):
                 category=setting_data["category"]
             )
             db.add(setting)
+            continue
+
+        if setting_data["key"] == "generation_utility_model_order":
+            existing.description = setting_data["description"]
+        if (
+            setting_data["key"] == "embedding_model"
+            and env_settings.EMBEDDING_PROVIDER.lower() == "ollama"
+            and str(existing.value).strip().startswith("jina-")
+        ):
+            existing.value = setting_data["value"]
+            continue
+        if (
+            setting_data["key"] == "generation_default_model"
+            and str(existing.value).strip() == "gemini-3.6-flash"
+            and _has_legacy_hosted_answer_defaults(db)
+        ):
+            existing.value = setting_data["value"]
+            continue
+
+        if (
+            setting_data["key"] in _LEGACY_GENERATION_VALUES
+            and str(existing.value).strip()
+            in _LEGACY_GENERATION_VALUES[setting_data["key"]]
+        ):
+            existing.value = setting_data["value"]
+        elif setting_data["key"] in {
+            "generation_allowed_models",
+            "generation_answer_model_order",
+        }:
+            normalized = _default_first_model_csv(str(existing.value), setting_data["value"])
+            if normalized != str(existing.value).strip():
+                existing.value = normalized
+        elif setting_data["key"] == "generation_utility_model_order":
+            normalized = _utility_model_csv(str(existing.value), setting_data["value"])
+            if normalized != str(existing.value).strip():
+                existing.value = normalized
+        elif setting_data["key"] == "generation_default_model" and str(existing.value).strip() not in SUPPORTED_MODEL_IDS:
+            # Only reset if the stored value is an unsupported model ID.
+            # Valid values (even non-default ones chosen by admin) are preserved.
+            existing.value = setting_data["value"]
     db.commit()
+
+
+def _default_first_model_csv(value: str, fallback: str) -> str:
+    models = [
+        model.strip()
+        for model in value.split(",")
+        if model.strip() in SUPPORTED_MODEL_IDS
+    ]
+    if not models:
+        models = [model.strip() for model in fallback.split(",") if model.strip()]
+    if DEFAULT_MODEL in models:
+        models = [DEFAULT_MODEL, *[model for model in models if model != DEFAULT_MODEL]]
+    else:
+        models.insert(0, DEFAULT_MODEL)
+    return ",".join(dict.fromkeys(models))
+
+
+def _has_legacy_hosted_answer_defaults(db: Session) -> bool:
+    allowed = db.query(SystemSetting).filter_by(key="generation_allowed_models").first()
+    answer_order = db.query(SystemSetting).filter_by(key="generation_answer_model_order").first()
+    legacy_values = _LEGACY_GENERATION_VALUES["generation_allowed_models"]
+    return bool(
+        allowed
+        and answer_order
+        and str(allowed.value).strip() in legacy_values
+        and str(answer_order.value).strip() in legacy_values
+    )
+
+
+def _utility_model_csv(value: str, fallback: str) -> str:
+    models = [
+        model.strip()
+        for model in value.split(",")
+        if model.strip() in UTILITY_MODEL_IDS
+    ]
+    if not models:
+        models = [
+            model.strip()
+            for model in fallback.split(",")
+            if model.strip() in UTILITY_MODEL_IDS
+        ]
+    return ",".join(dict.fromkeys(models))
 
 
 
@@ -155,6 +279,13 @@ class SettingsService:
     def enable_reranker(self) -> bool:
         return self._bool("enable_reranker", True)
 
+    @property
+    def adaptive_rerank_skip_high_confidence(self) -> bool:
+        return self._bool(
+            "adaptive_rerank_skip_high_confidence",
+            env_settings.ADAPTIVE_RERANK_SKIP_HIGH_CONFIDENCE,
+        )
+
     # ------------------------------------------------------------------
     # Typed properties ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ Embeddings
     # ------------------------------------------------------------------
@@ -169,7 +300,10 @@ class SettingsService:
 
     @property
     def generation_default_model(self) -> str:
-        return self._str("generation_default_model", env_settings.GROQ_MODEL)
+        return self._str(
+            "generation_default_model",
+            env_settings.GENERATION_MODEL or env_settings.GROQ_MODEL,
+        )
 
     @property
     def generation_allowed_models(self) -> List[str]:
@@ -304,14 +438,25 @@ class SettingsService:
                 models = [model.strip() for model in value.split(",") if model.strip()]
                 if not models:
                     raise ValueError(f"{key} must contain at least one model")
-                unsupported = [
-                    model for model in models
-                    if model not in SUPPORTED_MODEL_IDS
-                ]
-                if unsupported:
-                    raise ValueError(
-                        f"{key} contains unsupported models: {', '.join(unsupported)}"
-                    )
+                if key == "generation_utility_model_order":
+                    unsupported = [
+                        model for model in models
+                        if model not in UTILITY_MODEL_IDS
+                    ]
+                    if unsupported:
+                        raise ValueError(
+                            "generation_utility_model_order may contain only "
+                            f"utility-capable models: {', '.join(DEFAULT_UTILITY_MODEL_ORDER)}"
+                        )
+                else:
+                    unsupported = [
+                        model for model in models
+                        if model not in SUPPORTED_MODEL_IDS
+                    ]
+                    if unsupported:
+                        raise ValueError(
+                            f"{key} contains unsupported models: {', '.join(unsupported)}"
+                        )
                 models = list(dict.fromkeys(models))
                 if (
                     key == "generation_allowed_models"
@@ -321,7 +466,7 @@ class SettingsService:
                         "generation_allowed_models must include the default model"
                     )
                 if (
-                    key != "generation_allowed_models"
+                    key == "generation_answer_model_order"
                     and any(
                         model not in self.generation_allowed_models
                         for model in models
