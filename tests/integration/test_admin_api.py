@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from sqlalchemy import text as sql_text
+
 from app.core.config import settings
 from app.core.security import hash_password
-from app.db.models import DocumentModel, RetrievalAlias, SystemSetting, User
+from app.db.models import DocumentChunk, DocumentModel, RetrievalAlias, SystemSetting, User
+from app.services.sparse_retriever import SparseRetriever
 
 
 def create_admin_headers(client, db_session, monkeypatch, username="testadmin"):
@@ -262,3 +265,129 @@ def test_upload_almanac_strategy_streams_success(client, db_session, monkeypatch
     assert response.status_code == 200
     assert '"progress": 100' in response.text
     assert '"chunks_stored": 1' in response.text
+
+
+def test_quality_audit_marks_newer_exact_duplicate_for_review(
+    client,
+    db_session,
+    monkeypatch,
+):
+    headers = create_admin_headers(client, db_session, monkeypatch)
+    marker = f"qualityduplicate{uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    original = DocumentModel(
+        title=f"{marker}-original",
+        filename=f"{marker}-original.txt",
+        category="txt",
+        upload_date=now - timedelta(minutes=1),
+        status="active",
+    )
+    duplicate = DocumentModel(
+        title=f"{marker}-duplicate",
+        filename=f"{marker}-duplicate.txt",
+        category="txt",
+        upload_date=now,
+        status="active",
+    )
+    db_session.add_all([original, duplicate])
+    db_session.flush()
+    chunk_text = f"{marker} official registration rules and deadlines for students."
+    db_session.add_all(
+        [
+            DocumentChunk(
+                document_id=document.id,
+                chunk_index=0,
+                chunk_text=chunk_text,
+                embedding=[0.1] * settings.EMBEDDING_DIMENSION,
+                metadata_={},
+            )
+            for document in (original, duplicate)
+        ]
+    )
+    db_session.commit()
+    db_session.execute(
+        sql_text(
+            "UPDATE document_chunks SET tsv = to_tsvector('simple', chunk_text) "
+            "WHERE document_id IN (:original_id, :duplicate_id)"
+        ),
+        {"original_id": original.id, "duplicate_id": duplicate.id},
+    )
+    db_session.commit()
+
+    response = client.post(
+        "/api/admin/documents/quality-audit",
+        headers=headers,
+        json={"document_ids": [str(original.id), str(duplicate.id)]},
+    )
+
+    assert response.status_code == 200
+    results = {item["document_id"]: item for item in response.json()["documents"]}
+    assert results[str(original.id)]["quality_status"] in {"passed", "warning"}
+    assert results[str(duplicate.id)]["quality_status"] == "review"
+    assert results[str(duplicate.id)]["duplicate_of_document_id"] == str(original.id)
+
+    retrieval = SparseRetriever(db_session).retrieve(marker, top_k=10)
+    retrieved_document_ids = {item.document_id for item in retrieval}
+    assert str(original.id) in retrieved_document_ids
+    assert str(duplicate.id) not in retrieved_document_ids
+
+
+def test_admin_can_view_and_approve_reviewed_document(
+    client,
+    db_session,
+    monkeypatch,
+):
+    headers = create_admin_headers(client, db_session, monkeypatch)
+    document = DocumentModel(
+        title=f"quality-review-{uuid4()}",
+        filename="reviewed.txt",
+        category="txt",
+        status="quality_review",
+        quality_status="review",
+        quality_report={
+            "blocker_count": 1,
+            "warning_count": 0,
+            "issues": [{"code": "OCR_REQUIRED", "severity": "blocker"}],
+        },
+    )
+    db_session.add(document)
+    db_session.flush()
+    db_session.add(
+        DocumentChunk(
+            document_id=document.id,
+            chunk_index=0,
+            chunk_text="Auditable extracted policy text.",
+            embedding=[0.1] * settings.EMBEDDING_DIMENSION,
+            metadata_={},
+        )
+    )
+    db_session.commit()
+
+    report = client.get(
+        f"/api/admin/documents/{document.id}/quality",
+        headers=headers,
+    )
+    assert report.status_code == 200
+    assert report.json()["quality_status"] == "review"
+
+    approval = client.post(
+        f"/api/admin/documents/{document.id}/quality/approve",
+        headers=headers,
+        json={"reason": "Source was manually verified against the official copy."},
+    )
+
+    assert approval.status_code == 200
+    assert approval.json()["quality_status"] == "overridden"
+    db_session.refresh(document)
+    assert document.status == "active"
+    assert document.quality_report["override"]["approved_by"] == "testadmin"
+
+    audit = client.post(
+        "/api/admin/documents/quality-audit",
+        headers=headers,
+        json={"document_ids": [str(document.id)]},
+    )
+    assert audit.status_code == 200
+    db_session.refresh(document)
+    assert document.quality_status == "overridden"
+    assert document.quality_report["override"]["approved_by"] == "testadmin"

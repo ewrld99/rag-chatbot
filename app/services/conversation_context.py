@@ -171,6 +171,11 @@ class ConversationContextResolver:
         "one",
         "ones",
     }
+    _SELF_CONTAINED_TIME_REFERENCE_RE = re.compile(
+        r"\b(?:this|current|next|last)\s+(?:academic\s+)?"
+        r"(?:year|semester|term|month|week|day)\b",
+        re.IGNORECASE,
+    )
 
     def __init__(self, generator: Any | None = None) -> None:
         self.generator = generator
@@ -233,8 +238,26 @@ class ConversationContextResolver:
                 "correction", cleaned, anchor, 0.98, "rule", "Correction modifies the active topic."
             )
         if self._COMPARISON_RE.search(cleaned):
+            rewritten = self._rewrite_comparison_query(cleaned, chat_history)
+            if rewritten is None:
+                return self._decision(
+                    "ambiguous",
+                    None,
+                    0.70,
+                    anchor,
+                    None,
+                    "fallback",
+                    "The comparison target could not be rewritten safely as a standalone query.",
+                    intent=anchor.intent,
+                )
             return self._follow_up(
-                "comparison", cleaned, anchor, 0.96, "rule", "Comparison depends on the active topic."
+                "comparison",
+                cleaned,
+                anchor,
+                0.96,
+                "model",
+                "Comparison was rewritten as a standalone query using the active topic.",
+                standalone_query=rewritten,
             )
         if self._ELLIPTICAL_RE.match(cleaned) or self._has_reference(cleaned):
             return self._follow_up(
@@ -322,6 +345,25 @@ class ConversationContextResolver:
                 decision = self._new_topic(query, confidence=0.70, source="fallback")
 
         return decision
+
+    def _rewrite_comparison_query(
+        self,
+        query: str,
+        chat_history: list[dict[str, Any]] | None,
+    ) -> str | None:
+        rewrite = getattr(self.generator, "rewrite_query", None)
+        if not callable(rewrite):
+            return None
+
+        try:
+            rewritten = clean_query_text(str(rewrite(query, chat_history) or ""))
+        except Exception as exc:
+            logger.warning("Comparison query rewrite failed: %s", exc)
+            return None
+
+        if not rewritten or rewritten.casefold() == clean_query_text(query).casefold():
+            return None
+        return rewritten[:600]
 
     def _new_topic(
         self,
@@ -506,7 +548,11 @@ class ConversationContextResolver:
 
     @classmethod
     def _has_reference(cls, query: str) -> bool:
-        return bool(set(tokenize(query)) & cls._REFERENCE_TERMS)
+        without_self_contained_time = cls._SELF_CONTAINED_TIME_REFERENCE_RE.sub(
+            "",
+            query,
+        )
+        return bool(set(tokenize(without_self_contained_time)) & cls._REFERENCE_TERMS)
 
     @classmethod
     def _looks_like_clarification_response(cls, query: str) -> bool:

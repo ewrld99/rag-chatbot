@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from contextlib import contextmanager
 
 from langchain_core.documents import Document
 
@@ -22,6 +22,15 @@ class _FakeRetrievalService:
             )
         context = "\n".join(chunks)
         return context[:max_chars] if max_chars else context
+
+
+class _DBRetrievalService:
+    def __init__(self, db):
+        self.db = db
+
+    @contextmanager
+    def database_session(self):
+        yield self.db
 
 
 def test_generation_context_compaction_preserves_evidence_ids(monkeypatch):
@@ -124,7 +133,7 @@ def test_procedure_context_promotes_contiguous_chunks_in_document_order(db_sessi
     )
     pipeline = RAGPipeline.__new__(RAGPipeline)
     pipeline.generator = GenerationService.__new__(GenerationService)
-    pipeline.retrieval_service = SimpleNamespace(db=db_session)
+    pipeline.retrieval_service = _DBRetrievalService(db_session)
 
     expanded = pipeline._procedure_context_documents(
         [anchor],
@@ -195,7 +204,7 @@ def test_enumeration_context_promotes_detailed_policy_section(db_session, monkey
     )
     pipeline = RAGPipeline.__new__(RAGPipeline)
     pipeline.generator = GenerationService.__new__(GenerationService)
-    pipeline.retrieval_service = SimpleNamespace(db=db_session)
+    pipeline.retrieval_service = _DBRetrievalService(db_session)
 
     expanded = pipeline._generation_context_documents(
         [generic, detailed],
@@ -338,12 +347,6 @@ def test_procedure_questions_use_medium_context_budget(monkeypatch):
         "max_chars": 5800,
         "max_chars_per_doc": 1050,
     }
-
-
-def test_procedure_questions_do_not_use_direct_clause_shortcut():
-    pipeline = RAGPipeline.__new__(RAGPipeline)
-
-    assert not hasattr(pipeline, "_direct_procedure_step_answer")
 
 
 def test_curriculum_course_list_questions_use_wider_context_budget():

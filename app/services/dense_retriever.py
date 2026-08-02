@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session, joinedload
 
-from app.db.models import DocumentChunk, FAQModel
+from app.db.models import DocumentChunk, DocumentModel, FAQModel
 from app.services.embedding_service import EmbeddingServiceError, get_embedding
 from app.services.retrieval_metadata import document_metadata, faq_metadata
 
@@ -31,16 +33,48 @@ logger = logging.getLogger(__name__)
 #   - dense_results=[]  because embedding is DOWN  → degraded mode, be lenient
 #   - dense_results=[]  because no docs matched    → normal empty result
 # ---------------------------------------------------------------------------
-_dense_state = threading.local()
+_index_capability_lock = threading.Lock()
+_index_capability_value = False
+_index_capability_checked_at = 0.0
+_INDEX_CAPABILITY_TTL_SECONDS = 30.0
 
 
-def dense_embedding_failed() -> bool:
-    """Return True if the most recent retrieve() call failed due to embedding."""
-    return bool(getattr(_dense_state, "embedding_failed", False))
-
-
-def _set_embedding_failed(value: bool) -> None:
-    _dense_state.embedding_failed = value
+def retrievable_hnsw_ready(db: Session, *, force: bool = False) -> bool:
+    """Return whether the online backfill and partial HNSW index are ready."""
+    global _index_capability_checked_at, _index_capability_value
+    now = time.monotonic()
+    with _index_capability_lock:
+        if not force and now - _index_capability_checked_at < _INDEX_CAPABILITY_TTL_SECONDS:
+            return _index_capability_value
+        try:
+            ready = db.execute(
+                text(
+                    """
+                    SELECT
+                        EXISTS (
+                            SELECT 1
+                            FROM pg_class c
+                            JOIN pg_index i ON i.indexrelid = c.oid
+                            JOIN pg_am am ON am.oid = c.relam
+                            WHERE c.relname = 'idx_document_chunks_embedding_retrievable_hnsw'
+                              AND am.amname = 'hnsw'
+                              AND i.indisvalid
+                              AND i.indisready
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM document_chunks
+                            WHERE is_retrievable IS NULL
+                            LIMIT 1
+                        )
+                    """
+                )
+            ).scalar_one()
+            _index_capability_value = bool(ready)
+        except Exception:
+            db.rollback()
+            _index_capability_value = False
+        _index_capability_checked_at = now
+        return _index_capability_value
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +115,12 @@ class DenseResult:
         }
 
 
+@dataclass(frozen=True)
+class DenseRetrievalOutcome:
+    results: list[DenseResult]
+    embedding_failed: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Retriever
 # ---------------------------------------------------------------------------
@@ -96,6 +136,15 @@ class DenseRetriever:
         self.db = db
 
     def retrieve(self, query: str, top_k: int = 20, filters: dict | None = None) -> list[DenseResult]:
+        """Compatibility API returning only result rows."""
+        return self.retrieve_outcome(query, top_k=top_k, filters=filters).results
+
+    def retrieve_outcome(
+        self,
+        query: str,
+        top_k: int = 20,
+        filters: dict | None = None,
+    ) -> DenseRetrievalOutcome:
         """
         Embed *query* and return the *top_k* most similar chunks.
 
@@ -111,29 +160,33 @@ class DenseRetriever:
         Returns
         -------
         List of DenseResult ordered best → worst (descending similarity).
-        When the embedding service is unavailable, returns [] and sets the
-        thread-local dense_embedding_failed() flag to True so callers can
-        switch to degraded (sparse-only) mode gracefully.
+        When embeddings are unavailable, the outcome explicitly marks dense
+        retrieval as degraded so worker state cannot leak between requests.
         """
         if not query or not query.strip():
-            _set_embedding_failed(False)
-            return []
-
-        # Reset failure flag at the start of each call so callers always see
-        # the result of THIS request, not a previous one on the same thread.
-        _set_embedding_failed(False)
+            return DenseRetrievalOutcome([])
 
         try:
             query_embedding = get_embedding(query, self.db)
+
+            use_retrievable_index = retrievable_hnsw_ready(self.db)
+            if use_retrievable_index:
+                self.db.execute(text("SET LOCAL hnsw.iterative_scan = 'strict_order'"))
 
             doc_query = (
                 self.db.query(
                     DocumentChunk,
                     DocumentChunk.embedding.cosine_distance(query_embedding).label("dist"),
                 )
-                .filter(DocumentChunk.document.has(status="active"))
                 .options(joinedload(DocumentChunk.document))
             )
+            if use_retrievable_index:
+                doc_query = doc_query.filter(DocumentChunk.is_retrievable.is_(True))
+            else:
+                doc_query = (
+                    doc_query.filter(DocumentChunk.document.has(status="active"))
+                    .filter(DocumentChunk.document.has(DocumentModel.quality_status != "review"))
+                )
 
             # Apply optional metadata filters with graceful fallback:
             # chunks missing the metadata key (NULL) are always included so
@@ -171,7 +224,6 @@ class DenseRetriever:
 
         except EmbeddingServiceError as exc:
             self.db.rollback()
-            _set_embedding_failed(True)
             # Always log at WARNING — even a circuit-breaker cooldown is a
             # service degradation that admins need to see in the logs.
             logger.warning(
@@ -180,10 +232,9 @@ class DenseRetriever:
                 "Reason: %s",
                 exc,
             )
-            return []
+            return DenseRetrievalOutcome([], embedding_failed=True)
         except Exception as exc:
             self.db.rollback()
-            _set_embedding_failed(False)
             logger.exception(
                 "DenseRetriever: unexpected error — dense retrieval disabled for "
                 "this request. Sparse (FTS) retrieval will run alone. Reason: %s",
@@ -249,4 +300,4 @@ class DenseRetriever:
                     )
                 )
 
-        return results
+        return DenseRetrievalOutcome(results)

@@ -114,6 +114,93 @@ def test_invalid_evidence_id_and_uncovered_answer_sentence_are_rejected():
     assert any("without claim records" in error for error in validation.errors)
 
 
+def test_invalid_evidence_id_is_repaired_when_claim_matches_retrieved_text():
+    service = GroundingService()
+    document = _document(
+        "37.0 Appeal Fee. All appeals shall be accompanied by a "
+        "non-refundable appeal fee TZS 15,000.00 or as may be prescribed "
+        "by the University Council from time to time."
+    )
+    evidence = service.build_evidence([document])
+    evidence_id = service.evidence_id(document)
+    draft = GroundedDraft(
+        coverage="full",
+        answer=(
+            "The appeal fee is TZS 15,000.00 or as may be prescribed by "
+            "the University Council from time to time."
+        ),
+        claims=[
+            GroundedClaim(
+                claim=(
+                    "The appeal fee is TZS 15,000.00 or as may be prescribed "
+                    "by the University Council from time to time."
+                ),
+                evidence_ids=["ev-37c6debab54f6e32"],
+            )
+        ],
+    )
+
+    repaired = service.reconcile_evidence_ids(draft, evidence)
+    validation = service.validate(repaired, evidence)
+
+    assert repaired.claims[0].evidence_ids == [evidence_id]
+    assert validation.valid is True
+
+
+def test_invalid_evidence_id_is_not_repaired_when_number_is_absent():
+    service = GroundingService()
+    document = _document("Appeals must be submitted through the UDOM SR2 account.")
+    evidence = service.build_evidence([document])
+    draft = GroundedDraft(
+        coverage="full",
+        answer="The appeal fee is TZS 15,000.00.",
+        claims=[
+            GroundedClaim(
+                claim="The appeal fee is TZS 15,000.00.",
+                evidence_ids=["ev-37c6debab54f6e32"],
+            )
+        ],
+    )
+
+    repaired = service.reconcile_evidence_ids(draft, evidence)
+    validation = service.validate(repaired, evidence)
+
+    assert repaired.claims[0].evidence_ids == ["ev-37c6debab54f6e32"]
+    assert validation.valid is False
+    assert "not retrieved" in " ".join(validation.claim_errors[0])
+
+
+def test_missing_evidence_id_is_repaired_when_claim_matches_retrieved_text():
+    service = GroundingService()
+    document = _document(
+        "37.0 Appeal Fee. All appeals shall be accompanied by a "
+        "non-refundable appeal fee TZS 15,000.00."
+    )
+    evidence = service.build_evidence([document])
+    evidence_id = service.evidence_id(document)
+    raw = json.dumps(
+        {
+            "mode": "evidence",
+            "query": "what is the fee for appealing for remarking",
+            "claims": [
+                {
+                    "claim": "The appeal fee for remarking is TZS 15,000.00.",
+                }
+            ],
+        }
+    )
+
+    draft, error = service.parse_draft(raw)
+    assert error is None
+    assert draft is not None
+
+    repaired = service.reconcile_evidence_ids(draft, evidence)
+    validation = service.validate(repaired, evidence)
+
+    assert repaired.claims[0].evidence_ids == [evidence_id]
+    assert validation.valid is True
+
+
 def test_parse_draft_normalizes_fallback_schema_variants():
     service = GroundingService()
     raw = json.dumps(
@@ -139,6 +226,28 @@ def test_parse_draft_normalizes_fallback_schema_variants():
     assert draft.coverage == "partial"
     assert draft.claims[0].evidence_ids == ["ev-1234567890abcdef"]
     assert draft.claims[1].evidence_ids == ["ev-68b82f7b90d78d78"]
+
+
+def test_parse_draft_accepts_json_wrapped_in_markdown_fence():
+    service = GroundingService()
+    raw = """```json
+{
+  "coverage": "full",
+  "claims": [
+    {
+      "claim": "Students must display an identity card.",
+      "evidence_ids": ["ev-1234567890abcdef"]
+    }
+  ]
+}
+```"""
+
+    draft, error = service.parse_draft(raw)
+
+    assert error is None
+    assert draft is not None
+    assert draft.coverage == "full"
+    assert draft.answer == "- Students must display an identity card."
 
 
 def test_partial_outcome_keeps_only_semantically_supported_claims():
@@ -404,6 +513,46 @@ def test_generation_returns_verified_partial_without_repair_by_default():
     assert result["answer"] == "GPA uses grade points."
     assert result["grounding"]["repaired"] is False
     assert result["grounding"]["status"] == "partial"
+    assert result["evidence_ids"] == [evidence_id]
+
+
+def test_generation_keeps_matching_claim_when_extra_claim_has_no_evidence_id():
+    document = _document(
+        "Student UDOM SR access ceases six months after graduation."
+    )
+    evidence_id = GroundingService().evidence_id(document)
+    initial = {
+        "coverage": "partial",
+        "claims": [
+            {
+                "claim": "Student UDOM SR access ceases six months after graduation."
+            },
+            {
+                "claim": (
+                    "The exact duration depends on the circumstances of the "
+                    "student's departure from the University."
+                )
+            },
+        ],
+    }
+    generator = _StubGenerationService(
+        [initial],
+        [VerificationReport(verdicts={0: "SUPPORTED"})],
+    )
+
+    result = generator.generate_response(
+        "How long until student UDOM SR access ceases after finishing study?",
+        "<documents />",
+        documents=[document],
+    )
+
+    assert result["answer"] == (
+        "- Student UDOM SR access ceases six months after graduation."
+    )
+    assert result["grounding"]["status"] == "partial"
+    assert result["grounding"]["claim_count"] == 2
+    assert result["grounding"]["supported_claim_count"] == 1
+    assert result["grounding"]["repaired"] is False
     assert result["evidence_ids"] == [evidence_id]
 
 

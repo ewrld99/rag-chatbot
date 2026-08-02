@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_rag_pipeline, require_admin_user
 from app.api.limiter import RateLimiter
+from app.core.config import settings
 from app.db.models import User
 from app.db.session import get_db
 from app.schemas.query import (
@@ -43,7 +44,7 @@ def query(
     payload: QueryRequest,
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
     _: User = Depends(require_admin_user),
-    __: None = Depends(RateLimiter(limit=20, window=60)),
+    __: None = Depends(RateLimiter(limit=20, window=60, scope="admin_query")),
 ):
     """Run the same RAG pipeline as chat and include admin diagnostics."""
     t_start = time.perf_counter()
@@ -134,8 +135,8 @@ def health(db: Session = Depends(get_db)):
     System health check:
 
     - database:      can we execute a simple query?
-    - vector_index:  does the pgvector HNSW/IVFFlat index exist on documents.embedding?
-    - fts_index:     does the GIN index on documents.fts_vector exist?
+    - vector_index:  are both cosine HNSW indexes valid and dimension-compatible?
+    - fts_index:     are both expected GIN indexes valid and ready?
     """
     db_ok = False
     vector_index = False
@@ -159,13 +160,45 @@ def health(db: Session = Depends(get_db)):
         row = db.execute(
             text(
                 """
-                SELECT COUNT(*) FROM pg_indexes
-                WHERE tablename IN ('document_chunks', 'faqs')
-                  AND indexdef ILIKE '%vector_cosine_ops%'
+                WITH expected(index_name, table_name, partial_required) AS (
+                    VALUES
+                        ('idx_document_chunks_embedding_retrievable_hnsw', 'document_chunks', true),
+                        ('idx_faqs_embedding', 'faqs', false)
+                ), valid_indexes AS (
+                    SELECT e.index_name
+                    FROM expected e
+                    JOIN pg_class idx ON idx.relname = e.index_name
+                    JOIN pg_index i ON i.indexrelid = idx.oid
+                    JOIN pg_class tbl ON tbl.oid = i.indrelid AND tbl.relname = e.table_name
+                    JOIN pg_am am ON am.oid = idx.relam AND am.amname = 'hnsw'
+                    WHERE i.indisvalid
+                      AND i.indisready
+                      AND pg_get_indexdef(idx.oid) ILIKE '%vector_cosine_ops%'
+                      AND (
+                          NOT e.partial_required
+                          OR pg_get_expr(i.indpred, i.indrelid) ILIKE '%is_retrievable IS TRUE%'
+                      )
+                ), dimensions AS (
+                    SELECT COUNT(*) AS compatible
+                    FROM pg_attribute a
+                    JOIN pg_class t ON t.oid = a.attrelid
+                    WHERE t.relname IN ('document_chunks', 'faqs')
+                      AND a.attname = 'embedding'
+                      AND format_type(a.atttypid, a.atttypmod) = :vector_type
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM valid_indexes) = 2
+                    AND (SELECT compatible FROM dimensions) = 2
+                    AND NOT EXISTS (
+                        SELECT 1 FROM document_chunks
+                        WHERE is_retrievable IS NULL
+                        LIMIT 1
+                    )
                 """
-            )
+            ),
+            {"vector_type": f"vector({settings.EMBEDDING_DIMENSION})"},
         ).scalar()
-        vector_index = bool(row and row > 0)
+        vector_index = bool(row)
     except Exception as exc:
         logger.warning("Could not check vector index: %s", exc)
 
@@ -174,13 +207,18 @@ def health(db: Session = Depends(get_db)):
         row = db.execute(
             text(
                 """
-                SELECT COUNT(*) FROM pg_indexes
-                WHERE tablename IN ('document_chunks', 'faqs')
-                  AND indexname IN ('idx_document_chunks_fts', 'idx_faqs_fts')
+                SELECT COUNT(*) = 2
+                FROM pg_class idx
+                JOIN pg_index i ON i.indexrelid = idx.oid
+                JOIN pg_am am ON am.oid = idx.relam
+                WHERE idx.relname IN ('idx_document_chunks_fts', 'idx_faqs_fts')
+                  AND am.amname = 'gin'
+                  AND i.indisvalid
+                  AND i.indisready
                 """
             )
         ).scalar()
-        fts_index = bool(row and row > 0)
+        fts_index = bool(row)
     except Exception as exc:
         logger.warning("Could not check FTS index: %s", exc)
 

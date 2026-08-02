@@ -8,7 +8,6 @@ LangChain-compatible Document output.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 from typing import Any
@@ -21,15 +20,18 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
 from app.core.logging import format_log_event
 from app.db.models import DocumentChunk
-from app.db.session import SessionLocal
-from app.services.dense_retriever import (
-    DenseRetriever,
-    _set_embedding_failed,
-    dense_embedding_failed,
+from app.db.session import (
+    SessionFactory,
+    SessionLocal,
+    pool_snapshot,
+    session_factory_from_session,
+    session_scope,
 )
+from app.services.dense_retriever import DenseRetriever
 from app.services.rrf import ReciprocalRankFusion, RRFResult
 from app.services.sparse_retriever import SparseRetriever
-from app.services.settings_service import SettingsService
+from app.services.hybrid_executor import RetrievalBusyError, get_hybrid_executor
+from app.services.settings_service import RuntimeSettingsSnapshot, SettingsService
 
 logger = logging.getLogger(__name__)
 
@@ -60,26 +62,41 @@ class HybridRetriever:
 
     def __init__(
         self,
-        db: Session,
+        db: Session | None = None,
         top_k: int | None = None,
         dense_top_k: int | None = None,
         sparse_top_k: int | None = None,
         rrf_k: int | None = None,
         neighbor_window: int = NEIGHBOR_WINDOW,
+        *,
+        session_factory: SessionFactory | None = None,
+        settings_snapshot: RuntimeSettingsSnapshot | None = None,
     ) -> None:
-        self.db = db
+        if session_factory is None:
+            session_factory = (
+                session_factory_from_session(db) if db is not None else SessionLocal
+            )
+        self._session_factory = session_factory
         self.top_k: int
         self.dense_top_k: int
         self.sparse_top_k: int
         self.rrf_k: int
         self.neighbor_window = max(neighbor_window, 0)
 
-        if any(v is None for v in [top_k, dense_top_k, sparse_top_k, rrf_k]):
-            settings_svc = SettingsService(db)
-            self.top_k = top_k if top_k is not None else settings_svc.top_k_final
-            self.dense_top_k = dense_top_k if dense_top_k is not None else settings_svc.top_k_dense
-            self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_svc.top_k_sparse
-            self.rrf_k = rrf_k if rrf_k is not None else settings_svc.rrf_k
+        if settings_snapshot is None and any(
+            value is None for value in [top_k, dense_top_k, sparse_top_k, rrf_k]
+        ):
+            if db is not None:
+                settings_snapshot = SettingsService(db).runtime_snapshot()
+            else:
+                with session_scope(self._session_factory) as settings_db:
+                    settings_snapshot = SettingsService(settings_db).runtime_snapshot()
+
+        if settings_snapshot is not None:
+            self.top_k = top_k if top_k is not None else settings_snapshot.top_k_final
+            self.dense_top_k = dense_top_k if dense_top_k is not None else settings_snapshot.top_k_dense
+            self.sparse_top_k = sparse_top_k if sparse_top_k is not None else settings_snapshot.top_k_sparse
+            self.rrf_k = rrf_k if rrf_k is not None else settings_snapshot.rrf_k
         else:
             assert top_k is not None
             assert dense_top_k is not None
@@ -110,16 +127,15 @@ class HybridRetriever:
 
         started_at = time.perf_counter()
         if settings.HYBRID_PARALLEL_RETRIEVAL:
-            dense_results, sparse_results, dense_ms, sparse_ms = self._retrieve_parallel(
+            dense_results, sparse_results, dense_ms, sparse_ms, embedding_down = self._retrieve_parallel(
                 query,
                 filters,
             )
             retrieval_mode = "parallel"
         else:
-            dense_results, sparse_results, dense_ms, sparse_ms = self._retrieve_sequential(
+            dense_results, sparse_results, dense_ms, sparse_ms, embedding_down = self._retrieve_sequential(
                 query,
                 filters,
-                self.db,
             )
             retrieval_mode = "sequential"
 
@@ -130,9 +146,6 @@ class HybridRetriever:
             query[:80],
         )
 
-        # Parallel retrieval propagates the dense worker's failure flag back
-        # to this thread, so one check covers both sequential and parallel mode.
-        embedding_down = dense_embedding_failed()
         if embedding_down:
             logger.warning(
                 "HybridRetriever: running in SPARSE-ONLY degraded mode because "
@@ -165,6 +178,7 @@ class HybridRetriever:
                 include_neighbors=include_neighbors,
                 mode=retrieval_mode,
                 degraded=embedding_down,
+                **pool_snapshot(),
                 query=query[:120],
             )
         )
@@ -176,20 +190,23 @@ class HybridRetriever:
         self,
         query: str,
         filters: dict | None,
-    ) -> tuple[list[Any], list[Any], float, float]:
+    ) -> tuple[list[Any], list[Any], float, float, bool]:
         def dense_task() -> tuple[list[Any], float, bool]:
-            with SessionLocal() as db:
+            with session_scope(self._session_factory) as db:
                 started_at = time.perf_counter()
-                results = DenseRetriever(db).retrieve(
+                outcome = DenseRetriever(db).retrieve_outcome(
                     query,
                     top_k=self.dense_top_k,
                     filters=filters,
                 )
-                failed = dense_embedding_failed()
-                return results, round((time.perf_counter() - started_at) * 1000, 1), failed
+                return (
+                    outcome.results,
+                    round((time.perf_counter() - started_at) * 1000, 1),
+                    outcome.embedding_failed,
+                )
 
         def sparse_task() -> tuple[list[Any], float]:
-            with SessionLocal() as db:
+            with session_scope(self._session_factory) as db:
                 started_at = time.perf_counter()
                 results = SparseRetriever(db).retrieve(
                     query,
@@ -198,44 +215,60 @@ class HybridRetriever:
                 )
                 return results, round((time.perf_counter() - started_at) * 1000, 1)
 
+        executor = get_hybrid_executor()
+        dense_future = None
+        sparse_future = None
         try:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-retrieval") as executor:
-                dense_future = executor.submit(dense_task)
-                sparse_future = executor.submit(sparse_task)
-                dense_results, dense_ms, dense_failed = dense_future.result()
-                sparse_results, sparse_ms = sparse_future.result()
-            # Propagate this request's result in both directions so a previous
-            # failure cannot poison a later request on the coordinator thread.
-            _set_embedding_failed(dense_failed)
-            return dense_results, sparse_results, dense_ms, sparse_ms
+            dense_future = executor.submit(dense_task)
+            sparse_future = executor.submit(sparse_task)
+            dense_results, dense_ms, dense_failed = dense_future.result()
+            sparse_results, sparse_ms = sparse_future.result()
+            return dense_results, sparse_results, dense_ms, sparse_ms, dense_failed
+        except RetrievalBusyError:
+            raise
         except Exception as exc:
+            for future in (dense_future, sparse_future):
+                if future is None:
+                    continue
+                try:
+                    future.result()
+                except Exception:
+                    pass
             logger.warning(
                 "HybridRetriever: parallel retrieval failed; retrying sequentially: %s",
                 exc,
             )
-            return self._retrieve_sequential(query, filters, self.db)
+            return self._retrieve_sequential(query, filters)
 
     def _retrieve_sequential(
         self,
         query: str,
         filters: dict | None,
-        db: Session,
-    ) -> tuple[list[Any], list[Any], float, float]:
+    ) -> tuple[list[Any], list[Any], float, float, bool]:
         dense_started_at = time.perf_counter()
-        dense_results = DenseRetriever(db).retrieve(
-            query,
-            top_k=self.dense_top_k,
-            filters=filters,
-        )
+        with session_scope(self._session_factory) as db:
+            dense_outcome = DenseRetriever(db).retrieve_outcome(
+                query,
+                top_k=self.dense_top_k,
+                filters=filters,
+            )
+            dense_results = dense_outcome.results
         dense_ms = round((time.perf_counter() - dense_started_at) * 1000, 1)
         sparse_started_at = time.perf_counter()
-        sparse_results = SparseRetriever(db).retrieve(
-            query,
-            top_k=self.sparse_top_k,
-            filters=filters,
-        )
+        with session_scope(self._session_factory) as db:
+            sparse_results = SparseRetriever(db).retrieve(
+                query,
+                top_k=self.sparse_top_k,
+                filters=filters,
+            )
         sparse_ms = round((time.perf_counter() - sparse_started_at) * 1000, 1)
-        return dense_results, sparse_results, dense_ms, sparse_ms
+        return (
+            dense_results,
+            sparse_results,
+            dense_ms,
+            sparse_ms,
+            dense_outcome.embedding_failed,
+        )
 
     def retrieve(
         self,
@@ -287,12 +320,13 @@ class HybridRetriever:
         if not targets:
             return results
 
-        chunks = (
-            self.db.query(DocumentChunk)
-            .options(joinedload(DocumentChunk.document))
-            .filter(tuple_(DocumentChunk.document_id, DocumentChunk.chunk_index).in_(list(targets.keys())))
-            .all()
-        )
+        with session_scope(self._session_factory) as db:
+            chunks = (
+                db.query(DocumentChunk)
+                .options(joinedload(DocumentChunk.document))
+                .filter(tuple_(DocumentChunk.document_id, DocumentChunk.chunk_index).in_(list(targets.keys())))
+                .all()
+            )
 
         neighbors_by_parent: dict[str, list[RRFResult]] = {}
         for chunk in chunks:

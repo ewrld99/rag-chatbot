@@ -85,6 +85,7 @@ def test_model_catalog_exposes_only_the_approved_models(client):
     body = response.json()
     assert body["default"] == "auto"
     assert [model["id"] for model in body["models"]] == [
+        "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",

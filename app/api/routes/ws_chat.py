@@ -1,14 +1,16 @@
+import json
 import logging
-import time
-from collections import defaultdict
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import build_user_profile, get_rag_pipeline, normalize_guest_history
+from app.api.limiter import check_rate_limit
+from app.core.config import settings
 from app.core.security import decode_access_token
 from app.db.models import ChatMessage, ChatSession, User
-from app.db.session import SessionLocal
+from app.db.session import SessionFactory, get_session_factory, session_scope
 from app.services.generation_resilience import GenerationUnavailableError
 from app.services.chat_persistence_service import (
     create_pending_user_turn,
@@ -22,25 +24,8 @@ from app.services.rag_pipeline import RAGPipeline
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Simple sliding-window rate limiter for WebSocket messages.
-# slowapi only covers HTTP endpoints, so we track per-user_id timestamps here.
-# ---------------------------------------------------------------------------
 _WS_LIMIT = 20          # max messages per window
 _WS_WINDOW = 60.0       # window size in seconds
-_ws_timestamps: Dict[str, List[float]] = defaultdict(list)
-
-
-def _ws_is_allowed(user_id: str) -> bool:
-    """Return True if the user is within the rate limit, False otherwise."""
-    now = time.monotonic()
-    bucket = _ws_timestamps[user_id]
-    # Evict timestamps outside the current window
-    _ws_timestamps[user_id] = [t for t in bucket if now - t < _WS_WINDOW]
-    if len(_ws_timestamps[user_id]) >= _WS_LIMIT:
-        return False
-    _ws_timestamps[user_id].append(now)
-    return True
 
 
 def load_chat_history(
@@ -77,7 +62,11 @@ def load_chat_history(
     ]
 
 
-def _authenticate_websocket_user(websocket: WebSocket, path_user_id: str) -> tuple[int, Dict[str, Any] | None] | None:
+def _authenticate_websocket_user(
+    websocket: WebSocket,
+    path_user_id: str,
+    session_factory: SessionFactory,
+) -> tuple[int, Dict[str, Any] | None] | None:
     token = websocket.query_params.get("token", "").strip()
     payload = decode_access_token(token) if token else None
     if not payload:
@@ -91,14 +80,78 @@ def _authenticate_websocket_user(websocket: WebSocket, path_user_id: str) -> tup
     if token_user_id != requested_user_id:
         return None
 
-    db = SessionLocal()
-    try:
+    with session_scope(session_factory) as db:
         user = db.query(User).filter(User.id == token_user_id).first()
         if not user:
             return None
         return token_user_id, build_user_profile(user)
-    finally:
-        db.close()
+
+
+def _prepare_websocket_turn(
+    session_factory: SessionFactory,
+    user_id: int,
+    session_id: int,
+    message: str,
+) -> tuple[List[Dict[str, Any]], int | None]:
+    with session_scope(session_factory) as db:
+        history = load_chat_history(db, user_id, session_id)
+        pending = create_pending_user_turn(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            content=message,
+        )
+        return history, int(pending.id) if pending is not None else None
+
+
+def _update_websocket_routing(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    conversation: dict,
+) -> None:
+    with session_scope(session_factory) as db:
+        update_user_turn_routing(
+            db,
+            user_id=user_id,
+            message_id=message_id,
+            conversation=conversation,
+        )
+
+
+def _fail_websocket_turn(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    conversation: dict,
+) -> None:
+    with session_scope(session_factory) as db:
+        mark_user_turn_failed(
+            db,
+            user_id=user_id,
+            message_id=message_id,
+            conversation=conversation,
+        )
+
+
+def _finalize_websocket_turn(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    response: str,
+    sources: list,
+    conversation: dict,
+) -> bool:
+    with session_scope(session_factory) as db:
+        assistant = finalize_chat_turn(
+            db,
+            user_id=user_id,
+            user_message_id=message_id,
+            assistant_message=response,
+            sources=sources,
+            conversation=conversation,
+        )
+        return assistant is not None
 
 
 @router.websocket("/ws/chat/{user_id}")
@@ -106,8 +159,14 @@ async def websocket_chat(
     websocket: WebSocket,
     user_id: str,
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
+    session_factory: SessionFactory = Depends(get_session_factory),
 ):
-    auth_result = _authenticate_websocket_user(websocket, user_id)
+    auth_result = await run_in_threadpool(
+        _authenticate_websocket_user,
+        websocket,
+        user_id,
+        session_factory,
+    )
     if auth_result is None:
         await websocket.close(code=1008)
         return
@@ -117,23 +176,55 @@ async def websocket_chat(
 
     try:
         while True:
-            payload = await websocket.receive_json()
+            raw_payload = await websocket.receive_text()
+            if len(raw_payload.encode("utf-8")) > settings.WS_MAX_PAYLOAD_BYTES:
+                await websocket.close(code=1009, reason="Message payload is too large")
+                return
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "INVALID_MESSAGE",
+                    "message": "Message payload must be valid JSON",
+                })
+                continue
+            if not isinstance(payload, dict):
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "INVALID_MESSAGE",
+                    "message": "Message payload must be an object",
+                })
+                continue
             message = payload.get("message", "").strip()
             session_id = payload.get("session_id")
             model_preference = str(payload.get("model_preference", "auto"))
 
-            if not message:
+            if not message or len(message) > settings.CHAT_MAX_MESSAGE_CHARS:
                 await websocket.send_json({
                     "type": "error",
-                    "message": "Message cannot be empty",
+                    "code": "INVALID_MESSAGE",
+                    "message": (
+                        "Message cannot be empty"
+                        if not message
+                        else "Message is too long"
+                    ),
                 })
                 continue
 
             # ── Rate limit check ────────────────────────────────────────────
-            if not _ws_is_allowed(str(user_id)):
+            limit_decision = await check_rate_limit(
+                scope="ws_chat",
+                subject=f"user:{authenticated_user_id}",
+                limit=_WS_LIMIT,
+                window=_WS_WINDOW,
+            )
+            if not limit_decision.allowed:
                 await websocket.send_json({
                     "type": "error",
+                    "code": "RATE_LIMITED",
                     "message": f"Rate limit exceeded: max {_WS_LIMIT} messages per {int(_WS_WINDOW)}s. Please slow down.",
+                    "retry_after": max(1, int(limit_decision.retry_after + 0.999)),
                 })
                 continue
 
@@ -146,24 +237,23 @@ async def websocket_chat(
                 "selected_model": None,
                 "fallback_used": False,
             }
-            chat_history = normalize_guest_history(payload.get("history"))
+            chat_history = normalize_guest_history(
+                payload.get("history"),
+                limit=settings.CHAT_MAX_HISTORY_MESSAGES,
+            )
 
             user_profile = authenticated_user_profile
             if session_id:
-                db = SessionLocal()
                 try:
-                    chat_history = load_chat_history(db, authenticated_user_id, int(session_id))
-                    pending = create_pending_user_turn(
-                        db,
-                        user_id=authenticated_user_id,
-                        session_id=int(session_id),
-                        content=message,
+                    chat_history, pending_user_message_id = await run_in_threadpool(
+                        _prepare_websocket_turn,
+                        session_factory,
+                        authenticated_user_id,
+                        int(session_id),
+                        message,
                     )
-                    pending_user_message_id = pending.id if pending is not None else None
                 except (TypeError, ValueError):
                     chat_history = []
-                finally:
-                    db.close()
                 if pending_user_message_id is None:
                     await websocket.send_json({
                         "type": "error",
@@ -189,16 +279,13 @@ async def websocket_chat(
                             ),
                         }
                         if pending_user_message_id is not None:
-                            db = SessionLocal()
-                            try:
-                                update_user_turn_routing(
-                                    db,
-                                    user_id=authenticated_user_id,
-                                    message_id=pending_user_message_id,
-                                    conversation=response_conversation,
-                                )
-                            finally:
-                                db.close()
+                            await run_in_threadpool(
+                                _update_websocket_routing,
+                                session_factory,
+                                authenticated_user_id,
+                                pending_user_message_id,
+                                response_conversation,
+                            )
                         continue
                     if event["type"] == "sources":
                         response_sources = event["sources"]
@@ -235,16 +322,13 @@ async def websocket_chat(
                     })
             except GenerationUnavailableError as exc:
                 if pending_user_message_id is not None:
-                    db = SessionLocal()
-                    try:
-                        mark_user_turn_failed(
-                            db,
-                            user_id=authenticated_user_id,
-                            message_id=pending_user_message_id,
-                            conversation=response_conversation,
-                        )
-                    finally:
-                        db.close()
+                    await run_in_threadpool(
+                        _fail_websocket_turn,
+                        session_factory,
+                        authenticated_user_id,
+                        pending_user_message_id,
+                        response_conversation,
+                    )
                 await websocket.send_json({
                     "type": "error",
                     **exc.public_payload(sources=response_sources or exc.sources),
@@ -252,16 +336,13 @@ async def websocket_chat(
                 continue
             except InvalidModelPreference as exc:
                 if pending_user_message_id is not None:
-                    db = SessionLocal()
-                    try:
-                        mark_user_turn_failed(
-                            db,
-                            user_id=authenticated_user_id,
-                            message_id=pending_user_message_id,
-                            conversation=response_conversation,
-                        )
-                    finally:
-                        db.close()
+                    await run_in_threadpool(
+                        _fail_websocket_turn,
+                        session_factory,
+                        authenticated_user_id,
+                        pending_user_message_id,
+                        response_conversation,
+                    )
                 await websocket.send_json({
                     "type": "error",
                     "code": "MODEL_NOT_ALLOWED",
@@ -272,16 +353,13 @@ async def websocket_chat(
             except Exception:
                 logger.exception("Unexpected WebSocket chat generation failure")
                 if pending_user_message_id is not None:
-                    db = SessionLocal()
-                    try:
-                        mark_user_turn_failed(
-                            db,
-                            user_id=authenticated_user_id,
-                            message_id=pending_user_message_id,
-                            conversation=response_conversation,
-                        )
-                    finally:
-                        db.close()
+                    await run_in_threadpool(
+                        _fail_websocket_turn,
+                        session_factory,
+                        authenticated_user_id,
+                        pending_user_message_id,
+                        response_conversation,
+                    )
                 await websocket.send_json({
                     "type": "error",
                     "code": "CHAT_STREAM_FAILED",
@@ -291,20 +369,17 @@ async def websocket_chat(
                 continue
 
             if session_id and pending_user_message_id is not None:
-                db = SessionLocal()
-                try:
-                    assistant = finalize_chat_turn(
-                        db,
-                        user_id=authenticated_user_id,
-                        user_message_id=pending_user_message_id,
-                        assistant_message=assistant_response,
-                        sources=response_sources,
-                        conversation=response_conversation,
-                    )
-                finally:
-                    db.close()
+                saved = await run_in_threadpool(
+                    _finalize_websocket_turn,
+                    session_factory,
+                    authenticated_user_id,
+                    pending_user_message_id,
+                    assistant_response,
+                    response_sources,
+                    response_conversation,
+                )
 
-                if assistant is None:
+                if not saved:
                     await websocket.send_json({
                         "type": "error",
                         "message": "Unable to save chat history",

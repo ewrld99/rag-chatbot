@@ -1,11 +1,17 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, Header, HTTPException
 from app.core.config import settings
 from sqlalchemy.orm import Session
 
-from app.db.session import get_db
+from app.db.session import (
+    SessionFactory,
+    get_db,
+    get_session_factory,
+    session_scope,
+)
 from app.db.models import User, ChatMessage, ChatSession
 from app.core.security import decode_access_token
 from app.services.rag_pipeline import RAGPipeline
@@ -16,8 +22,19 @@ from app.services.conversation_context import attach_guest_context
 EAT = timezone(timedelta(hours=3), name="EAT")
 
 
-def get_retrieval_service(db: Session = Depends(get_db)):
-    return RetrievalService(db=db, top_k=settings.HYBRID_TOP_K)
+@dataclass(frozen=True)
+class CurrentUserIdentity:
+    id: int
+    username: str
+
+
+def get_retrieval_service(
+    session_factory: SessionFactory = Depends(get_session_factory),
+):
+    return RetrievalService(
+        top_k=settings.HYBRID_TOP_K,
+        session_factory=session_factory,
+    )
 
 
 def get_rag_pipeline(
@@ -72,6 +89,49 @@ def get_optional_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="User no longer exists")
     return user
+
+
+def get_optional_current_user_identity(
+    authorization: Optional[str] = Header(None),
+    session_factory: SessionFactory = Depends(get_session_factory),
+) -> Optional[CurrentUserIdentity]:
+    """Authenticate without retaining an ORM session through a streamed response."""
+    if not authorization:
+        return None
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = decode_access_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+
+    with session_scope(session_factory) as db:
+        row = db.query(User.id, User.username).filter(User.id == user_id).first()
+        if row is None:
+            raise HTTPException(status_code=401, detail="User no longer exists")
+        return CurrentUserIdentity(id=int(row.id), username=str(row.username))
+
+
+def get_current_user_identity(
+    current_user: Optional[CurrentUserIdentity] = Depends(
+        get_optional_current_user_identity
+    ),
+) -> CurrentUserIdentity:
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return current_user
+
+
+def require_admin_identity(
+    current_user: CurrentUserIdentity = Depends(get_current_user_identity),
+) -> str:
+    if get_user_role(current_user.username) != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user.username
 
 
 def require_admin_user(current_user: User = Depends(get_current_user)) -> User:

@@ -24,6 +24,12 @@ _DATE_START_RE = re.compile(
     r"^\s*(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+",
     re.IGNORECASE,
 )
+_SPLIT_DATE_YEAR_RE = re.compile(
+    r"(?m)^(?P<prefix>(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+    r"\d{1,2},)\s+(?!20\d{2}\b)(?P<activity>[^\n]+)\n(?P<year>20\d{2})$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,7 @@ class AlmanacEvent:
         lines = [
             "UDOM Academic Almanac Event",
             f"Date: {self.event_date.isoformat()}",
+            f"Calendar Date: {self.event_date.strftime('%B %d, %Y')}",
             f"Activity: {self.activity}",
             f"Event Type: {self.event_type}",
         ]
@@ -49,6 +56,8 @@ class AlmanacEvent:
             "category": "academic_calendar",
             "record_type": "almanac_event",
             "date": self.event_date.isoformat(),
+            "month": self.event_date.strftime("%Y-%m"),
+            "month_name": self.event_date.strftime("%B").lower(),
             "academic_year": self.academic_year,
             "event_type": self.event_type,
         }
@@ -58,6 +67,7 @@ def parse_almanac_events(text: str) -> list[AlmanacEvent]:
     """Extract one searchable event per dated almanac row."""
     clean_text = _normalize_almanac_text(text)
     events: list[AlmanacEvent] = []
+    seen: set[tuple[date, str, str | None]] = set()
     current_academic_year: str | None = None
 
     for match in _EVENT_RE.finditer(clean_text):
@@ -71,11 +81,20 @@ def parse_almanac_events(text: str) -> list[AlmanacEvent]:
             current_academic_year = explicit_year
 
         event_date = datetime.strptime(raw_date, "%A, %B %d, %Y").date()
+        academic_year = explicit_year or current_academic_year or _academic_year_for_date(event_date)
+        identity = (
+            event_date,
+            re.sub(r"\s+", " ", activity).strip().casefold(),
+            academic_year,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
         events.append(
             AlmanacEvent(
                 event_date=event_date,
                 activity=activity,
-                academic_year=explicit_year or current_academic_year or _academic_year_for_date(event_date),
+                academic_year=academic_year,
                 event_type=_classify_event_type(activity),
             )
         )
@@ -98,6 +117,13 @@ def _normalize_almanac_text(text: str) -> str:
         if (clean_line := line.strip(" |"))
         and not _MONTH_HEADER_RE.match(clean_line)
         and not _is_section_heading(clean_line)
+    )
+    normalized = _SPLIT_DATE_YEAR_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')} {match.group('year')} "
+            f"{match.group('activity')}"
+        ),
+        normalized,
     )
     return re.sub(r"\n+", "\n", normalized)
 
@@ -129,8 +155,9 @@ def _academic_year_from_text(text: str) -> str | None:
         return value.replace("-", "/")
     parts = value.split("/")
     if len(parts[1]) == 2:
-        return f"{parts[0]}/20{parts[1]}"
-    return value
+        value = f"{parts[0]}/20{parts[1]}"
+    start_year, end_year = (int(part) for part in value.split("/"))
+    return value if end_year == start_year + 1 else None
 
 
 def _academic_year_for_date(value: date) -> str:

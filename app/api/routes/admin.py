@@ -1,5 +1,4 @@
 import os
-import shutil
 import logging
 import time
 from uuid import UUID, uuid4
@@ -12,18 +11,20 @@ import csv
 import io
 import json
 
-from app.api.deps import require_admin_user
-from app.utils.loaders import load_document
-from app.utils.chunking import split_text
+from app.api.deps import require_admin_identity, require_admin_user
 from app.core.config import settings
+from app.core.time import application_now
 from app.services.embedding_service import EmbeddingServiceError, get_embeddings
-from app.db.models import DocumentModel, DocumentChunk, RetrievalAlias, User
-from app.db.session import get_db, SessionLocal
+from app.db.models import DocumentModel, DocumentChunk, FileOperation, RetrievalAlias, User
+from app.db.session import get_db, SessionLocal, session_scope
 from app.schemas.document import (
     DocumentCreate, 
     DocumentUpdate, 
     DocumentResponse, 
-    PaginatedDocumentResponse
+    PaginatedDocumentResponse,
+    DocumentQualityResponse,
+    DocumentQualityApproval,
+    DocumentAuditRequest,
 )
 from app.services.settings_service import SettingsService
 from app.schemas.settings import SystemSettingResponse, SystemSettingUpdate
@@ -31,11 +32,24 @@ from app.services.faq_service import FAQService
 from app.services.alias_expansion_service import AliasExpansionService
 from app.services.almanac_service import build_almanac_chunks
 from app.services.curriculum_service import build_curriculum_chunks
+from app.services.document_ingestion_service import (
+    DocumentIngestionService,
+    quality_summary,
+)
+from app.services.document_quality_service import normalized_document_hash
+from app.services.file_storage_service import (
+    FileStorageService,
+    UploadTooLargeError,
+)
+from app.services.storage_reconciler import (
+    create_file_operation,
+    reconcile_file_operations,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = settings.UPLOADS_DIR
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
@@ -59,6 +73,18 @@ def serialize_document(document: DocumentModel, include_content: bool = False) -
         "upload_date": document.upload_date,
         "status": document.status,
         "chunk_count": len(document.chunks),
+        "quality_status": document.quality_status or "unchecked",
+        "indexing_status": document.indexing_status or "idle",
+        "quality_checked_at": document.quality_checked_at,
+        "ingestion_version": document.ingestion_version or "1",
+        "duplicate_of_document_id": (
+            str(document.duplicate_of_document_id)
+            if document.duplicate_of_document_id
+            else None
+        ),
+        "quality_summary": quality_summary(document),
+        "storage_state": document.storage_state or "not_applicable",
+        "storage_error": document.storage_error,
     }
     if include_content:
         data["content"] = "\n\n".join(chunk.chunk_text for chunk in sorted(document.chunks, key=lambda c: c.chunk_index))
@@ -85,47 +111,28 @@ def rebuild_document_chunks(
     db: Session,
     extra_metadata: dict | None = None,
 ) -> None:
-    settings_svc = SettingsService(db)
-    chunk_size = settings_svc.chunk_size
-    chunk_overlap = settings_svc.chunk_overlap
-
-    chunks = split_text(
+    ingestion = DocumentIngestionService(db)
+    prepared = ingestion.prepare_text(
         content,
-        chunk_size=chunk_size,
-        overlap=chunk_overlap,
+        file_type=document.category or "txt",
+        current_document_id=document.id,
+        base_metadata=extra_metadata,
+        extraction_method="manual",
     )
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="Text could not be chunked")
-
     try:
-        embeddings = get_embeddings(chunks, db)
+        embeddings = ingestion.embed(prepared)
     except EmbeddingServiceError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e))
     except Exception as e:
         logger.exception("Embedding failed while rebuilding document chunks")
         raise HTTPException(status_code=502, detail=f"Embedding service error: {str(e)}")
 
-    if len(embeddings) != len(chunks):
-        raise HTTPException(
-            status_code=502,
-            detail="Embedding service returned an unexpected number of vectors",
-        )
-
-    # delete old chunks and synchronize ORM session state
-    db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).delete(synchronize_session="fetch")
-
-    new_chunks = [
-        DocumentChunk(
-            document_id=document.id,
-            chunk_index=i,
-            chunk_text=chunk,
-            embedding=embedding,
-            metadata_=extra_metadata or {},
-        )
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-    ]
-    db.add_all(new_chunks)
+    ingestion.apply(
+        document,
+        prepared,
+        embeddings,
+        persist_review_chunks=True,
+    )
     db.expire(document, ["chunks"])
 
 
@@ -180,6 +187,18 @@ def list_documents(
             "upload_date": doc.upload_date,
             "status": doc.status,
             "chunk_count": count,
+            "quality_status": doc.quality_status or "unchecked",
+            "indexing_status": doc.indexing_status or "idle",
+            "quality_checked_at": doc.quality_checked_at,
+            "ingestion_version": doc.ingestion_version or "1",
+            "duplicate_of_document_id": (
+                str(doc.duplicate_of_document_id)
+                if doc.duplicate_of_document_id
+                else None
+            ),
+            "quality_summary": quality_summary(doc),
+            "storage_state": doc.storage_state or "not_applicable",
+            "storage_error": doc.storage_error,
         })
         
     return {
@@ -281,12 +300,30 @@ def delete_document(
     admin_username: str = Depends(require_admin),
 ):
     document = get_document_or_404(document_id, db)
-    
+    deleted_document_id = str(document.id)
     chunk_count = len(document.chunks)
 
     try:
-        db.delete(document)
-        db.commit()
+        if document.file_path:
+            storage = FileStorageService(UPLOAD_DIR)
+            document.status = "delete_pending"
+            document.storage_state = "delete_pending"
+            document.storage_error = None
+            create_file_operation(
+                db,
+                document_id=document.id,
+                operation="delete",
+                source_path=document.file_path,
+                target_path=storage.trash_path(
+                    document.id,
+                    document.filename or "document",
+                ),
+            )
+            db.commit()
+            reconcile_file_operations(storage=storage)
+        else:
+            db.delete(document)
+            db.commit()
     except Exception as e:
         db.rollback()
         logger.exception("Database delete failed for document %s", document_id)
@@ -294,7 +331,7 @@ def delete_document(
 
     return {
         "message": "Document deleted successfully",
-        "id": str(document.id),
+        "id": deleted_document_id,
         "chunks_deleted": chunk_count,
     }
 
@@ -318,9 +355,28 @@ def delete_documents_batch(
                 pass
                 
         if valid_ids:
-            deleted_count = db.query(DocumentModel).filter(DocumentModel.id.in_(valid_ids)).delete(synchronize_session=False)
+            documents = db.query(DocumentModel).filter(DocumentModel.id.in_(valid_ids)).all()
+            storage = FileStorageService(UPLOAD_DIR)
+            for document in documents:
+                if document.file_path:
+                    document.status = "delete_pending"
+                    document.storage_state = "delete_pending"
+                    document.storage_error = None
+                    create_file_operation(
+                        db,
+                        document_id=document.id,
+                        operation="delete",
+                        source_path=document.file_path,
+                        target_path=storage.trash_path(
+                            document.id,
+                            document.filename or "document",
+                        ),
+                    )
+                else:
+                    db.delete(document)
             db.commit()
-            return {"status": "ok", "deleted_count": deleted_count}
+            reconcile_file_operations(storage=storage)
+            return {"status": "ok", "deleted_count": len(documents)}
         return {"status": "ok", "deleted_count": 0}
     except Exception as e:
         db.rollback()
@@ -356,14 +412,220 @@ def update_setting(
 # ---------------------------------------
 # 1. Upload & Ingest Document (FIXED)
 # ---------------------------------------
+def _prepare_uploaded_document(
+    file_path: str,
+    file_ext: str,
+    strategy: str,
+    chunk_meta: dict,
+):
+    with session_scope(SessionLocal) as db:
+        return DocumentIngestionService(db).prepare_file(
+            file_path,
+            file_ext,
+            strategy=strategy,
+            base_metadata=chunk_meta,
+        )
+
+
+def _upload_embedding_service():
+    from app.services.embedding_service import EmbeddingService
+
+    with session_scope(SessionLocal) as db:
+        return EmbeddingService(db)
+
+
+def _register_staged_upload(staged, title: str, file_ext: str) -> UUID:
+    with session_scope(SessionLocal) as db:
+        document = DocumentModel(
+            title=title,
+            filename=staged.filename,
+            file_path=staged.target_path,
+            category=file_ext,
+            content_hash=staged.sha256,
+            status="processing",
+            indexing_status="processing",
+            storage_state="staged",
+        )
+        db.add(document)
+        db.flush()
+        create_file_operation(
+            db,
+            document_id=document.id,
+            operation="promote",
+            source_path=staged.source_path,
+            target_path=staged.target_path,
+        )
+        db.commit()
+        return document.id
+
+
+def _retain_failed_upload(
+    document_id: UUID,
+    staged_path: str,
+    filename: str,
+    error: Exception,
+    prepared=None,
+) -> None:
+    storage = FileStorageService(UPLOAD_DIR)
+    retained_path = None
+    storage_error = str(error)[:2000]
+    try:
+        retained_path = storage.retain_failed(staged_path, document_id, filename)
+    except Exception as storage_exc:
+        storage_error = f"{storage_error}; retaining source failed: {storage_exc}"[:2000]
+
+    with session_scope(SessionLocal) as db:
+        document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+        if document is None:
+            return
+        if prepared is not None:
+            DocumentIngestionService(db).record_quality(document, prepared)
+        document.file_path = retained_path or document.file_path
+        document.storage_state = "ready" if retained_path else "missing"
+        document.storage_error = storage_error
+        document.status = "embedding_failed"
+        document.indexing_status = "failed"
+        db.query(FileOperation).filter(
+            FileOperation.document_id == document.id,
+            FileOperation.operation == "promote",
+            FileOperation.status.in_(["pending", "processing", "failed"]),
+        ).update(
+            {FileOperation.status: "cancelled", FileOperation.last_error: storage_error},
+            synchronize_session=False,
+        )
+        db.commit()
+
+
+def _save_completed_upload(
+    document_id: UUID,
+    prepared,
+    embeddings: list[list[float]],
+) -> None:
+    with session_scope(SessionLocal) as db:
+        document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+        if document is None:
+            raise RuntimeError("Staged document record no longer exists")
+        DocumentIngestionService(db).apply(
+            document,
+            prepared,
+            embeddings,
+            persist_review_chunks=True,
+        )
+        document.status = "processing"
+        document.indexing_status = "processing"
+        document.storage_state = "promoting"
+        document.storage_error = None
+        db.commit()
+
+
+def _upload_ingestion_generator(
+    *,
+    document_id: UUID,
+    staged_path: str,
+    file_ext: str,
+    filename: str,
+    strategy: str,
+    programme: str | None,
+    year: int | None,
+):
+    try:
+        yield json.dumps({"progress": 15, "status": "Extracting text..."}) + "\n"
+        chunk_meta: dict = {}
+        if programme:
+            chunk_meta["programme"] = programme.strip()
+        if year is not None:
+            chunk_meta["year"] = str(year)
+        if strategy == "almanac":
+            chunk_meta.update(category="academic_calendar", record_type="almanac_event")
+        elif strategy == "curriculum":
+            chunk_meta.update(category="curriculum", record_type="course")
+
+        try:
+            prepared = _prepare_uploaded_document(staged_path, file_ext, strategy, chunk_meta)
+        except Exception as exc:
+            _retain_failed_upload(document_id, staged_path, filename, exc)
+            yield json.dumps({
+                "error": f"Error reading file: {str(exc)}",
+                "status": "embedding_failed",
+            }) + "\n"
+            return
+        chunks = [chunk.text for chunk in prepared.chunks]
+        yield json.dumps({
+            "progress": 30,
+            "status": "Checking extraction and chunk quality...",
+            "quality_status": prepared.quality.status,
+            "quality": prepared.quality.report,
+        }) + "\n"
+        yield json.dumps({
+            "progress": 35,
+            "status": f"Generating embeddings for {len(chunks)} chunks...",
+        }) + "\n"
+
+        embedding_service = _upload_embedding_service()
+        batch_size = 15 if embedding_service.provider == "local" else embedding_service.batch_size
+        batch_size = max(1, int(batch_size))
+        total_batches = (len(chunks) + batch_size - 1) // batch_size
+        embeddings: list[list[float]] = []
+        for batch_index, start in enumerate(range(0, len(chunks), batch_size), start=1):
+            yield json.dumps({
+                "progress": 35 + int((batch_index / total_batches) * 50),
+                "status": f"Generating embeddings (batch {batch_index}/{total_batches})...",
+            }) + "\n"
+            try:
+                embeddings.extend(
+                    embedding_service.embed_batch(chunks[start:start + batch_size])
+                )
+            except Exception as exc:
+                logger.warning("Embedding failed for uploaded document %s: %s", filename, exc)
+                try:
+                    _retain_failed_upload(
+                        document_id,
+                        staged_path,
+                        filename,
+                        exc,
+                        prepared,
+                    )
+                except Exception:
+                    logger.exception("Could not save embedding_failed record for %s", filename)
+                yield json.dumps({
+                    "error": f"Embedding service error: {str(exc)}",
+                    "status": "embedding_failed",
+                    "message": "The document was saved for retry after embedding recovers.",
+                }) + "\n"
+                return
+
+        if len(embeddings) != len(chunks):
+            yield json.dumps({"error": "Embedding service returned an unexpected number of vectors"}) + "\n"
+            return
+
+        yield json.dumps({"progress": 90, "status": "Saving document to database..."}) + "\n"
+        _save_completed_upload(document_id, prepared, embeddings)
+        reconcile_file_operations(storage=FileStorageService(UPLOAD_DIR))
+        with session_scope(SessionLocal) as db:
+            document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+            if document is None or document.storage_state != "ready":
+                detail = document.storage_error if document is not None else "document disappeared"
+                raise RuntimeError(f"File promotion did not complete: {detail}")
+        yield json.dumps({
+            "progress": 100,
+            "status": "Quality review required" if prepared.quality.blocks_activation else "Done",
+            "filename": filename,
+            "chunks_stored": len(chunks),
+            "quality_status": prepared.quality.status,
+            "quality": prepared.quality.report,
+        }) + "\n"
+    except Exception as exc:
+        logger.exception("Error during document ingestion generator")
+        yield json.dumps({"error": f"Internal Server Error: {str(exc)}"}) + "\n"
+
+
 @router.post("/documents/")
 def upload_document(
     file: UploadFile = File(...),
     strategy: str = Form("auto"),
     programme: Optional[str] = Form(None, description="Programme this document belongs to, e.g. 'BSc Computer Science'"),
     year: Optional[int] = Form(None, description="Year of study this document applies to, e.g. 2"),
-    db: Session = Depends(get_db),
-    admin_username: str = Depends(require_admin),
+    admin_username: str = Depends(require_admin_identity),
 ):
     """
     Streaming ingestion pipeline:
@@ -384,188 +646,33 @@ def upload_document(
     file_ext = filename.split(".")[-1]
     name_without_ext = os.path.splitext(filename)[0]
 
-    # Pre-save the file directly in the main thread to avoid holding UploadFile open in the generator
-    file_path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(file_path):
-        copy_index = 1
-        while os.path.exists(file_path):
-            suffix = f"_copy{copy_index}"
-            filename = f"{name_without_ext}{suffix}.{file_ext}"
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            copy_index += 1
+    with session_scope(SessionLocal) as db:
+        max_upload_bytes = SettingsService(db).max_upload_size_mb * 1024 * 1024
+    storage = FileStorageService(UPLOAD_DIR)
+    try:
+        staged = storage.stage_stream(file.file, filename, max_bytes=max_upload_bytes)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"File staging error: {str(exc)}") from exc
 
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
-
-
-    def ingest_generator():
-        # Open a fresh DB session that is owned entirely by this generator so it
-        # is not closed by FastAPI's request-scoped dependency teardown before
-        # the StreamingResponse body finishes streaming.
-        with SessionLocal() as gen_db:
-            try:
-                yield json.dumps({"progress": 15, "status": "Extracting text..."}) + "\n"
-
-                try:
-                    text = load_document(file_path, file_ext, strategy)
-                except Exception as e:
-                    yield json.dumps({"error": f"Error reading file: {str(e)}"}) + "\n"
-                    return
-
-                if not text or not text.strip():
-                    yield json.dumps({"error": "No text extracted from document"}) + "\n"
-                    return
-
-                yield json.dumps({"progress": 25, "status": "Splitting text into chunks..."}) + "\n"
-
-                chunk_metadata: list[dict] | None = None
-                if strategy == "almanac":
-                    almanac_chunks = build_almanac_chunks(text)
-                    chunks = [chunk for chunk, _metadata in almanac_chunks]
-                    chunk_metadata = [metadata for _chunk, metadata in almanac_chunks]
-                elif strategy == "curriculum":
-                    curriculum_chunks = build_curriculum_chunks(text)
-                    chunks = [chunk for chunk, _metadata in curriculum_chunks]
-                    chunk_metadata = [metadata for _chunk, metadata in curriculum_chunks]
-                else:
-                    settings_svc = SettingsService(gen_db)
-                    chunks = split_text(
-                        text,
-                        chunk_size=settings_svc.chunk_size,
-                        overlap=settings_svc.chunk_overlap,
-                    )
-
-                if not chunks:
-                    yield json.dumps({"error": "Text could not be chunked"}) + "\n"
-                    return
-
-                yield json.dumps({"progress": 35, "status": f"Generating embeddings for {len(chunks)} chunks..."}) + "\n"
-
-                embeddings = []
-                batch_size = 15  # default
-                from app.services.embedding_service import EmbeddingService
-                embedding_svc = EmbeddingService(gen_db)
-
-                # Determine provider batch size
-                if embedding_svc.provider != "local":
-                    batch_size = embedding_svc.batch_size
-
-                total_batches = (len(chunks) + batch_size - 1) // batch_size
-
-                for i in range(total_batches):
-                    start = i * batch_size
-                    batch_chunks = chunks[start:start + batch_size]
-
-                    pct = 35 + int(((i + 1) / total_batches) * 50)
-                    yield json.dumps({
-                        "progress": pct,
-                        "status": f"Generating embeddings (batch {i + 1}/{total_batches})..."
-                    }) + "\n"
-
-                    try:
-                        batch_embeddings = embedding_svc.embed_batch(batch_chunks)
-                        embeddings.extend(batch_embeddings)
-                    except Exception as e:
-                        # Embedding failed: save the document row with status
-                        # "embedding_failed" so it shows up in the admin UI and
-                        # the admin can retry it once the embedding service recovers.
-                        # Without this the file exists on disk but is invisible.
-                        logger.warning(
-                            "Embedding failed for uploaded document %s: %s — "
-                            "saving document record with status='embedding_failed' "
-                            "so it can be retried from the admin panel.",
-                            filename, str(e),
-                        )
-                        try:
-                            failed_doc = DocumentModel(
-                                title=name_without_ext,
-                                filename=filename,
-                                file_path=file_path,
-                                category=file_ext,
-                                status="embedding_failed",
-                            )
-                            gen_db.add(failed_doc)
-                            gen_db.commit()
-                            yield json.dumps({
-                                "error": f"Embedding service error: {str(e)}",
-                                "status": "embedding_failed",
-                                "message": (
-                                    "The document was saved but could not be embedded. "
-                                    "It will appear in the admin document list with status "
-                                    "'embedding_failed'. Use Retry Failed Documents to "
-                                    "re-process it once the embedding service is available."
-                                ),
-                            }) + "\n"
-                        except Exception as db_exc:
-                            logger.error(
-                                "Could not save embedding_failed record for %s: %s",
-                                filename, db_exc,
-                            )
-                            yield json.dumps({"error": f"Embedding service error: {str(e)}"}) + "\n"
-                        return
-
-                if len(embeddings) != len(chunks):
-                    yield json.dumps({"error": "Embedding service returned an unexpected number of vectors"}) + "\n"
-                    return
-
-                yield json.dumps({"progress": 90, "status": "Saving document to database..."}) + "\n"
-
-                document = DocumentModel(
-                    title=name_without_ext,
-                    filename=filename,
-                    file_path=file_path,
-                    category=file_ext,
-                    status="active"
-                )
-                gen_db.add(document)
-                gen_db.flush()
-
-                # Build chunk metadata; include programme and year when provided by the uploader.
-                chunk_meta: dict = {}
-                if programme:
-                    chunk_meta["programme"] = programme.strip()
-                if year is not None:
-                    chunk_meta["year"] = str(year)
-                if strategy == "almanac":
-                    chunk_meta["category"] = "academic_calendar"
-                    chunk_meta["record_type"] = "almanac_event"
-                elif strategy == "curriculum":
-                    chunk_meta["category"] = "curriculum"
-                    chunk_meta["record_type"] = "course"
-
-                gen_db.bulk_insert_mappings(
-                    DocumentChunk,
-                    [
-                        {
-                            "document_id": document.id,
-                            "chunk_text": chunk,
-                            "embedding": embedding,
-                            "chunk_index": i,
-                            "metadata_": {
-                                **chunk_meta,
-                                **(chunk_metadata[i] if chunk_metadata else {}),
-                            } if (chunk_meta or chunk_metadata) else None,
-                        }
-                        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-                    ]
-                )
-                gen_db.commit()
-
-                yield json.dumps({
-                    "progress": 100,
-                    "status": "Done",
-                    "filename": filename,
-                    "chunks_stored": len(chunks)
-                }) + "\n"
-
-            except Exception as e:
-                logger.exception("Error during document ingestion generator")
-                yield json.dumps({"error": f"Internal Server Error: {str(e)}"}) + "\n"
-
-    return StreamingResponse(ingest_generator(), media_type="application/x-ndjson")
+        document_id = _register_staged_upload(staged, name_without_ext, file_ext)
+    except Exception:
+        storage.remove(staged.source_path)
+        raise
+    return StreamingResponse(
+        _upload_ingestion_generator(
+            document_id=document_id,
+            staged_path=staged.source_path,
+            file_ext=file_ext,
+            filename=staged.filename,
+            strategy=strategy,
+            programme=programme,
+            year=year,
+        ),
+        media_type="application/x-ndjson",
+    )
 
 # ---------------------------------------
 # Reindex All
@@ -593,10 +700,10 @@ def reindex_all_documents(
     if not doc_ids:
         return {"queued": 0, "message": "No documents require reindexing."}
 
-    query.update({DocumentModel.status: "processing"}, synchronize_session=False)
+    query.update({DocumentModel.indexing_status: "processing"}, synchronize_session=False)
     db.commit()
 
-    background_tasks.add_task(_reindex_documents_task, doc_ids)
+    background_tasks.add_task(_quality_reindex_documents_task, doc_ids)
 
     return {"queued": len(doc_ids), "message": f"{len(doc_ids)} document(s) queued for reindexing."}
 
@@ -614,15 +721,122 @@ def reindex_single_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    doc.status = "processing"
+    doc.indexing_status = "processing"
     db.commit()
 
-    background_tasks.add_task(_reindex_documents_task, [str(doc.id)])
+    background_tasks.add_task(_quality_reindex_documents_task, [str(doc.id)])
 
     return {"message": f"Document '{doc.filename}' queued for reindexing."}
 
 
-def _reindex_documents_task(doc_ids: list[str]) -> None:
+def _quality_reindex_documents_task(doc_ids: list[str]) -> None:
+    """Reindex through the shared quality gate without deleting a valid old index."""
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        for raw_document_id in doc_ids:
+            try:
+                document_id = UUID(raw_document_id)
+                document = db.query(DocumentModel).filter(
+                    DocumentModel.id == document_id
+                ).first()
+                if document is None:
+                    logger.warning("Reindex: document %s not found, skipping", raw_document_id)
+                    continue
+
+                document.indexing_status = "processing"
+                db.commit()
+
+                rows = (
+                    db.query(DocumentChunk)
+                    .filter(DocumentChunk.document_id == document.id)
+                    .order_by(DocumentChunk.chunk_index.asc())
+                    .all()
+                )
+                first_metadata = dict(rows[0].metadata_ or {}) if rows else {}
+                strategy = "auto"
+                if first_metadata.get("record_type") == "almanac_event":
+                    strategy = "almanac"
+                elif (
+                    first_metadata.get("category") == "curriculum"
+                    and first_metadata.get("record_type") == "course"
+                ):
+                    strategy = "curriculum"
+
+                base_metadata = {
+                    key: value
+                    for key, value in first_metadata.items()
+                    if key in {"programme", "year", "source_url"}
+                }
+                ingestion = DocumentIngestionService(db)
+                target_file_path = document.file_path
+                if not target_file_path and document.filename:
+                    target_file_path = os.path.join(UPLOAD_DIR, document.filename)
+
+                if target_file_path and os.path.exists(target_file_path):
+                    file_type = target_file_path.rsplit(".", 1)[-1].lower()
+                    prepared = ingestion.prepare_file(
+                        target_file_path,
+                        file_type,
+                        strategy=strategy,
+                        current_document_id=document.id,
+                        base_metadata=base_metadata,
+                    )
+                elif rows:
+                    prepared = ingestion.prepare_existing_chunks(
+                        rows,
+                        file_type=document.category or "txt",
+                        strategy=strategy,
+                        current_document_id=document.id,
+                    )
+                else:
+                    prepared = ingestion.prepare_text(
+                        "",
+                        file_type=document.category or "txt",
+                        strategy=strategy,
+                        current_document_id=document.id,
+                        extraction_method="missing_source",
+                    )
+
+                prepared = ingestion.preserve_override(document, prepared)
+
+                if prepared.quality.blocks_activation:
+                    ingestion.record_quality(document, prepared)
+                    document.status = "quality_review"
+                    document.indexing_status = "idle"
+                    db.commit()
+                    logger.warning(
+                        "Reindex: document %s requires quality review; existing chunks retained",
+                        raw_document_id,
+                    )
+                    continue
+
+                embeddings = ingestion.embed(prepared)
+                ingestion.apply(document, prepared, embeddings)
+                db.commit()
+                logger.info(
+                    "Reindex: document %s completed (%d chunks, quality=%s)",
+                    raw_document_id,
+                    len(prepared.chunks),
+                    prepared.quality.status,
+                )
+            except Exception as exc:
+                logger.exception("Reindex: document %s failed: %s", raw_document_id, exc)
+                db.rollback()
+                try:
+                    document = db.query(DocumentModel).filter(
+                        DocumentModel.id == UUID(raw_document_id)
+                    ).first()
+                    if document is not None:
+                        document.indexing_status = "failed"
+                        if not document.chunks:
+                            document.status = "embedding_failed"
+                        db.commit()
+                except Exception:
+                    db.rollback()
+
+
+def _legacy_reindex_documents_task(doc_ids: list[str]) -> None:
     """Background task: re-chunk and re-embed each document."""
     from app.db.session import SessionLocal
 
@@ -665,7 +879,7 @@ def _reindex_documents_task(doc_ids: list[str]) -> None:
                 target_file_path = document.file_path
                 if not target_file_path and document.filename:
                     import os
-                    target_file_path = os.path.join("uploads", document.filename)
+                    target_file_path = os.path.join(UPLOAD_DIR, document.filename)
 
                 content = None
                 fallback_chunk_rows = None
@@ -831,6 +1045,155 @@ def _reindex_documents_task(doc_ids: list[str]) -> None:
 
 
 # ---------------------------------------
+# Document Quality Diagnostics
+# ---------------------------------------
+@router.get(
+    "/documents/{document_id:uuid}/quality",
+    response_model=DocumentQualityResponse,
+)
+def get_document_quality(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    document = get_document_or_404(document_id, db)
+    return {
+        "document_id": str(document.id),
+        "lifecycle_status": document.status or "active",
+        "indexing_status": document.indexing_status or "idle",
+        "quality_status": document.quality_status or "unchecked",
+        "quality_checked_at": document.quality_checked_at,
+        "ingestion_version": document.ingestion_version or "1",
+        "duplicate_of_document_id": (
+            str(document.duplicate_of_document_id)
+            if document.duplicate_of_document_id
+            else None
+        ),
+        "report": dict(document.quality_report or {}),
+    }
+
+
+@router.post("/documents/quality-audit")
+def audit_document_quality(
+    payload: DocumentAuditRequest,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    query = db.query(DocumentModel)
+    if payload.document_ids:
+        valid_ids: list[UUID] = []
+        for raw_id in payload.document_ids:
+            try:
+                valid_ids.append(UUID(raw_id))
+            except (TypeError, ValueError):
+                continue
+        query = query.filter(DocumentModel.id.in_(valid_ids))
+
+    documents = query.order_by(
+        DocumentModel.upload_date.asc(),
+        DocumentModel.id.asc(),
+    ).all()
+    counts = {"passed": 0, "warning": 0, "review": 0}
+    results: list[dict] = []
+    ingestion = DocumentIngestionService(db)
+
+    for document in documents:
+        rows = sorted(document.chunks, key=lambda chunk: chunk.chunk_index)
+        first_metadata = dict(rows[0].metadata_ or {}) if rows else {}
+        strategy = "auto"
+        if first_metadata.get("record_type") == "almanac_event":
+            strategy = "almanac"
+        elif (
+            first_metadata.get("category") == "curriculum"
+            and first_metadata.get("record_type") == "course"
+        ):
+            strategy = "curriculum"
+
+        target_file_path = document.file_path
+        if not target_file_path and document.filename:
+            target_file_path = os.path.join(UPLOAD_DIR, document.filename)
+        try:
+            if target_file_path and os.path.exists(target_file_path):
+                prepared = ingestion.prepare_file(
+                    target_file_path,
+                    target_file_path.rsplit(".", 1)[-1].lower(),
+                    strategy=strategy,
+                    current_document_id=document.id,
+                )
+                prepared = ingestion.preserve_override(document, prepared)
+                ingestion.record_quality(document, prepared)
+                result = prepared.quality
+            else:
+                result = ingestion.audit_document(document)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Quality audit failed for document %s", document.id)
+            results.append({
+                "document_id": str(document.id),
+                "quality_status": "error",
+                "error": str(exc),
+            })
+            continue
+
+        counts[result.status] = counts.get(result.status, 0) + 1
+        results.append({
+            "document_id": str(document.id),
+            "quality_status": result.status,
+            "warning_count": result.report.get("warning_count", 0),
+            "blocker_count": result.report.get("blocker_count", 0),
+            "duplicate_of_document_id": (
+                str(result.duplicate_of_document_id)
+                if result.duplicate_of_document_id
+                else None
+            ),
+        })
+
+    return {"audited": len(results), "counts": counts, "documents": results}
+
+
+@router.post(
+    "/documents/{document_id:uuid}/quality/approve",
+    response_model=DocumentQualityResponse,
+)
+def approve_document_quality(
+    document_id: UUID,
+    payload: DocumentQualityApproval,
+    db: Session = Depends(get_db),
+    admin_username: str = Depends(require_admin),
+):
+    document = get_document_or_404(document_id, db)
+    if not document.chunks:
+        raise HTTPException(
+            status_code=409,
+            detail="The document has no embedded chunks. Correct the source and reindex it before approval.",
+        )
+
+    report = dict(document.quality_report or {})
+    report["override"] = {
+        "approved_by": admin_username,
+        "reason": payload.reason.strip(),
+        "approved_at": application_now().isoformat(),
+        "previous_quality_status": document.quality_status or "unchecked",
+    }
+    document.quality_report = report
+    if not document.content_hash:
+        document.content_hash = normalized_document_hash(
+            "\n\n".join(
+                chunk.chunk_text
+                for chunk in sorted(document.chunks, key=lambda row: row.chunk_index)
+            )
+        )
+    document.quality_status = "overridden"
+    document.quality_checked_at = application_now()
+    document.status = "active"
+    document.indexing_status = "idle"
+    db.commit()
+    db.refresh(document)
+    return get_document_quality(document.id, db, admin_username)
+
+
+# ---------------------------------------
 # Broken Document Diagnostics
 @router.get("/documents/broken")
 def list_broken_documents(db: Session = Depends(get_db), admin_username: str = Depends(require_admin)):
@@ -874,6 +1237,8 @@ def list_broken_documents(db: Session = Depends(get_db), admin_username: str = D
             "title": doc.title,
             "status": doc.status,
             "file_path": doc.file_path,
+            "storage_state": doc.storage_state or "not_applicable",
+            "storage_error": doc.storage_error,
             "upload_date": doc.upload_date.isoformat() if doc.upload_date else None,
             "reason": reason,
         }
@@ -912,11 +1277,11 @@ def retry_failed_documents(
         return {"queued": 0, "message": "No documents with status 'embedding_failed' found."}
 
     for doc in failed_docs:
-        doc.status = "processing"
+        doc.indexing_status = "processing"
     db.commit()
 
     doc_ids = [str(doc.id) for doc in failed_docs]
-    background_tasks.add_task(_reindex_documents_task, doc_ids)
+    background_tasks.add_task(_quality_reindex_documents_task, doc_ids)
 
     return {
         "queued": len(doc_ids),

@@ -2,11 +2,15 @@ from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional
 
 from app.services.model_catalog import validate_model_preference
+from app.core.config import settings
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: Optional[List[Dict[str, Any]]] = None
+    message: str = Field(min_length=1, max_length=settings.CHAT_MAX_MESSAGE_CHARS)
+    history: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        max_length=settings.CHAT_MAX_HISTORY_MESSAGES,
+    )
     # Optional: provided by the SSE stream endpoint to persist history
     session_id: Optional[int] = None
     user_id: Optional[int] = None

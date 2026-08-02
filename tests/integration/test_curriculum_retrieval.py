@@ -1,4 +1,5 @@
 from langchain_core.documents import Document
+from contextlib import contextmanager
 from uuid import uuid4
 
 from app.core.config import settings
@@ -10,6 +11,15 @@ from app.services.rag_pipeline import RAGPipeline
 class _RetrievalService:
     def __init__(self, db):
         self.db = db
+
+    @contextmanager
+    def database_session(self):
+        yield self.db
+
+    def alias_expansions(self, query):
+        from app.services.alias_expansion_service import AliasExpansionService
+
+        return AliasExpansionService(self.db).get_expansions(query)
 
 
 def _course_metadata(programme, year, semester, code, title, acronym="BSc SE"):

@@ -13,6 +13,7 @@ This retriever searches multiple query variants:
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any
 
 from sqlalchemy import text
@@ -87,10 +88,14 @@ class SparseRetriever:
         merged: dict[str, SparseResult] = {}
         matched_queries: dict[str, list[dict[str, Any]]] = {}
         alias_boost_terms = self._alias_boost_terms(alias_expansions)
+        variant_results_by_label = self._retrieve_variants(
+            variants,
+            top_k=top_k,
+            filters=filters,
+        )
 
         for variant_index, variant in enumerate(variants):
-            fetch_k = max(top_k * 3, 60) if variant.label in {"expanded", "fallback"} else top_k
-            variant_results = self._retrieve_variant(variant, top_k=fetch_k, filters=filters)
+            variant_results = variant_results_by_label.get(variant.label, [])
             for rank, result in enumerate(variant_results, start=1):
                 result.metadata["sparse_query_type"] = variant.label
                 result.metadata["sparse_query"] = variant.query
@@ -169,13 +174,25 @@ class SparseRetriever:
                 boost += 0.02 if " " not in term else 0.04
         return min(boost, 0.08)
 
-    def _retrieve_variant(
+    def _retrieve_variants(
         self,
-        variant: QueryVariant,
+        variants: list[QueryVariant],
         top_k: int,
         filters: dict | None,
-    ) -> list[SparseResult]:
-        params: dict[str, Any] = {"query": variant.query, "top_k": top_k}
+    ) -> dict[str, list[SparseResult]]:
+        variant_payload = [
+            {
+                "variant_index": index,
+                "label": variant.label,
+                "query_text": variant.query,
+                "weight": variant.weight,
+                "fetch_k": max(top_k * 3, 60)
+                if variant.label in {"expanded", "fallback"}
+                else top_k,
+            }
+            for index, variant in enumerate(variants)
+        ]
+        params: dict[str, Any] = {"variants": json.dumps(variant_payload)}
         prog_clause = ""
         year_clause = ""
 
@@ -193,71 +210,75 @@ class SparseRetriever:
         # instead of two separate queries, halving the number of DB calls from
         # 8 (4 variants × 2 queries) to 4 (4 variants × 1 query).
         union_sql = text(f"""
-            WITH search_query AS (
-                SELECT
-                    websearch_to_tsquery('simple', :query) AS tsq_s,
-                    websearch_to_tsquery('english', :query) AS tsq_e
-            ),
-            doc_hits AS (
-                SELECT
-                    dc.id::text                                     AS chunk_id,
-                    d.id::text                                      AS document_id,
-                    d.filename                                      AS source,
-                    d.title                                         AS document_title,
-                    d.source_url                                    AS source_url,
-                    d.status                                        AS document_status,
-                    d.content_hash                                  AS content_hash,
-                    d.upload_date                                   AS document_uploaded_at,
-                    dc.chunk_text                                   AS text,
-                    dc.chunk_index                                  AS chunk_index,
-                    dc.page_number                                  AS page_number,
-                    dc.metadata                                     AS metadata_json,
-                    NULL::text                                      AS category,
-                    'doc'::text                                     AS row_type,
-                    GREATEST(
-                        ts_rank_cd(dc.tsv, search_query.tsq_s, 34),
-                        ts_rank_cd(dc.tsv, search_query.tsq_e, 34)
-                    )                                               AS fts_score
-                FROM document_chunks dc
-                JOIN documents d ON d.id = dc.document_id
-                CROSS JOIN search_query
-                WHERE (dc.tsv @@ search_query.tsq_s OR dc.tsv @@ search_query.tsq_e)
-                  AND d.status = 'active'
-                  {prog_clause}
-                  {year_clause}
-            ),
-            faq_hits AS (
-                SELECT
-                    f.id::text                                      AS chunk_id,
-                    f.id::text                                      AS document_id,
-                    COALESCE('FAQ - ' || f.category, 'FAQ')        AS source,
-                    NULL::text                                      AS document_title,
-                    NULL::text                                      AS source_url,
-                    NULL::text                                      AS document_status,
-                    NULL::text                                      AS content_hash,
-                    NULL::timestamptz                               AS document_uploaded_at,
-                    f.question || CHR(10) || CHR(10) || f.answer   AS text,
-                    0                                               AS chunk_index,
-                    NULL::integer                                   AS page_number,
-                    f.metadata                                      AS metadata_json,
-                    f.category                                      AS category,
-                    'faq'::text                                     AS row_type,
-                    GREATEST(
-                        ts_rank_cd(f.fts_vector, search_query.tsq_s, 34),
-                        ts_rank_cd(f.fts_vector, search_query.tsq_e, 34)
-                    )                                               AS fts_score
-                FROM faqs f
-                CROSS JOIN search_query
-                WHERE f.is_active = true
-                  AND (f.fts_vector @@ search_query.tsq_s OR f.fts_vector @@ search_query.tsq_e)
+            WITH variants AS (
+                SELECT *
+                FROM jsonb_to_recordset(CAST(:variants AS jsonb)) AS v(
+                    variant_index integer,
+                    label text,
+                    query_text text,
+                    weight double precision,
+                    fetch_k integer
+                )
             )
-            SELECT * FROM (
-                SELECT * FROM doc_hits
-                UNION ALL
-                SELECT * FROM faq_hits
-            ) combined
-            ORDER BY fts_score DESC, chunk_id ASC
-            LIMIT :top_k
+            SELECT v.variant_index, v.label AS variant_label,
+                   v.query_text AS variant_query, v.weight AS variant_weight,
+                   hits.*
+            FROM variants v
+            CROSS JOIN LATERAL (
+                WITH search_query AS (
+                    SELECT websearch_to_tsquery('simple', v.query_text) AS tsq_s,
+                           websearch_to_tsquery('english', v.query_text) AS tsq_e
+                ),
+                doc_hits AS (
+                    SELECT dc.id::text AS chunk_id, d.id::text AS document_id,
+                           d.filename AS source, d.title AS document_title,
+                           d.source_url AS source_url, d.status AS document_status,
+                           d.content_hash AS content_hash,
+                           d.upload_date AS document_uploaded_at,
+                           dc.chunk_text AS text, dc.chunk_index AS chunk_index,
+                           dc.page_number AS page_number, dc.metadata AS metadata_json,
+                           NULL::text AS category, 'doc'::text AS row_type,
+                           GREATEST(
+                               ts_rank_cd(dc.tsv, search_query.tsq_s, 34),
+                               ts_rank_cd(dc.tsv, search_query.tsq_e, 34)
+                           ) AS fts_score
+                    FROM document_chunks dc
+                    JOIN documents d ON d.id = dc.document_id
+                    CROSS JOIN search_query
+                    WHERE (dc.tsv @@ search_query.tsq_s OR dc.tsv @@ search_query.tsq_e)
+                      AND d.status = 'active'
+                      AND d.quality_status <> 'review'
+                      {prog_clause}
+                      {year_clause}
+                ),
+                faq_hits AS (
+                    SELECT f.id::text AS chunk_id, f.id::text AS document_id,
+                           COALESCE('FAQ - ' || f.category, 'FAQ') AS source,
+                           NULL::text AS document_title, NULL::text AS source_url,
+                           NULL::text AS document_status, NULL::text AS content_hash,
+                           NULL::timestamptz AS document_uploaded_at,
+                           f.question || CHR(10) || CHR(10) || f.answer AS text,
+                           0 AS chunk_index, NULL::integer AS page_number,
+                           f.metadata AS metadata_json, f.category AS category,
+                           'faq'::text AS row_type,
+                           GREATEST(
+                               ts_rank_cd(f.fts_vector, search_query.tsq_s, 34),
+                               ts_rank_cd(f.fts_vector, search_query.tsq_e, 34)
+                           ) AS fts_score
+                    FROM faqs f
+                    CROSS JOIN search_query
+                    WHERE f.is_active = true
+                      AND (f.fts_vector @@ search_query.tsq_s OR f.fts_vector @@ search_query.tsq_e)
+                )
+                SELECT * FROM (
+                    SELECT * FROM doc_hits
+                    UNION ALL
+                    SELECT * FROM faq_hits
+                ) combined
+                ORDER BY fts_score DESC, chunk_id ASC
+                LIMIT v.fetch_k
+            ) hits
+            ORDER BY v.variant_index, hits.fts_score DESC, hits.chunk_id ASC
         """)
 
         try:
@@ -265,17 +286,15 @@ class SparseRetriever:
         except Exception as exc:
             self.db.rollback()
             logger.warning(
-                "SparseRetriever FTS query failed for %s query %r: %s",
-                variant.label,
-                variant.query,
+                "SparseRetriever set-based FTS query failed: %s",
                 exc,
             )
-            return []
+            return {}
 
-        results: list[SparseResult] = []
+        results: dict[str, list[SparseResult]] = {}
         for row in all_rows:
             raw_score = float(row.fts_score or 0.0)
-            adjusted_score = round(raw_score * variant.weight, 6)
+            adjusted_score = round(raw_score * float(row.variant_weight), 6)
             if row.row_type == "doc":
                 metadata = document_metadata(
                     row.metadata_json,
@@ -289,14 +308,12 @@ class SparseRetriever:
                     document_uploaded_at=row.document_uploaded_at,
                     extra={"fts_score_raw": round(raw_score, 6)},
                 )
-                results.append(
-                    SparseResult(
-                        chunk_id=str(row.chunk_id),
-                        document_id=str(row.document_id),
-                        fts_score=adjusted_score,
-                        text=row.text,
-                        metadata=metadata,
-                    )
+                result = SparseResult(
+                    chunk_id=str(row.chunk_id),
+                    document_id=str(row.document_id),
+                    fts_score=adjusted_score,
+                    text=row.text,
+                    metadata=metadata,
                 )
             else:
                 metadata = faq_metadata(
@@ -306,15 +323,14 @@ class SparseRetriever:
                     source=row.source,
                     extra={"fts_score_raw": round(raw_score, 6)},
                 )
-                results.append(
-                    SparseResult(
-                        chunk_id=str(row.chunk_id),
-                        document_id=str(row.document_id),
-                        fts_score=adjusted_score,
-                        text=row.text,
-                        metadata=metadata,
-                    )
+                result = SparseResult(
+                    chunk_id=str(row.chunk_id),
+                    document_id=str(row.document_id),
+                    fts_score=adjusted_score,
+                    text=row.text,
+                    metadata=metadata,
                 )
+            results.setdefault(str(row.variant_label), []).append(result)
 
         return results
 

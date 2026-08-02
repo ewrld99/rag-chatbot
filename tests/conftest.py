@@ -78,8 +78,8 @@ _ensure_test_database(_TEST_DATABASE_URL)
 
 from app.main import app
 from app.core.config import settings
-from app.db.session import engine, get_db
-from app.db.models import AuditLog, Base, FAQModel, SystemSetting
+from app.db.session import engine, get_db, get_session_factory
+from app.db.models import AuditLog, Base, FAQModel, FileOperation, SystemSetting
 
 # Setup database tables just in case
 Base.metadata.create_all(bind=engine)
@@ -88,6 +88,42 @@ with engine.begin() as connection:
         "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS "
         "turn_context JSONB NOT NULL DEFAULT '{}'::jsonb"
     ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "quality_status TEXT NOT NULL DEFAULT 'unchecked'"
+    ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "quality_report JSONB NOT NULL DEFAULT '{}'::jsonb"
+    ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "quality_checked_at TIMESTAMPTZ NULL"
+    ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "ingestion_version TEXT NOT NULL DEFAULT '1'"
+    ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "indexing_status TEXT NOT NULL DEFAULT 'idle'"
+    ))
+    connection.execute(text(
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+        "duplicate_of_document_id UUID NULL REFERENCES documents(id) ON DELETE SET NULL"
+    ))
+    connection.execute(text(
+        "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS "
+        "is_retrievable BOOLEAN NULL"
+    ))
+    connection.exec_driver_sql(
+        (PROJECT_ROOT / "app" / "db" / "migrations" / "016_chunk_retrievability.sql")
+        .read_text(encoding="utf-8")
+    )
+    connection.exec_driver_sql(
+        (PROJECT_ROOT / "app" / "db" / "migrations" / "017_storage_operations.sql")
+        .read_text(encoding="utf-8")
+    )
 
 
 @pytest.fixture(scope="function")
@@ -107,6 +143,7 @@ def db_session():
     )
 
     try:
+        session.query(FileOperation).delete(synchronize_session=False)
         session.query(AuditLog).delete(synchronize_session=False)
         session.query(FAQModel).delete(synchronize_session=False)
         session.query(SystemSetting).delete(synchronize_session=False)
@@ -142,7 +179,18 @@ def client(db_session):
         finally:
             request_session.close()
 
+    def request_session_factory():
+        return Session(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+
+    def override_get_session_factory():
+        return request_session_factory
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_session_factory] = override_get_session_factory
 
     test_client = TestClient(app)
     try:

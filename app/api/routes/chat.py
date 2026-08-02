@@ -1,8 +1,10 @@
 import json
 import logging
+from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, selectinload
+from starlette.concurrency import run_in_threadpool
 
 from app.api.limiter import RateLimiter
 from app.schemas.chat import ChatRequest, ChatResponse, MessageFeedbackRequest
@@ -11,14 +13,16 @@ from app.services.rag_pipeline import RAGPipeline
 from app.api.deps import (
     get_chat_history,
     get_optional_current_user,
+    get_optional_current_user_identity,
     get_rag_pipeline,
     get_user_role,
     get_user_profile,
     require_admin_user,
     require_requested_user,
+    CurrentUserIdentity,
 )
 from app.db.models import ChatMessage, ChatSession, User
-from app.db.session import get_db
+from app.db.session import SessionFactory, get_db, get_session_factory, session_scope
 from app.services.generation_resilience import GenerationUnavailableError
 from app.services.chat_persistence_service import (
     create_pending_user_turn,
@@ -35,6 +39,91 @@ from app.services.settings_service import SettingsService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _StreamPreparation:
+    user_profile: dict | None
+    chat_history: list[dict]
+    pending_user_message_id: int | None
+
+
+def _prepare_chat_stream(
+    body: ChatRequest,
+    guest_conversation: dict | None,
+    session_factory: SessionFactory,
+) -> _StreamPreparation:
+    with session_scope(session_factory) as db:
+        user_profile = get_user_profile(body.user_id, db)
+        chat_history = get_chat_history(
+            body.user_id,
+            body.session_id,
+            body.history,
+            db,
+            guest_conversation,
+        )
+        pending_id = None
+        if body.user_id is not None and body.session_id is not None:
+            pending = create_pending_user_turn(
+                db,
+                user_id=body.user_id,
+                session_id=body.session_id,
+                content=body.message,
+            )
+            if pending is None:
+                raise HTTPException(status_code=404, detail="Chat session not found")
+            pending_id = int(pending.id)
+        return _StreamPreparation(user_profile, chat_history, pending_id)
+
+
+def _persist_stream_routing(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    conversation: dict,
+) -> None:
+    with session_scope(session_factory) as db:
+        update_user_turn_routing(
+            db,
+            user_id=user_id,
+            message_id=message_id,
+            conversation=conversation,
+        )
+
+
+def _fail_stream_turn(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    conversation: dict,
+) -> None:
+    with session_scope(session_factory) as db:
+        mark_user_turn_failed(
+            db,
+            user_id=user_id,
+            message_id=message_id,
+            conversation=conversation,
+        )
+
+
+def _finalize_stream_turn(
+    session_factory: SessionFactory,
+    user_id: int,
+    message_id: int,
+    response: str,
+    sources: list,
+    conversation: dict,
+) -> int | None:
+    with session_scope(session_factory) as db:
+        message = finalize_chat_turn(
+            db,
+            user_id=user_id,
+            user_message_id=message_id,
+            assistant_message=response,
+            sources=sources,
+            conversation=conversation,
+        )
+        return int(message.id) if message is not None else None
 
 
 def _result_conversation(result: dict) -> dict:
@@ -154,7 +243,7 @@ def chat(
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
-    _: None = Depends(RateLimiter(limit=20, window=60)),
+    _: None = Depends(RateLimiter(limit=20, window=60, scope="chat")),
 ):
     """
     Chat endpoint for RAG system:
@@ -304,9 +393,9 @@ def chat(
 async def chat_stream(
     body: ChatRequest,
     rag_pipeline: RAGPipeline = Depends(get_rag_pipeline),
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_current_user),
-    _: None = Depends(RateLimiter(limit=20, window=60)),
+    current_user: CurrentUserIdentity | None = Depends(get_optional_current_user_identity),
+    session_factory: SessionFactory = Depends(get_session_factory),
+    _: None = Depends(RateLimiter(limit=20, window=60, scope="chat_stream")),
 ):
     """
     Server-Sent Events (SSE) streaming endpoint.
@@ -328,35 +417,21 @@ async def chat_stream(
         if current_user.id != body.user_id:
             raise HTTPException(status_code=403, detail="Cannot use another user's chat session")
 
-    # Fix #3: single call using the already-open request DB session
-    user_profile = get_user_profile(body.user_id, db)
     guest_conversation = (
         decode_guest_conversation_token(body.conversation_token)
         if body.user_id is None and body.session_id is None
         else None
     )
 
-    # This raises HTTP 403 for an unowned authenticated session. A true guest
-    # has no IDs and receives sanitized recent browser history instead.
-    chat_history = get_chat_history(
-        body.user_id,
-        body.session_id,
-        body.history,
-        db,
+    preparation = await run_in_threadpool(
+        _prepare_chat_stream,
+        body,
         guest_conversation,
+        session_factory,
     )
-
-    pending_user_message_id = None
-    if body.user_id is not None and body.session_id is not None:
-        pending = create_pending_user_turn(
-            db,
-            user_id=body.user_id,
-            session_id=body.session_id,
-            content=body.message,
-        )
-        if pending is None:
-            raise HTTPException(status_code=404, detail="Chat session not found")
-        pending_user_message_id = pending.id
+    user_profile = preparation.user_profile
+    chat_history = preparation.chat_history
+    pending_user_message_id = preparation.pending_user_message_id
 
     async def event_stream():
         full_response = ""
@@ -384,11 +459,12 @@ async def chat_stream(
                         routing_intent,
                     )
                     if body.user_id is not None and pending_user_message_id is not None:
-                        update_user_turn_routing(
-                            db,
-                            user_id=body.user_id,
-                            message_id=pending_user_message_id,
-                            conversation=response_conversation,
+                        await run_in_threadpool(
+                            _persist_stream_routing,
+                            session_factory,
+                            body.user_id,
+                            pending_user_message_id,
+                            response_conversation,
                         )
                     continue
                 if event["type"] == "sources":
@@ -430,11 +506,12 @@ async def chat_stream(
 
         except GenerationUnavailableError as exc:
             if body.user_id is not None and pending_user_message_id is not None:
-                mark_user_turn_failed(
-                    db,
-                    user_id=body.user_id,
-                    message_id=pending_user_message_id,
-                    conversation=response_conversation,
+                await run_in_threadpool(
+                    _fail_stream_turn,
+                    session_factory,
+                    body.user_id,
+                    pending_user_message_id,
+                    response_conversation,
                 )
             safe_sources = response_sources or exc.sources
             err_payload = json.dumps(
@@ -449,12 +526,12 @@ async def chat_stream(
         except Exception:
             logger.exception("Unexpected SSE stream failure")
             if body.user_id is not None and pending_user_message_id is not None:
-                db.rollback()
-                mark_user_turn_failed(
-                    db,
-                    user_id=body.user_id,
-                    message_id=pending_user_message_id,
-                    conversation=response_conversation,
+                await run_in_threadpool(
+                    _fail_stream_turn,
+                    session_factory,
+                    body.user_id,
+                    pending_user_message_id,
+                    response_conversation,
                 )
             err_payload = json.dumps(
                 {
@@ -471,19 +548,17 @@ async def chat_stream(
         # ── Persist to DB if caller supplied session context ──────────────────
         if body.user_id is not None and pending_user_message_id is not None and full_response:
             try:
-                asst_msg = finalize_chat_turn(
-                    db,
-                    user_id=body.user_id,
-                    user_message_id=pending_user_message_id,
-                    assistant_message=full_response,
-                    sources=response_sources,
-                    conversation=response_conversation,
+                assistant_message_id = await run_in_threadpool(
+                    _finalize_stream_turn,
+                    session_factory,
+                    body.user_id,
+                    pending_user_message_id,
+                    full_response,
+                    response_sources,
+                    response_conversation,
                 )
-                if asst_msg is not None:
-                    assistant_message_id = asst_msg.id
             except Exception as exc:
                 logger.warning("SSE: failed to persist chat exchange: %s", exc)
-                db.rollback()
 
         # ── Signal completion ─────────────────────────────────────────
         done_payload = json.dumps(

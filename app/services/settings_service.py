@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Any, List, Optional
 from sqlalchemy.orm import Session
 from app.db.models import SystemSetting, AuditLog
@@ -13,6 +14,23 @@ from app.services.model_catalog import (
 
 # Keys that require all documents to be reindexed when changed
 REINDEX_REQUIRED_KEYS = {"chunk_size", "chunk_overlap", "embedding_model"}
+
+
+@dataclass(frozen=True)
+class RuntimeSettingsSnapshot:
+    top_k_dense: int
+    top_k_sparse: int
+    top_k_final: int
+    rrf_k: int
+    enable_reranker: bool
+    adaptive_rerank_skip_high_confidence: bool
+    embedding_model: str
+    generation_default_model: str
+    generation_allowed_models: tuple[str, ...]
+    generation_answer_model_order: tuple[str, ...]
+    generation_utility_model_order: tuple[str, ...]
+    generation_user_selection_enabled: bool
+    similarity_metric: str = "cosine"
 
 DEFAULT_SETTINGS = [
     {"key": "chunk_size", "value": "1500", "description": "Size of each text chunk (characters)", "category": "rag"},
@@ -107,6 +125,17 @@ def seed_default_settings(db: Session):
         ):
             existing.value = setting_data["value"]
             continue
+        if setting_data["key"] == "generation_default_model":
+            existing_value = str(existing.value).strip()
+            if existing_value not in SUPPORTED_MODEL_IDS:
+                existing.value = setting_data["value"]
+            elif (
+                existing_value in _LEGACY_GENERATION_VALUES["generation_default_model"]
+                and existing_value != setting_data["value"]
+                and _has_legacy_answer_routing_defaults(db)
+            ):
+                existing.value = setting_data["value"]
+            continue
 
         if (
             setting_data["key"] in _LEGACY_GENERATION_VALUES
@@ -125,10 +154,6 @@ def seed_default_settings(db: Session):
             normalized = _utility_model_csv(str(existing.value), setting_data["value"])
             if normalized != str(existing.value).strip():
                 existing.value = normalized
-        elif setting_data["key"] == "generation_default_model" and str(existing.value).strip() not in SUPPORTED_MODEL_IDS:
-            # Only reset if the stored value is an unsupported model ID.
-            # Valid values (even non-default ones chosen by admin) are preserved.
-            existing.value = setting_data["value"]
     db.commit()
 
 
@@ -156,6 +181,18 @@ def _has_legacy_hosted_answer_defaults(db: Session) -> bool:
         and answer_order
         and str(allowed.value).strip() in legacy_values
         and str(answer_order.value).strip() in legacy_values
+    )
+
+
+def _has_legacy_answer_routing_defaults(db: Session) -> bool:
+    allowed = db.query(SystemSetting).filter_by(key="generation_allowed_models").first()
+    answer_order = db.query(SystemSetting).filter_by(key="generation_answer_model_order").first()
+    return (
+        (allowed is None or str(allowed.value).strip() in _LEGACY_GENERATION_VALUES["generation_allowed_models"])
+        and (
+            answer_order is None
+            or str(answer_order.value).strip() in _LEGACY_GENERATION_VALUES["generation_answer_model_order"]
+        )
     )
 
 
@@ -294,6 +331,33 @@ class SettingsService:
     def embedding_model(self) -> str:
         return self._str("embedding_model", env_settings.EMBEDDING_MODEL)
 
+    @property
+    def similarity_metric(self) -> str:
+        return self._str("similarity_metric", "cosine").strip().lower()
+
+    def runtime_snapshot(self) -> RuntimeSettingsSnapshot:
+        """Detach read-only runtime settings from the owning DB session."""
+        metric = self.similarity_metric
+        if metric != "cosine":
+            raise ValueError(
+                "Only cosine similarity is supported by the configured vector indexes."
+            )
+        return RuntimeSettingsSnapshot(
+            top_k_dense=self.top_k_dense,
+            top_k_sparse=self.top_k_sparse,
+            top_k_final=self.top_k_final,
+            rrf_k=self.rrf_k,
+            enable_reranker=self.enable_reranker,
+            adaptive_rerank_skip_high_confidence=self.adaptive_rerank_skip_high_confidence,
+            embedding_model=self.embedding_model,
+            generation_default_model=self.generation_default_model,
+            generation_allowed_models=tuple(self.generation_allowed_models),
+            generation_answer_model_order=tuple(self.generation_answer_model_order),
+            generation_utility_model_order=tuple(self.generation_utility_model_order),
+            generation_user_selection_enabled=self.generation_user_selection_enabled,
+            similarity_metric=metric,
+        )
+
     # ------------------------------------------------------------------
     # Typed properties - Generation
     # ------------------------------------------------------------------
@@ -425,6 +489,12 @@ class SettingsService:
             elif key == "embedding_model":
                 if not value:
                     raise ValueError("embedding_model cannot be empty")
+            elif key == "similarity_metric":
+                if value.strip().lower() != "cosine":
+                    raise ValueError(
+                        "similarity_metric must be cosine for the installed vector indexes"
+                    )
+                value = "cosine"
             elif key == "generation_default_model":
                 if value not in SUPPORTED_MODEL_IDS:
                     raise ValueError("generation_default_model is not supported")

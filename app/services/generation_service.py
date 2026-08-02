@@ -1116,11 +1116,14 @@ class GenerationService:
 
         if self._PROCEDURE_QUERY_RE.search(query):
             return (
-                "This is a procedure question. When supported by the documents, explain the "
-                "prerequisites, ordered actions, required documents or approvals, deadlines, "
-                "conditions, exceptions, and expected outcome. Do not reduce a documented procedure "
-                "to a generic summary. Prefer numbered steps. Keep each step close to the wording "
-                "in the evidence, and do not merge multiple requirements into one broad claim."
+                "This is a procedure question. Include only actions the user must perform as ordered "
+                "steps: preparation or evidence, submission channel, recipient or approving body, "
+                "deadline, and how approval is confirmed. A definition, eligibility rule, fee rule, "
+                "effect on studies, penalty, or consequence is not an application step. Omit those "
+                "unless one is essential to acting correctly, and then identify it explicitly as an "
+                "important condition rather than relabelling it as a step. If the documents specify "
+                "only one action, say so instead of inventing a multi-step process. Keep every action "
+                "close to the wording in the evidence."
             )
         if self._CURRICULUM_LIST_QUERY_RE.search(query):
             return (
@@ -1404,6 +1407,7 @@ QUESTION:
 
         draft = self.grounding.reconcile_stub_answer(draft)
         draft = self.grounding.reconcile_claim_answer_alignment(draft)
+        draft = self.grounding.reconcile_evidence_ids(draft, evidence)
         if ordered_answer:
             draft = self.grounding.render_claim_answer(draft, ordered=True)
         reasons: List[str] = []
@@ -1573,12 +1577,12 @@ QUESTION:
                 repaired=False,
             )
 
-        # Procedure and policy-list queries synthesize information across multiple
-        # chunks. Preserve supported units on the first pass so one rejected claim
-        # does not discard the rest of a useful multi-item answer.
+        # Preserve structurally valid units on the first pass so an extra uncited
+        # claim does not discard the rest of an otherwise grounded answer. The
+        # semantic verifier still decides which valid units reach the user.
         is_procedure = self._is_procedure_query(query)
         is_enumeration = self._is_enumeration_query(query)
-        initial_allow_partial = is_procedure or is_enumeration
+        initial_allow_partial = True
 
         initial_raw = self._document_completion(
             query,
@@ -1667,8 +1671,10 @@ QUESTION:
             "collapse a multi-step answer into a short summary. Split compound claims into "
             "atomic supported units when necessary. Do not add an answer field. "
             "For procedure questions, rebuild the answer as evidence-close numbered steps "
-            "and include supported prerequisites, required approvals, deadlines, conditions, "
-            "exceptions, and outcomes instead of keeping only one surviving sentence. "
+            "containing only actions the user must perform, including supported preparation, "
+            "submission, deadlines, and approval confirmation. Do not turn definitions, fee rules, "
+            "effects, penalties, or consequences into steps. Include a non-action rule only when it "
+            "is essential to acting correctly, and label it as an important condition. "
             "For policy or rule-list questions, rebuild the requested list from the allowed "
             "evidence and keep each supported item as a separate atomic claim instead of "
             "returning only the generic parent rule. "
@@ -1796,7 +1802,9 @@ QUESTION:
             "For every indexed claim, decide whether the claim materially answers that question "
             "and whether its cited evidence directly supports the complete claim. A statement can "
             "be true and supported yet still be irrelevant to the question; mark that "
-            "NOT_ENOUGH_INFORMATION. Use SUPPORTED only when the claim is responsive and all "
+            "NOT_ENOUGH_INFORMATION. For a procedure question, a definition, fee rule, penalty, "
+            "study effect, or consequence must not be accepted as an application step. Use SUPPORTED "
+            "only when the claim is responsive and all "
             "material details, qualifiers, identities, roles, numbers, dates, and conditions are "
             "present in evidence. Distinguish similarly named roles such as Chancellor, Vice "
             "Chancellor, and Deputy Vice Chancellor. Use CONTRADICTED when evidence conflicts. "
@@ -2219,7 +2227,7 @@ QUESTION:
         # does not discard the rest of a useful multi-item answer.
         is_procedure = self._is_procedure_query(query)
         is_enumeration = self._is_enumeration_query(query)
-        initial_allow_partial = is_procedure or is_enumeration
+        initial_allow_partial = True
 
         initial_raw = await self._document_completion_async(
             query,

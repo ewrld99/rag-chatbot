@@ -26,8 +26,9 @@ const RefreshIcon = () => (
 
 // ─── Setting metadata ──────────────────────────────────────────────────────────
 const GENERATION_MODELS = [
-    "qwen3.5:4b",
+    "llama3.2:3b",
     "gemma3:4b",
+    "qwen3.5:4b",
     "gemini-3.6-flash",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",

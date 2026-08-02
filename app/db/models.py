@@ -68,21 +68,64 @@ class DocumentModel(Base):
     source_url = Column(Text, nullable=True, unique=True, index=True)
     content_hash = Column(Text, nullable=True)
     last_crawled_at = Column(DateTime(timezone=True), nullable=True)
+    quality_status = Column(Text, nullable=False, default="unchecked", server_default=text("'unchecked'"), index=True)
+    quality_report = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    quality_checked_at = Column(DateTime(timezone=True), nullable=True)
+    ingestion_version = Column(Text, nullable=False, default="1", server_default=text("'1'"))
+    indexing_status = Column(Text, nullable=False, default="idle", server_default=text("'idle'"), index=True)
+    duplicate_of_document_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    storage_state = Column(
+        Text,
+        nullable=False,
+        default="not_applicable",
+        server_default=text("'not_applicable'"),
+    )
+    storage_error = Column(Text, nullable=True)
 
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+
+
+class FileOperation(Base):
+    __tablename__ = "file_operations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    document_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    operation = Column(Text, nullable=False)
+    source_path = Column(Text, nullable=False)
+    target_path = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, default="pending", server_default=text("'pending'"))
+    attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
 
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, index=True, server_default=text("gen_random_uuid()"))
-    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     chunk_index = Column(Integer, nullable=False)
     chunk_text = Column(Text, nullable=False)
     embedding = Column(Vector(settings.EMBEDDING_DIMENSION), nullable=False)
     tsv = Column(TSVECTOR, nullable=True)
     page_number = Column(Integer, nullable=True)
     metadata_ = Column("metadata", JSONB, nullable=True)  # Using metadata_ to avoid conflict with SQLAlchemy Base.metadata
+    is_retrievable = Column(Boolean, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     document = relationship("DocumentModel", back_populates="chunks")
@@ -127,7 +170,7 @@ class AuditLog(Base):
 class FAQModel(Base):
     __tablename__ = "faqs"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, index=True, server_default=text("gen_random_uuid()"))
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     question = Column(Text, nullable=False)
     answer = Column(Text, nullable=False)
     category = Column(Text, nullable=True)

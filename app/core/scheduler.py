@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.core.config import settings
@@ -11,21 +12,17 @@ scheduler = AsyncIOScheduler()
 async def run_full_crawler(reset: bool = True):
     mode = "fresh" if reset else "resume"
     logger.info("Starting Full Weekly Crawler (%s)...", mode)
-    db = SessionLocal()
     try:
-        svc = CrawlerService(db)
+        svc = await asyncio.to_thread(_create_crawler_service)
         await svc.run_crawler(["https://www.udom.ac.tz/"], max_pages=5000, job_type="full", reset=reset)
     except Exception as e:
         logger.error(f"Full Crawler failed: {e}")
-    finally:
-        db.close()
     logger.info("Full Weekly Crawler finished.")
 
 async def run_announcement_crawler():
     logger.info("Starting Hourly Announcement Crawler...")
-    db = SessionLocal()
     try:
-        svc = CrawlerService(db)
+        svc = await asyncio.to_thread(_create_crawler_service)
         start_urls = [
             "https://www.udom.ac.tz/announcements",
             "https://www.udom.ac.tz/blog/index",
@@ -34,9 +31,12 @@ async def run_announcement_crawler():
         await svc.run_crawler(start_urls, max_pages=30, job_type="announcements")
     except Exception as e:
         logger.error(f"Announcement Crawler failed: {e}")
-    finally:
-        db.close()
     logger.info("Hourly Announcement Crawler finished.")
+
+
+def _create_crawler_service() -> CrawlerService:
+    with SessionLocal() as db:
+        return CrawlerService(db)
 
 def start_scheduler():
     if not settings.CRAWLER_ENABLED:

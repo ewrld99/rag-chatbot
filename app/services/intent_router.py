@@ -10,6 +10,12 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
+from app.db.session import (
+    SessionFactory,
+    SessionLocal,
+    session_factory_from_session,
+    session_scope,
+)
 from app.services.alias_expansion_service import AliasExpansionService
 from app.services.conversation_context import ConversationContextResolver, ConversationDecision
 from app.services.conversation_service import conversational_kind
@@ -39,7 +45,8 @@ STUDENT_SUPPORT:
 The user is asking for general guidance relevant to university
 students, such as studying, revision, concentration, time management,
 academic stress, note-taking, assignments, motivation, or university
-life. The answer does not require official UDOM documents.
+life. The user wants advice or coaching, and the answer does not require
+an authoritative rule or institution-specific fact.
 
 UDOM_DOCUMENT_SEARCH:
 The user is asking for official, factual, or institution-specific
@@ -70,11 +77,23 @@ Rules:
    "that regulation", "what about IDIT students", and "the second programme".
 7. Choose CLARIFY only when missing information prevents correct routing.
 8. When generating the standalone_query, explicitly correct any spelling mistakes or typos (e.g., fix "udmo" to "UDOM").
-9. Return only valid JSON. Keep reason under 12 words.
+9. First decide whether a reliable answer requires authoritative evidence. Questions about rules, causes for institutional action, eligibility, deadlines, fees, sanctions, consequences, required steps, or what the University permits require official evidence even when they mention assignments, studying, stress, or other student-support topics.
+10. STUDENT_SUPPORT is only for advice or coaching that remains useful without consulting an official UDOM source.
+11. When uncertain between STUDENT_SUPPORT and UDOM_DOCUMENT_SEARCH, set requires_official_evidence to true and choose UDOM_DOCUMENT_SEARCH.
+12. Return only valid JSON. Keep reason under 12 words.
+
+Contrastive examples:
+- "How can I submit assignments on time?" -> STUDENT_SUPPORT, requires_official_evidence=false
+- "Can a missed assignment cause discontinuation?" -> UDOM_DOCUMENT_SEARCH, requires_official_evidence=true
+- "How can I manage examination stress?" -> STUDENT_SUPPORT, requires_official_evidence=false
+- "What happens if I miss an examination?" -> UDOM_DOCUMENT_SEARCH, requires_official_evidence=true
+- "Help me improve my study schedule" -> STUDENT_SUPPORT, requires_official_evidence=false
+- "How long does student status continue after graduation?" -> UDOM_DOCUMENT_SEARCH, requires_official_evidence=true
 
 Output:
 {
   "intent": "CONVERSATIONAL | STUDENT_SUPPORT | UDOM_DOCUMENT_SEARCH | CLARIFY | OUT_OF_SCOPE",
+  "requires_official_evidence": true,
   "confidence": 0.0,
   "reason": "Brief reason under 12 words",
   "standalone_query": "Resolved standalone query or null"
@@ -137,6 +156,25 @@ class IntentRouter:
         r")\s*[?.!]*\s*$",
         re.IGNORECASE,
     )
+    _OFFICIAL_EVIDENCE_REQUEST_RE = re.compile(
+        r"\b(?:according\s+to|official|polic(?:y|ies)|regulat\w*|rules?|"
+        r"requir\w*|eligib\w*|permit\w*|prohibit\w*|deadlines?|fees?|"
+        r"appeals?|penalt\w*|sanction\w*|consequences?|"
+        r"discontinu\w*|suspend\w*|expel\w*|deregister\w*|debar\w*)\b",
+        re.IGNORECASE,
+    )
+    _FACTUAL_QUESTION_RE = re.compile(
+        r"^\s*(?:(?:what|when|where|who|which|whose)\b|"
+        r"(?:is|are|was|were|can|could|does|do|did|will|would|should)\b|"
+        r"how\s+(?:long|much|many|often)\b)",
+        re.IGNORECASE,
+    )
+    _ADVICE_REQUEST_RE = re.compile(
+        r"\b(?:advice|tips?|coach\w*|motivat\w*|study\s+better|"
+        r"improve\s+my|manage\s+my|cope\s+with|help\s+me|"
+        r"plan\s+my|organize\s+my|concentrate\s+better)\b",
+        re.IGNORECASE,
+    )
 
     UDOM_TERMS = {
         "udom", "dodoma", "university of dodoma", "admission", "admissions",
@@ -192,8 +230,16 @@ class IntentRouter:
         "same", "previous", "above", "earlier", "second", "first", "one", "ones",
     }
 
-    def __init__(self, db: Session, generator: Any | None = None) -> None:
-        self.db = db
+    def __init__(
+        self,
+        db: Session | None = None,
+        generator: Any | None = None,
+        *,
+        session_factory: SessionFactory | None = None,
+    ) -> None:
+        self._session_factory = session_factory or (
+            session_factory_from_session(db) if db is not None else SessionLocal
+        )
         self.generator = generator
         self.context_resolver = ConversationContextResolver(generator)
 
@@ -440,6 +486,40 @@ class IntentRouter:
     ) -> IntentDecision:
         return self.classify(query, chat_history=chat_history, user_profile=user_profile)
 
+    def should_probe_documents(
+        self,
+        query: str,
+        decision: IntentDecision,
+    ) -> bool:
+        """Return whether a support answer needs retrieval-based arbitration."""
+        if decision.intent != "STUDENT_SUPPORT":
+            return False
+        if self._requires_official_evidence(query):
+            return True
+        if self._ADVICE_REQUEST_RE.search(query):
+            return False
+        return bool(self._FACTUAL_QUESTION_RE.search(query))
+
+    def promote_to_document_search(
+        self,
+        decision: IntentDecision,
+        query: str,
+        confidence: float,
+    ) -> IntentDecision:
+        """Promote an uncertain route after strong official-document retrieval."""
+        promoted = self._decision(
+            "UDOM_DOCUMENT_SEARCH",
+            max(decision.confidence, confidence),
+            "Strong UDOM retrieval evidence overrode the general-support route.",
+            decision.standalone_query or clean_query_text(query),
+            decision.normalized_query,
+            f"{decision.source}+retrieval_guardrail",
+            decision.filters,
+        )
+        if decision.conversation is None:
+            return promoted
+        return self._attach_conversation(promoted, decision.conversation)
+
     def _rule_document_search_decision(
         self,
         query: str,
@@ -451,7 +531,11 @@ class IntentRouter:
         terms = self._expanded_terms(query, aliases)
         if self._has_reference_without_anchor(terms, bool(chat_history)):
             return None
-        if not self._requires_document_search(terms, aliases):
+        explicit_evidence_request = self._requires_official_evidence(query)
+        topic_document_match = self._requires_document_search(terms, aliases)
+        if self._ADVICE_REQUEST_RE.search(query) and not explicit_evidence_request:
+            topic_document_match = False
+        if not (explicit_evidence_request or topic_document_match):
             return None
         return self._decision(
             "UDOM_DOCUMENT_SEARCH",
@@ -530,6 +614,11 @@ class IntentRouter:
         user_profile: dict[str, Any] | None,
     ) -> IntentDecision:
         intent = self._normalize_intent(payload.get("intent"))
+        requires_official_evidence = self._optional_bool(
+            payload.get("requires_official_evidence")
+        )
+        if requires_official_evidence is True and intent == "STUDENT_SUPPORT":
+            intent = "UDOM_DOCUMENT_SEARCH"
         confidence = self._safe_confidence(payload.get("confidence"), default=0.55)
         reason = clean_query_text(str(payload.get("reason") or "LLM intent classifier decision."))
         standalone_query = self._normalize_standalone_query(payload.get("standalone_query"))
@@ -594,7 +683,13 @@ class IntentRouter:
                 decision.normalized_query,
                 f"{decision.source}+guardrail",
             )
-        if decision.intent in {"CONVERSATIONAL", "STUDENT_SUPPORT"} and self._requires_document_search(terms, aliases):
+        explicit_evidence_request = self._requires_official_evidence(query)
+        topic_document_match = self._requires_document_search(terms, aliases)
+        if self._ADVICE_REQUEST_RE.search(query) and not explicit_evidence_request:
+            topic_document_match = False
+        if decision.intent in {"CONVERSATIONAL", "STUDENT_SUPPORT"} and (
+            explicit_evidence_request or topic_document_match
+        ):
             return self._decision(
                 "UDOM_DOCUMENT_SEARCH",
                 max(decision.confidence, 0.78),
@@ -650,7 +745,8 @@ class IntentRouter:
 
     def _matched_aliases(self, query: str) -> dict[str, list[str]]:
         try:
-            return AliasExpansionService(self.db).get_expansions(query)
+            with session_scope(self._session_factory) as db:
+                return AliasExpansionService(db).get_expansions(query)
         except Exception as exc:
             logger.warning("Could not load retrieval aliases for intent classifier: %s", exc)
             return {}
@@ -675,6 +771,9 @@ class IntentRouter:
         if terms & {"gpa", "cgpa", "sr", "sr2", "oas", "tcu", "nactvet"}:
             return True
         return bool((terms & self.UDOM_TERMS) and (terms & self.OFFICIAL_DOCUMENT_TERMS))
+
+    def _requires_official_evidence(self, query: str) -> bool:
+        return bool(self._OFFICIAL_EVIDENCE_REQUEST_RE.search(query or ""))
 
     def _has_student_support_signal(self, terms: set[str]) -> bool:
         return bool(terms & self.STUDENT_SUPPORT_TERMS)
@@ -804,3 +903,14 @@ class IntentRouter:
             return max(0.0, min(1.0, float(value)))
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _optional_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+        return None

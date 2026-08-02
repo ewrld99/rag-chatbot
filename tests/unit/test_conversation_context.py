@@ -85,7 +85,12 @@ def test_complete_question_starts_a_new_topic():
 
 
 def test_correction_and_comparison_keep_the_active_topic():
-    resolver = ConversationContextResolver()
+    class RewritingGenerator:
+        def rewrite_query(self, query, _chat_history):
+            assert query == "What about postgraduate students?"
+            return "Who is the chancellor for postgraduate students?"
+
+    resolver = ConversationContextResolver(RewritingGenerator())
 
     correction = resolver.resolve("I meant semester two", _document_history())
     comparison = resolver.resolve("What about postgraduate students?", _document_history())
@@ -94,6 +99,42 @@ def test_correction_and_comparison_keep_the_active_topic():
     assert correction.topic_id == "topic-chancellor"
     assert comparison.relation == "comparison"
     assert comparison.topic_id == "topic-chancellor"
+    assert comparison.standalone_query == "Who is the chancellor for postgraduate students?"
+
+
+def test_what_about_follow_up_rewrites_the_previous_question_target():
+    class RewritingGenerator:
+        def rewrite_query(self, query, chat_history):
+            assert query == "what about discontinuation"
+            assert chat_history[-2]["content"] == "Who is the chancellor of UDOM?"
+            return "What is the fee for appealing a discontinuation decision?"
+
+    decision = ConversationContextResolver(RewritingGenerator()).resolve(
+        "what about discontinuation",
+        _document_history(),
+    )
+
+    assert decision.relation == "comparison"
+    assert decision.is_follow_up is True
+    assert decision.source == "model"
+    assert decision.standalone_query == (
+        "What is the fee for appealing a discontinuation decision?"
+    )
+
+
+def test_unrewritten_what_about_follow_up_is_marked_ambiguous():
+    class EchoingGenerator:
+        def rewrite_query(self, query, _chat_history):
+            return query
+
+    decision = ConversationContextResolver(EchoingGenerator()).resolve(
+        "what about discontinuation",
+        _document_history(),
+    )
+
+    assert decision.relation == "ambiguous"
+    assert decision.is_follow_up is None
+    assert decision.standalone_query is None
 
 
 def test_follow_up_chain_uses_the_latest_canonical_query():

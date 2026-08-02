@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { deleteDocument, getDocuments, getDocument, updateDocument, deleteDocumentsBatch, reindexDocument } from "../../api/documentApi";
+import {
+    approveDocumentQuality,
+    auditDocumentQuality,
+    deleteDocument,
+    deleteDocumentsBatch,
+    getDocument,
+    getDocumentQuality,
+    getDocuments,
+    reindexDocument,
+    updateDocument,
+} from "../../api/documentApi";
 import { reindexAll } from "../../api/settingsApi";
 
 const emptyForm = { content: "", filename: "" };
@@ -67,6 +77,16 @@ const STATUS_CONFIG = {
     needs_reindex:  { label: "Needs Reindex", bg: "#fff8e1", color: "#856404", border: "#f5d878" },
     processing:     { label: "Processing",    bg: "#e3f2fd", color: "#1565c0", border: "#90caf9" },
     failed:         { label: "Failed",        bg: "#ffebee", color: "#c62828", border: "#ef9a9a" },
+    embedding_failed: { label: "Embedding Failed", bg: "#ffebee", color: "#c62828", border: "#ef9a9a" },
+    quality_review: { label: "Quality Review", bg: "#fff3e0", color: "#9a4d00", border: "#ffcc80" },
+};
+
+const QUALITY_CONFIG = {
+    passed: { label: "Quality Passed", bg: "#e8f5e9", color: "#2e7d32", border: "#a5d6a7" },
+    warning: { label: "Quality Warning", bg: "#fff8e1", color: "#856404", border: "#f5d878" },
+    review: { label: "Review Required", bg: "#ffebee", color: "#c62828", border: "#ef9a9a" },
+    overridden: { label: "Admin Approved", bg: "#e3f2fd", color: "#1565c0", border: "#90caf9" },
+    unchecked: { label: "Not Audited", bg: "#f2f2f2", color: "#5f6368", border: "#d6d6d6" },
 };
 
 function StatusBadge({ status }) {
@@ -124,6 +144,9 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
     const [isReindexing, setIsReindexing] = useState(false);
     const [focused, setFocused] = useState(null);
     const [selectedIds, setSelectedIds] = useState(new Set());
+    const [qualityView, setQualityView] = useState(null);
+    const [qualityLoading, setQualityLoading] = useState(false);
+    const [approvalReason, setApprovalReason] = useState("");
 
     const toggleSelection = (id) => {
         const newSet = new Set(selectedIds);
@@ -224,7 +247,7 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
 
     // Poll gently while any document is still processing.
     useEffect(() => {
-        const hasProcessing = documents.some((d) => d.status === "processing");
+        const hasProcessing = documents.some((d) => d.indexing_status === "processing");
         if (!hasProcessing) return undefined;
         const timer = window.setTimeout(() => {
             loadDocuments({ clearStatus: false });
@@ -334,8 +357,62 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
         }
     };
 
+    const handleQualityView = async (doc) => {
+        setQualityLoading(true);
+        setApprovalReason("");
+        try {
+            const quality = await getDocumentQuality(doc.id);
+            setQualityView({ document: doc, quality });
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setQualityLoading(false);
+        }
+    };
+
+    const handleAudit = async (ids = []) => {
+        setQualityLoading(true);
+        try {
+            const result = await auditDocumentQuality(ids);
+            setStatus(`Audited ${result.audited} document(s).`);
+            setStatusType("success");
+            await loadDocuments({ clearStatus: false });
+            if (qualityView?.document?.id && (!ids.length || ids.includes(qualityView.document.id))) {
+                const quality = await getDocumentQuality(qualityView.document.id);
+                setQualityView((current) => ({ ...current, quality }));
+            }
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setQualityLoading(false);
+        }
+    };
+
+    const handleApproveQuality = async () => {
+        if (!qualityView?.document?.id || approvalReason.trim().length < 3) return;
+        setQualityLoading(true);
+        try {
+            const quality = await approveDocumentQuality(
+                qualityView.document.id,
+                approvalReason.trim(),
+            );
+            setQualityView((current) => ({ ...current, quality }));
+            setApprovalReason("");
+            setStatus("Document quality override recorded.");
+            setStatusType("success");
+            await loadDocuments({ clearStatus: false });
+        } catch (error) {
+            setStatus(error.message);
+            setStatusType("error");
+        } finally {
+            setQualityLoading(false);
+        }
+    };
+
     const hasNeedsReindex = documents.some((d) => d.status === "needs_reindex");
-    const isProcessing = documents.some((d) => d.status === "processing");
+    const isProcessing = documents.some((d) => d.indexing_status === "processing");
     const goToPage = (nextPage) => {
         const normalized = Number(nextPage);
         if (!Number.isFinite(normalized)) return;
@@ -376,6 +453,18 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                             Delete ({selectedIds.size})
                         </button>
                     )}
+                    <button
+                        type="button"
+                        style={{
+                            ...styles.ghostBtn,
+                            ...(qualityLoading ? styles.disabledBtn : {}),
+                        }}
+                        onClick={() => handleAudit(selectedIds.size ? Array.from(selectedIds) : [])}
+                        disabled={qualityLoading}
+                    >
+                        <CheckIcon />
+                        {selectedIds.size ? `Audit (${selectedIds.size})` : "Audit All"}
+                    </button>
                     <button
                         type="button"
                         style={{
@@ -495,6 +584,131 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                 </div>
             )}
 
+            {qualityView && (
+                <section style={styles.qualityPanel} aria-label="Document quality report">
+                    <div style={styles.editPanelHeader}>
+                        <div style={styles.editHeaderText}>
+                            <span style={styles.eyebrow}>Quality Report</span>
+                            <h3 style={styles.editTitle}>
+                                {qualityView.document.title || qualityView.document.filename}
+                            </h3>
+                        </div>
+                        <button
+                            type="button"
+                            style={styles.closeBtn}
+                            onClick={() => setQualityView(null)}
+                            aria-label="Close quality report"
+                        >
+                            <XIcon />
+                        </button>
+                    </div>
+
+                    <div style={styles.qualityBadges}>
+                        <StatusBadge status={qualityView.quality.lifecycle_status} />
+                        <QualityBadge status={qualityView.quality.quality_status} />
+                        {qualityView.quality.indexing_status !== "idle" && (
+                            <StatusBadge status={qualityView.quality.indexing_status} />
+                        )}
+                    </div>
+
+                    <div style={styles.qualityMetrics}>
+                        {Object.entries(qualityView.quality.report?.metrics || {})
+                            .filter(([key]) => [
+                                "page_count",
+                                "chunk_count",
+                                "removed_duplicate_chunks",
+                                "ocr_required_ratio",
+                                "page_provenance_ratio",
+                                "source_token_coverage_ratio",
+                                "chunk_length_avg",
+                            ].includes(key))
+                            .map(([key, value]) => (
+                                <div key={key} style={styles.qualityMetric}>
+                                    <span style={styles.qualityMetricLabel}>{key.replaceAll("_", " ")}</span>
+                                    <strong style={styles.qualityMetricValue}>{String(value)}</strong>
+                                </div>
+                            ))}
+                    </div>
+
+                    {(qualityView.quality.report?.issues || []).length > 0 && (
+                        <div style={styles.qualityIssues}>
+                            {qualityView.quality.report.issues.map((issue, index) => (
+                                <div key={`${issue.code}-${index}`} style={styles.qualityIssue}>
+                                    <AlertIcon />
+                                    <div>
+                                        <strong>{issue.code.replaceAll("_", " ")}</strong>
+                                        <p style={styles.qualityIssueText}>{issue.message}</p>
+                                        {issue.page_number && (
+                                            <span style={styles.qualityIssueMeta}>Page {issue.page_number}</span>
+                                        )}
+                                        {issue.sample && (
+                                            <span style={styles.qualityIssueMeta}>{issue.sample}</span>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {(qualityView.quality.report?.samples?.first_chunk || qualityView.quality.report?.samples?.last_chunk) && (
+                        <div style={styles.qualitySamples}>
+                            <pre style={styles.qualitySample}>
+                                {qualityView.quality.report.samples.first_chunk}
+                            </pre>
+                            {qualityView.quality.report.samples.last_chunk !== qualityView.quality.report.samples.first_chunk && (
+                                <pre style={styles.qualitySample}>
+                                    {qualityView.quality.report.samples.last_chunk}
+                                </pre>
+                            )}
+                        </div>
+                    )}
+
+                    {qualityView.quality.quality_status === "review" && (
+                        <div style={styles.approvalRow}>
+                            <input
+                                value={approvalReason}
+                                onChange={(event) => setApprovalReason(event.target.value)}
+                                placeholder="Approval reason"
+                                maxLength={500}
+                                style={styles.input}
+                            />
+                            <button
+                                type="button"
+                                style={{
+                                    ...styles.primaryBtn,
+                                    ...(approvalReason.trim().length < 3 || qualityLoading ? styles.disabledBtn : {}),
+                                }}
+                                onClick={handleApproveQuality}
+                                disabled={approvalReason.trim().length < 3 || qualityLoading}
+                            >
+                                <CheckIcon />
+                                Approve
+                            </button>
+                        </div>
+                    )}
+
+                    <div style={styles.formActions}>
+                        <button
+                            type="button"
+                            style={{ ...styles.ghostBtn, ...(qualityLoading ? styles.disabledBtn : {}) }}
+                            onClick={() => handleAudit([qualityView.document.id])}
+                            disabled={qualityLoading}
+                        >
+                            <RefreshIcon />
+                            Audit Again
+                        </button>
+                        <button
+                            type="button"
+                            style={styles.ghostBtn}
+                            onClick={() => handleReindexSingle(qualityView.document)}
+                        >
+                            <ReindexIcon />
+                            Reindex
+                        </button>
+                    </div>
+                </section>
+            )}
+
             {/* Status */}
             {status && (
                 <div style={{
@@ -552,10 +766,24 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                                         {doc.chunk_count ?? 1} parts
                                     </span>
                                     <StatusBadge status={doc.status || "active"} />
+                                    <QualityBadge status={doc.quality_status || "unchecked"} />
                                 </div>
                                 <p style={{ ...styles.docRowPreview, ...(isNarrow ? styles.docRowPreviewNarrow : {}) }}>{doc.content}</p>
                             </div>
                             <div style={{ ...styles.docRowActions, ...(isNarrow ? styles.docRowActionsNarrow : {}) }}>
+                                <button
+                                    type="button"
+                                    style={{
+                                        ...styles.ghostBtn,
+                                        ...(isNarrow ? styles.editBtnNarrow : {}),
+                                        padding: "6px 10px",
+                                        fontSize: "12px",
+                                    }}
+                                    onClick={() => handleQualityView(doc)}
+                                >
+                                    <AlertIcon />
+                                    Quality
+                                </button>
                                 <button
                                     type="button"
                                     style={{ 
@@ -563,13 +791,13 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                                         ...(isNarrow ? styles.editBtnNarrow : {}), 
                                         padding: "6px 10px", 
                                         fontSize: "12px",
-                                        ...(doc.status === "processing" ? styles.disabledBtn : {})
+                                        ...(doc.indexing_status === "processing" ? styles.disabledBtn : {})
                                     }}
                                     onClick={() => handleReindexSingle(doc)}
-                                    disabled={doc.status === "processing"}
+                                    disabled={doc.indexing_status === "processing"}
                                 >
                                     <ReindexIcon />
-                                    {doc.status === "processing" ? "Reindexing…" : "Reindex"}
+                                    {doc.indexing_status === "processing" ? "Reindexing..." : "Reindex"}
                                 </button>
                                 <button
                                     type="button"
@@ -670,6 +898,24 @@ export default function DocumentManager({ refreshKey = 0, onChanged }) {
                 </form>
             </div>
         </section>
+    );
+}
+
+function QualityBadge({ status }) {
+    const cfg = QUALITY_CONFIG[status] || QUALITY_CONFIG.unchecked;
+    return (
+        <span style={{
+            fontSize: "11px",
+            fontWeight: "700",
+            padding: "2px 8px",
+            borderRadius: "8px",
+            background: cfg.bg,
+            color: cfg.color,
+            border: `1px solid ${cfg.border}`,
+            whiteSpace: "nowrap",
+        }}>
+            {cfg.label}
+        </span>
     );
 }
 
@@ -952,6 +1198,107 @@ const styles = {
     },
     formActions: { display: "flex", gap: "10px", flexWrap: "wrap" },
     formActionsNarrow: { flexDirection: "column" },
+    qualityPanel: {
+        minWidth: 0,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+        background: "var(--app-surface)",
+        border: "1px solid var(--app-border-strong)",
+        borderRadius: "8px",
+        padding: "20px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "16px",
+    },
+    qualityBadges: {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        flexWrap: "wrap",
+    },
+    qualityMetrics: {
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(132px, 1fr))",
+        gap: "1px",
+        overflow: "hidden",
+        border: "1px solid var(--app-border)",
+        borderRadius: "8px",
+        background: "var(--app-border)",
+    },
+    qualityMetric: {
+        minWidth: 0,
+        padding: "12px",
+        background: "var(--app-bg)",
+        display: "flex",
+        flexDirection: "column",
+        gap: "4px",
+    },
+    qualityMetricLabel: {
+        color: "var(--app-muted)",
+        fontSize: "11px",
+        fontWeight: "600",
+        textTransform: "capitalize",
+        overflowWrap: "anywhere",
+    },
+    qualityMetricValue: {
+        color: "var(--app-text)",
+        fontSize: "17px",
+    },
+    qualityIssues: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+    },
+    qualityIssue: {
+        display: "flex",
+        alignItems: "flex-start",
+        gap: "10px",
+        padding: "11px 12px",
+        border: "1px solid #f5d878",
+        borderRadius: "8px",
+        background: "#fff8e1",
+        color: "#6f5600",
+        minWidth: 0,
+    },
+    qualityIssueText: {
+        margin: "3px 0 0",
+        color: "#625c4d",
+        fontSize: "12px",
+        lineHeight: 1.45,
+        overflowWrap: "anywhere",
+    },
+    qualityIssueMeta: {
+        display: "block",
+        marginTop: "4px",
+        color: "#756d5d",
+        fontSize: "11px",
+        overflowWrap: "anywhere",
+    },
+    qualitySamples: {
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(min(280px, 100%), 1fr))",
+        gap: "10px",
+    },
+    qualitySample: {
+        maxHeight: "180px",
+        margin: 0,
+        padding: "12px",
+        overflow: "auto",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+        border: "1px solid var(--app-border)",
+        borderRadius: "8px",
+        background: "var(--app-bg)",
+        color: "var(--app-text)",
+        fontSize: "11px",
+        lineHeight: 1.5,
+    },
+    approvalRow: {
+        display: "grid",
+        gridTemplateColumns: "minmax(0, 1fr) auto",
+        gap: "10px",
+        alignItems: "center",
+    },
     statusBox: {
         display: "flex",
         alignItems: "center",

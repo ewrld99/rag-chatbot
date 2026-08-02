@@ -1,4 +1,5 @@
 import pytest
+from threading import Event, get_ident
 from starlette.requests import Request
 
 from app.api.limiter import _get_client_ip
@@ -7,11 +8,11 @@ from app.core.security import validate_auth_configuration
 from app.schemas.chat import ChatRequest
 from app.schemas.query import QueryRequest
 from app.services.dense_retriever import (
+    DenseRetrievalOutcome,
     DenseRetriever,
-    _set_embedding_failed,
-    dense_embedding_failed,
 )
 from app.services.hybrid_retriever import HybridRetriever
+from app.services.hybrid_executor import BoundedHybridExecutor, RetrievalBusyError
 from app.services.model_catalog import SUPPORTED_MODEL_IDS
 
 
@@ -63,17 +64,22 @@ def test_request_schemas_use_the_catalog_for_answer_models():
         ChatRequest(message="hello", model_preference="qwen2.5:1.5b")
 
 
-def test_parallel_dense_success_clears_coordinator_failure_flag(db_session, monkeypatch):
+def test_parallel_dense_outcome_is_request_scoped(db_session, monkeypatch):
     from app.services import hybrid_retriever as hybrid_module
-    from app.services.dense_retriever import _set_embedding_failed as set_worker_state
 
-    def dense_success(_self, *_args, **_kwargs):
-        set_worker_state(False)
-        return []
+    outcomes = iter(
+        [
+            DenseRetrievalOutcome([], embedding_failed=True),
+            DenseRetrievalOutcome([], embedding_failed=False),
+        ]
+    )
 
-    monkeypatch.setattr(DenseRetriever, "retrieve", dense_success)
+    monkeypatch.setattr(
+        DenseRetriever,
+        "retrieve_outcome",
+        lambda *_args, **_kwargs: next(outcomes),
+    )
     monkeypatch.setattr(hybrid_module.SparseRetriever, "retrieve", lambda *_args, **_kwargs: [])
-    _set_embedding_failed(True)
 
     retriever = HybridRetriever(
         db_session,
@@ -82,6 +88,63 @@ def test_parallel_dense_success_clears_coordinator_failure_flag(db_session, monk
         sparse_top_k=5,
         rrf_k=60,
     )
-    retriever._retrieve_parallel("postponement", None)
+    first = retriever._retrieve_parallel("postponement", None)
+    second = retriever._retrieve_parallel("postponement", None)
 
-    assert dense_embedding_failed() is False
+    assert first[-1] is True
+    assert second[-1] is False
+
+
+def test_bounded_hybrid_executor_rejects_saturated_queue():
+    release = Event()
+    executor = BoundedHybridExecutor(max_workers=1, max_pending=1, queue_timeout=0.01)
+    future = executor.submit(release.wait)
+    try:
+        with pytest.raises(RetrievalBusyError):
+            executor.submit(lambda: None)
+    finally:
+        release.set()
+        future.result(timeout=1)
+        executor.shutdown()
+
+
+def test_sequential_retrieval_owns_distinct_short_sessions(monkeypatch):
+    from app.services import hybrid_retriever as hybrid_module
+
+    sessions = []
+    calls = []
+
+    class TrackingSession:
+        def __init__(self):
+            self.closed = False
+            sessions.append(self)
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    def record_dense(self, *_args, **_kwargs):
+        calls.append(("dense", id(self.db), get_ident()))
+        return DenseRetrievalOutcome([])
+
+    def record_sparse(self, *_args, **_kwargs):
+        calls.append(("sparse", id(self.db), get_ident()))
+        return []
+
+    monkeypatch.setattr(DenseRetriever, "retrieve_outcome", record_dense)
+    monkeypatch.setattr(hybrid_module.SparseRetriever, "retrieve", record_sparse)
+    retriever = HybridRetriever(
+        top_k=5,
+        dense_top_k=5,
+        sparse_top_k=5,
+        rrf_k=60,
+        session_factory=TrackingSession,
+    )
+
+    retriever._retrieve_sequential("postponement", None)
+
+    assert len(sessions) == 2
+    assert calls[0][1] != calls[1][1]
+    assert all(session.closed for session in sessions)

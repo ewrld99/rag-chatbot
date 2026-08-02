@@ -60,6 +60,7 @@ function SourceList({ sources }) {
 }
 
 const MODEL_LABELS = {
+    "llama3.2:3b": "Llama 3.2 3B Local",
     "gemma3:4b": "Gemma 3 4B Local",
     "gemini-3.6-flash": "Gemini 3.6 Flash",
     "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",

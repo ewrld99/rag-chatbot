@@ -17,19 +17,26 @@ from __future__ import annotations
 from html import escape
 import logging
 import time
-from typing import Any, Dict, List, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Tuple
 
 from langchain_core.documents import Document
 from sqlalchemy.orm import Session
 
 from app.core.logging import format_log_event
+from app.db.session import (
+    SessionFactory,
+    SessionLocal,
+    session_factory_from_session,
+    session_scope,
+)
 from app.services.alias_expansion_service import AliasExpansionService
 from app.services.embedding_service import get_embedding
 from app.services.grounding_service import GroundingService
 from app.services.hybrid_retriever import HybridRetriever
 from app.services.reranker_service import RerankService
 from app.services.source_service import document_name
-from app.services.settings_service import SettingsService
+from app.services.settings_service import RuntimeSettingsSnapshot, SettingsService
 
 
 logger = logging.getLogger(__name__)
@@ -45,20 +52,52 @@ class RetrievalService:
 
     def __init__(
         self,
-        db: Session,
+        db: Session | None = None,
         top_k: int = 5,
+        *,
+        session_factory: SessionFactory | None = None,
+        settings_snapshot: RuntimeSettingsSnapshot | None = None,
     ) -> None:
-        self.db = db
-        self._settings = SettingsService(db)
+        if session_factory is None:
+            session_factory = (
+                session_factory_from_session(db) if db is not None else SessionLocal
+            )
+        self._session_factory = session_factory
+        if settings_snapshot is None:
+            if db is not None:
+                settings_snapshot = SettingsService(db).runtime_snapshot()
+            else:
+                with session_scope(self._session_factory) as settings_db:
+                    settings_snapshot = SettingsService(settings_db).runtime_snapshot()
+        self._settings = settings_snapshot
         self.top_k = top_k if top_k is not None else self._settings.top_k_final
         self._reranker = RerankService()
         self._hybrid = HybridRetriever(
-            db=db,
             top_k=self.top_k,
             dense_top_k=self._settings.top_k_dense,
             sparse_top_k=self._settings.top_k_sparse,
             rrf_k=self._settings.rrf_k,
+            session_factory=self._session_factory,
+            settings_snapshot=self._settings,
         )
+
+    @contextmanager
+    def database_session(self) -> Iterator[Session]:
+        """Provide a short-lived session for one synchronous pipeline operation."""
+        with session_scope(self._session_factory) as db:
+            yield db
+
+    def alias_expansions(self, query: str) -> dict[str, list[str]]:
+        with self.database_session() as db:
+            return AliasExpansionService(db).get_expansions(query)
+
+    @property
+    def runtime_settings(self) -> RuntimeSettingsSnapshot:
+        return self._settings
+
+    @property
+    def session_factory(self) -> SessionFactory:
+        return self._session_factory
 
     def set_top_k(self, top_k: int) -> None:
         """Update the final result limit for this request-scoped service."""
@@ -70,7 +109,8 @@ class RetrievalService:
     # -----------------------------------------------------------------------
     def embed_query(self, query: str) -> List[float]:
         """Convert user query into embedding vector."""
-        return get_embedding(query, self.db)
+        with self.database_session() as db:
+            return get_embedding(query, db)
 
     # -----------------------------------------------------------------------
     # 2. Retrieve Documents
@@ -107,7 +147,7 @@ class RetrievalService:
                     result.metadata["reranker"] = "skipped_high_confidence"
                     result.metadata["rerank_strategy"] = "rrf_high_confidence"
             else:
-                alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+                alias_expansions = self.alias_expansions(query)
                 reranked = self._reranker.rerank(
                     query,
                     raw,
@@ -150,7 +190,7 @@ class RetrievalService:
                 rerank_ms = 0.0
             else:
                 alias_started_at = time.perf_counter()
-                alias_expansions = AliasExpansionService(self.db).get_expansions(query)
+                alias_expansions = self.alias_expansions(query)
                 alias_ms = round((time.perf_counter() - alias_started_at) * 1000, 1)
                 raw = self._reranker.rerank(
                     query,

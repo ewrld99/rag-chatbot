@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://postgres:password@localhost:5432/rag_db"
     DATABASE_POOL_SIZE: int = 20
     DATABASE_MAX_OVERFLOW: int = 20
+    DATABASE_POOL_TIMEOUT_SECONDS: float = 10.0
     EMBEDDING_PROVIDER: str = "ollama"
     EMBEDDING_MODEL: str = "bge-m3"
     EMBEDDING_DIMENSION: int = 1024
@@ -30,6 +31,11 @@ class Settings(BaseSettings):
     TRUSTED_PROXY_CIDRS: str = ""
     RATE_LIMIT_REDIS_URL: str = ""
     RATE_LIMIT_KEY_PREFIX: str = "rag-chatbot:rate-limit"
+    RATE_LIMIT_LOCAL_MAX_KEYS: int = 10000
+    RATE_LIMIT_REDIS_COOLDOWN_SECONDS: float = 30.0
+    CHAT_MAX_MESSAGE_CHARS: int = 8000
+    CHAT_MAX_HISTORY_MESSAGES: int = 20
+    WS_MAX_PAYLOAD_BYTES: int = 65536
 
     # --- Admin seed (used only by scripts/create_admin.py) ---
     ADMIN_USERNAME: str = ""
@@ -51,8 +57,9 @@ class Settings(BaseSettings):
 
     # Deprecated compatibility aliases; model_provider() performs routing.
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "gemma3:4b"
+    GROQ_MODEL: str = "llama3.2:3b"
     GROQ_ALLOWED_MODELS: str = (
+        "llama3.2:3b,"
         "gemma3:4b,"
         "qwen3.5:4b,"
         "gemini-3.6-flash,"
@@ -60,6 +67,7 @@ class Settings(BaseSettings):
         "llama-3.1-8b-instant"
     )
     GROQ_ANSWER_MODEL_ORDER: str = (
+        "llama3.2:3b,"
         "gemma3:4b,"
         "gemini-3.6-flash,"
         "llama-3.3-70b-versatile,"
@@ -114,6 +122,9 @@ class Settings(BaseSettings):
     # --- File Uploads & Server ---
     BASE_URL: str = "http://localhost:8000"
     UPLOADS_DIR: str = "uploads"
+    FILE_RECONCILE_INTERVAL_SECONDS: float = 60.0
+    FILE_STAGING_RETENTION_HOURS: int = 24
+    FILE_TRASH_RETENTION_HOURS: int = 24
 
     # --- Hybrid Retrieval ---
     DENSE_TOP_K: int = 20       # candidate pool from pgvector
@@ -121,6 +132,9 @@ class Settings(BaseSettings):
     RRF_K: int = 60             # RRF constant (higher = smoother rank decay)
     HYBRID_TOP_K: int = 5       # final chunks passed to the LLM
     HYBRID_PARALLEL_RETRIEVAL: bool = True
+    HYBRID_RETRIEVAL_MAX_WORKERS: int = 8
+    HYBRID_RETRIEVAL_MAX_PENDING: int = 64
+    HYBRID_RETRIEVAL_QUEUE_TIMEOUT_SECONDS: float = 10.0
     ADAPTIVE_RERANK_SKIP_HIGH_CONFIDENCE: bool = True
 
     if SettingsConfigDict:

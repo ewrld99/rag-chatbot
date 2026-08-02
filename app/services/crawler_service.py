@@ -2,8 +2,8 @@ import logging
 import time
 import hashlib
 import os
-import uuid
 import asyncio
+from types import SimpleNamespace
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -13,12 +13,19 @@ import markdownify
 
 from sqlalchemy.orm import Session
 from sqlalchemy import case, update
-from app.db.models import DocumentModel, DocumentChunk, ExternalLinkModel, User, CrawlerJob, CrawlerQueue
+from app.db.models import (
+    CrawlerJob,
+    CrawlerQueue,
+    DocumentModel,
+    ExternalLinkModel,
+    FileOperation,
+    User,
+)
 from app.db.session import SessionLocal
 from app.services.settings_service import SettingsService
-from app.utils.chunking import split_text
-from app.services.embedding_service import get_embeddings
-from app.utils.loaders import load_document
+from app.services.document_ingestion_service import DocumentIngestionService
+from app.services.file_storage_service import FileStorageService
+from app.services.storage_reconciler import create_file_operation, reconcile_file_operations
 
 logger = logging.getLogger(__name__)
 
@@ -125,27 +132,30 @@ def _normalized_path(url: str) -> str:
 
 class CrawlerService:
     def __init__(self, db: Session):
-        self.db = db
-        self.settings = SettingsService(db)
+        runtime_settings = SettingsService(db)
+        self.settings = SimpleNamespace(
+            crawler_allowlist=tuple(runtime_settings.crawler_allowlist),
+            crawler_blocklist=tuple(runtime_settings.crawler_blocklist),
+            crawler_max_age_days=runtime_settings.crawler_max_age_days,
+        )
         # Ensure we have a system user for crawler uploads
-        self.system_user = self.db.query(User).filter(User.username == "system_crawler").first()
-        if not self.system_user:
-            self.system_user = User(username="system_crawler", password_hash="dummy")
-            self.db.add(self.system_user)
-            self.db.commit()
-            self.db.refresh(self.system_user)
+        system_user = db.query(User).filter(User.username == "system_crawler").first()
+        if not system_user:
+            system_user = User(username="system_crawler", password_hash="dummy")
+            db.add(system_user)
+            db.commit()
 
         # Self-healing migration for link_text column
         from sqlalchemy import inspect, text
-        inspector = inspect(self.db.bind)
+        inspector = inspect(db.bind)
         columns = [c['name'] for c in inspector.get_columns('crawler_queue')]
         if 'link_text' not in columns:
             try:
-                self.db.execute(text("ALTER TABLE crawler_queue ADD COLUMN link_text TEXT"))
-                self.db.commit()
+                db.execute(text("ALTER TABLE crawler_queue ADD COLUMN link_text TEXT"))
+                db.commit()
                 logger.info("Successfully added link_text column to crawler_queue")
             except Exception as e:
-                self.db.rollback()
+                db.rollback()
                 logger.error(f"Failed to add link_text column: {e}")
 
     def process_external_link(self, url: str, found_on: str, db: Session):
@@ -163,7 +173,10 @@ class CrawlerService:
         
         # Check if we already indexed this PDF based on content hash. 
         # This prevents duplicates from S3 pre-signed URLs which change on every crawl due to signatures.
-        doc_by_hash = db.query(DocumentModel).filter(DocumentModel.content_hash == file_hash).first()
+        doc_by_hash = db.query(DocumentModel).filter(
+            (DocumentModel.content_hash == file_hash)
+            | (DocumentModel.quality_report["source_content_hash"].astext == file_hash)
+        ).first()
         if doc_by_hash:
             logger.info(f"PDF already exists with same content hash. Skipping {url}.")
             return
@@ -171,55 +184,139 @@ class CrawlerService:
         # Fallback check based on source_url
         doc = db.query(DocumentModel).filter(DocumentModel.source_url == url).first()
         
-        if doc and doc.content_hash == file_hash:
+        if doc and (
+            doc.content_hash == file_hash
+            or dict(doc.quality_report or {}).get("source_content_hash") == file_hash
+        ):
             logger.info(f"PDF {url} has not changed. Skipping.")
             return
 
-        if doc and doc.filename:
-            # Overwrite existing file to prevent duplicates
-            filename = doc.filename
-            os.makedirs("uploads", exist_ok=True)
-            file_path = os.path.join("uploads", filename)
-        else:
-            filename = os.path.basename(urlparse(url).path)
-            if title_hint:
-                import re
-                safe_title = re.sub(r'[^a-zA-Z0-9_\- ]', '', title_hint).strip()
-                if safe_title:
-                    filename = f"{safe_title[:50].replace(' ', '_')}.pdf"
-                    
-            if not filename.lower().endswith(".pdf"):
-                filename = "document.pdf"
-                
-            # Use UUID to prevent race conditions during concurrent crawler runs
-            name_without_ext = os.path.splitext(filename)[0]
-            filename = f"{name_without_ext}_{uuid.uuid4().hex[:8]}.pdf"
-            
-            os.makedirs("uploads", exist_ok=True)
-            file_path = os.path.join("uploads", filename)
+        filename = os.path.basename(urlparse(url).path)
+        if title_hint:
+            import re
+            safe_title = re.sub(r'[^a-zA-Z0-9_\- ]', '', title_hint).strip()
+            if safe_title:
+                filename = f"{safe_title[:50].replace(' ', '_')}.pdf"
+        if not filename.lower().endswith(".pdf"):
+            filename = "document.pdf"
 
-        with open(file_path, "wb") as f:
-            f.write(content)
-            
-        text = load_document(file_path, "pdf", "fast")
-        if not text or not text.strip():
-            logger.warning(f"Could not extract text from {url}")
-            return
-            
-        self._embed_and_save(url, filename, text, file_hash, "pdf", db, file_path=file_path)
+        storage = FileStorageService()
+        staged = storage.stage_bytes(content, filename)
+        old_file_path = doc.file_path if doc else None
+        if doc is None:
+            sys_user = db.query(User).filter(User.username == "system_crawler").first()
+            doc = DocumentModel(
+                title=staged.filename,
+                filename=staged.filename,
+                file_path=staged.target_path,
+                source_url=url,
+                category="pdf",
+                uploaded_by=sys_user.id if sys_user else None,
+                last_crawled_at=datetime.utcnow(),
+                status="processing",
+                indexing_status="processing",
+                storage_state="staged",
+            )
+            db.add(doc)
+            db.flush()
+        operation = create_file_operation(
+            db,
+            document_id=doc.id,
+            operation="promote",
+            source_path=staged.source_path,
+            target_path=staged.target_path,
+        )
+        operation.status = "held"
+        db.commit()
+
+        try:
+            ingestion = DocumentIngestionService(db)
+            prepared = ingestion.prepare_file(
+                staged.source_path,
+                "pdf",
+                strategy="auto",
+                current_document_id=doc.id,
+                base_metadata={
+                    "source_url": url,
+                    "crawled_at": datetime.utcnow().isoformat(),
+                },
+            )
+            embeddings = ingestion.embed(prepared)
+            storage.promote(staged.source_path, staged.target_path)
+
+            operation = db.query(FileOperation).filter(FileOperation.id == operation.id).first()
+            doc = db.query(DocumentModel).filter(DocumentModel.id == doc.id).first()
+            ingestion.apply(doc, prepared, embeddings, persist_review_chunks=not bool(doc.chunks))
+            report = dict(doc.quality_report or {})
+            report["source_content_hash"] = file_hash
+            doc.quality_report = report
+            doc.title = staged.filename
+            doc.filename = staged.filename
+            doc.file_path = staged.target_path
+            doc.last_crawled_at = datetime.utcnow()
+            doc.storage_state = "ready"
+            doc.storage_error = None
+            operation.status = "completed"
+            db.commit()
+
+            if old_file_path and old_file_path != staged.target_path:
+                cleanup = create_file_operation(
+                    db,
+                    document_id=None,
+                    operation="delete",
+                    source_path=old_file_path,
+                    target_path=storage.trash_path(doc.id, os.path.basename(old_file_path)),
+                )
+                db.commit()
+                reconcile_file_operations(storage=storage)
+        except Exception as exc:
+            db.rollback()
+            if storage.resolve(staged.target_path).exists() and not storage.resolve(staged.source_path).exists():
+                storage.remove(staged.target_path)
+            try:
+                retained = storage.retain_failed(staged.source_path, doc.id, staged.filename)
+            except Exception:
+                retained = None
+            operation = db.query(FileOperation).filter(FileOperation.id == operation.id).first()
+            if operation is not None:
+                operation.status = "cancelled"
+                operation.last_error = str(exc)[:2000]
+            current = db.query(DocumentModel).filter(DocumentModel.id == doc.id).first()
+            if current is not None and old_file_path is None:
+                current.file_path = retained or current.file_path
+                current.storage_state = "ready" if retained else "missing"
+                current.storage_error = str(exc)[:2000]
+                current.status = "embedding_failed"
+                current.indexing_status = "failed"
+            db.commit()
+            raise
 
     def _embed_and_save(self, url: str, title: str, text: str, content_hash: str, category: str, db: Session, doc_metadata: dict | None = None, file_path: str = None):
-        local_settings = SettingsService(db)
-        chunk_size = local_settings.chunk_size
-        chunk_overlap = local_settings.chunk_overlap
-        
-        chunks = split_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-        if not chunks:
-            return
-            
-        embeddings = get_embeddings(chunks, db)
-        
         doc = db.query(DocumentModel).filter(DocumentModel.source_url == url).first()
+        base_meta = {
+            "source_url": url,
+            "crawled_at": datetime.utcnow().isoformat(),
+            **(doc_metadata or {}),
+        }
+        ingestion = DocumentIngestionService(db)
+        if file_path and os.path.exists(file_path):
+            prepared = ingestion.prepare_file(
+                file_path,
+                category,
+                strategy="auto",
+                current_document_id=doc.id if doc else None,
+                base_metadata=base_meta,
+            )
+        else:
+            prepared = ingestion.prepare_text(
+                text,
+                file_type=category,
+                current_document_id=doc.id if doc else None,
+                base_metadata=base_meta,
+                extraction_method="crawler_html",
+            )
+        embeddings = ingestion.embed(prepared)
+
         if not doc:
             sys_user = db.query(User).filter(User.username == "system_crawler").first()
             doc = DocumentModel(
@@ -229,8 +326,10 @@ class CrawlerService:
                 source_url=url,
                 category=category,
                 uploaded_by=sys_user.id if sys_user else None,
-                content_hash=content_hash,
-                last_crawled_at=datetime.utcnow()
+                last_crawled_at=datetime.utcnow(),
+                status="processing",
+                indexing_status="processing",
+                storage_state="ready" if file_path else "not_applicable",
             )
             db.add(doc)
             db.flush()
@@ -239,28 +338,17 @@ class CrawlerService:
             doc.filename = title
             if file_path:
                 doc.file_path = file_path
-            doc.content_hash = content_hash
             doc.last_crawled_at = datetime.utcnow()
-            db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
-            db.flush()
 
-        # Merge crawler-specific fields with any caller-supplied metadata
-        # (e.g. programme, year from future admin tooling).
-        base_meta = {"source_url": url, "crawled_at": datetime.utcnow().isoformat()}
-        if doc_metadata:
-            base_meta.update(doc_metadata)
-
-        new_chunks = [
-            DocumentChunk(
-                document_id=doc.id,
-                chunk_index=i,
-                chunk_text=chunk,
-                embedding=embedding,
-                metadata_=base_meta
-            )
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-        ]
-        db.add_all(new_chunks)
+        ingestion.apply(
+            doc,
+            prepared,
+            embeddings,
+            persist_review_chunks=not bool(doc.chunks),
+        )
+        report = dict(doc.quality_report or {})
+        report["source_content_hash"] = content_hash
+        doc.quality_report = report
         db.commit()
 
     async def fetch_page(self, client, url: str):
@@ -473,7 +561,7 @@ class CrawlerService:
         content_type = response.headers.get("Content-Type", "").lower()
         parsed_url = urlparse(url)
         url_ext = os.path.splitext(parsed_url.path)[1].lower()
-        
+
         if "application/pdf" in content_type or url_ext == ".pdf":
             if job_type == "full":
                 logger.info("Skipping PDF during full crawler %s", url)
@@ -536,37 +624,165 @@ class CrawlerService:
         await asyncio.to_thread(self._process_html_sync, url, title, html_content, external_links_to_save)
         return new_urls
 
-    async def run_crawler(self, start_urls: list, max_pages: int = 100, job_type: str = "full", reset: bool = True):
-        allowlist = self.settings.crawler_allowlist
-        blocklist = self.settings.crawler_blocklist
-        
-        # Initialize or resume Job in DB
+    @staticmethod
+    def _initialize_crawl_job(
+        start_urls: list[str],
+        max_pages: int,
+        job_type: str,
+        reset: bool,
+    ) -> bool:
         with SessionLocal() as db:
             job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
             if not job:
-                job = CrawlerJob(job_type=job_type, status="running", max_pages=max_pages, crawled_count=0)
+                job = CrawlerJob(
+                    job_type=job_type,
+                    status="running",
+                    max_pages=max_pages,
+                    crawled_count=0,
+                )
                 db.add(job)
             else:
                 if job.status == "running" and not reset:
-                    logger.warning(f"Crawler {job_type} is already running. Skipping start.")
-                    return
-                # Force reset if reset=True
+                    return False
                 job.status = "running"
                 job.max_pages = max_pages
                 if reset:
                     job.crawled_count = 0
                     db.query(CrawlerQueue).filter_by(job_type=job_type).delete()
-            
             if not reset:
-                # Reset stuck 'processing' urls to 'pending'
-                db.execute(update(CrawlerQueue).where(CrawlerQueue.job_type == job_type, CrawlerQueue.status == 'processing').values(status='pending'))
-            
-            # Insert start_urls (ignore duplicates by fetching existing first)
+                db.execute(
+                    update(CrawlerQueue)
+                    .where(
+                        CrawlerQueue.job_type == job_type,
+                        CrawlerQueue.status == "processing",
+                    )
+                    .values(status="pending")
+                )
             for url in start_urls:
-                existing = db.query(CrawlerQueue).filter_by(job_type=job_type, url=url).first()
-                if not existing:
-                    db.add(CrawlerQueue(job_type=job_type, url=url, status='pending', link_text=""))
+                exists = db.query(CrawlerQueue.id).filter_by(
+                    job_type=job_type,
+                    url=url,
+                ).first()
+                if not exists:
+                    db.add(
+                        CrawlerQueue(
+                            job_type=job_type,
+                            url=url,
+                            status="pending",
+                            link_text="",
+                        )
+                    )
             db.commit()
+            return True
+
+    @staticmethod
+    def _claim_crawl_batch(job_type: str, batch_size: int) -> list[tuple[str, str]]:
+        with SessionLocal() as db:
+            job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
+            if not job or job.status != "running" or job.crawled_count >= job.max_pages:
+                return []
+            pending_query = db.query(CrawlerQueue).filter_by(
+                job_type=job_type,
+                status="pending",
+            )
+            if job_type == "announcements":
+                pending_query = pending_query.order_by(
+                    case(
+                        (CrawlerQueue.url.ilike("%.pdf%"), 0),
+                        *[
+                            (CrawlerQueue.url.ilike(f"%{keyword}%"), 1)
+                            for keyword in ANNOUNCEMENT_KEYWORDS
+                        ],
+                        else_=2,
+                    ),
+                    CrawlerQueue.id.asc(),
+                )
+            else:
+                pending_query = pending_query.order_by(CrawlerQueue.id.asc())
+            pending = pending_query.with_for_update(skip_locked=True).limit(batch_size).all()
+            if not pending:
+                return []
+            result = [(item.url, item.link_text or "") for item in pending]
+            for item in pending:
+                item.status = "processing"
+            job.current_url = result[0][0]
+            db.commit()
+            return result
+
+    @staticmethod
+    def _save_crawl_progress(
+        job_type: str,
+        success_urls: list[str],
+        failed_urls: list[str],
+        new_urls: dict[str, str],
+    ) -> None:
+        with SessionLocal() as db:
+            if success_urls:
+                db.execute(
+                    update(CrawlerQueue)
+                    .where(
+                        CrawlerQueue.job_type == job_type,
+                        CrawlerQueue.url.in_(success_urls),
+                    )
+                    .values(status="completed")
+                )
+            if failed_urls:
+                db.execute(
+                    update(CrawlerQueue)
+                    .where(
+                        CrawlerQueue.job_type == job_type,
+                        CrawlerQueue.url.in_(failed_urls),
+                    )
+                    .values(status="failed")
+                )
+            existing_urls = set(
+                row[0]
+                for row in db.query(CrawlerQueue.url).filter(
+                    CrawlerQueue.job_type == job_type,
+                    CrawlerQueue.url.in_(list(new_urls)),
+                )
+            ) if new_urls else set()
+            db.add_all(
+                [
+                    CrawlerQueue(
+                        job_type=job_type,
+                        url=url,
+                        status="pending",
+                        link_text=link_text,
+                    )
+                    for url, link_text in new_urls.items()
+                    if url not in existing_urls
+                ]
+            )
+            job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
+            if job:
+                job.crawled_count += len(success_urls)
+            db.commit()
+
+    @staticmethod
+    def _finish_crawl_job(job_type: str) -> None:
+        with SessionLocal() as db:
+            job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
+            if job:
+                job.status = "idle"
+                job.current_url = ""
+                job.last_run = datetime.utcnow()
+            db.commit()
+
+    async def run_crawler(self, start_urls: list, max_pages: int = 100, job_type: str = "full", reset: bool = True):
+        allowlist = self.settings.crawler_allowlist
+        blocklist = self.settings.crawler_blocklist
+
+        started = await asyncio.to_thread(
+            self._initialize_crawl_job,
+            start_urls,
+            max_pages,
+            job_type,
+            reset,
+        )
+        if not started:
+            logger.warning("Crawler %s is already running. Skipping start.", job_type)
+            return
 
         batch_size = 3
         headers = {
@@ -577,40 +793,14 @@ class CrawlerService:
         async with httpx.AsyncClient(verify=False, headers=headers) as client:
             try:
                 while True:
-                    # 1. Check job status and fetch a batch
-                    with SessionLocal() as db:
-                        job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
-                        if not job or job.status != "running" or job.crawled_count >= job.max_pages:
-                            break
-                        
-                        pending_query = db.query(CrawlerQueue).filter_by(job_type=job_type, status='pending')
-                        if job_type == "announcements":
-                            pending_query = pending_query.order_by(
-                                case(
-                                    (CrawlerQueue.url.ilike("%.pdf%"), 0),
-                                    *[
-                                        (CrawlerQueue.url.ilike(f"%{keyword}%"), 1)
-                                        for keyword in ANNOUNCEMENT_KEYWORDS
-                                    ],
-                                    else_=2,
-                                ),
-                                CrawlerQueue.id.asc(),
-                            )
-                        else:
-                            pending_query = pending_query.order_by(CrawlerQueue.id.asc())
-                        pending_batch = pending_query.limit(batch_size).all()
-                        if not pending_batch:
-                            break
-                            
-                        batch_data = [(item.url, item.link_text or "") for item in pending_batch]
-                        batch_urls = [item.url for item in pending_batch]
-                        
-                        for item in pending_batch:
-                            item.status = 'processing'
-                        
-                        # Also update current_url so frontend knows we are working
-                        job.current_url = batch_urls[0]
-                        db.commit()
+                    batch_data = await asyncio.to_thread(
+                        self._claim_crawl_batch,
+                        job_type,
+                        batch_size,
+                    )
+                    if not batch_data:
+                        break
+                    batch_urls = [url for url, _link_text in batch_data]
                     
                     # 2. Process batch concurrently
                     logger.info(f"[{job_type}] Processing batch of {len(batch_urls)} URLs...")
@@ -632,32 +822,15 @@ class CrawlerService:
                                 if new_url not in new_urls_dict:
                                     new_urls_dict[new_url] = text
                                     
-                    # 4. Save progress
-                    with SessionLocal() as db:
-                        if success_urls:
-                            db.execute(update(CrawlerQueue).where(CrawlerQueue.job_type == job_type, CrawlerQueue.url.in_(success_urls)).values(status='completed'))
-                        if failed_urls:
-                            db.execute(update(CrawlerQueue).where(CrawlerQueue.job_type == job_type, CrawlerQueue.url.in_(failed_urls)).values(status='failed'))
-                            
-                        # Insert newly discovered links
-                        for new_url, link_text in new_urls_dict.items():
-                            existing = db.query(CrawlerQueue).filter_by(job_type=job_type, url=new_url).first()
-                            if not existing:
-                                db.add(CrawlerQueue(job_type=job_type, url=new_url, status='pending', link_text=link_text))
-                                    
-                        job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
-                        if job:
-                            job.crawled_count += len(success_urls)
-                        db.commit()
+                    await asyncio.to_thread(
+                        self._save_crawl_progress,
+                        job_type,
+                        success_urls,
+                        failed_urls,
+                        new_urls_dict,
+                    )
 
             except Exception as e:
                 logger.error(f"Crawler {job_type} encountered a fatal error: {e}")
             finally:
-                # Job Finished safely
-                with SessionLocal() as db:
-                    job = db.query(CrawlerJob).filter_by(job_type=job_type).first()
-                    if job:
-                        job.status = "idle"
-                        job.current_url = ""
-                        job.last_run = datetime.utcnow()
-                    db.commit()
+                await asyncio.to_thread(self._finish_crawl_job, job_type)

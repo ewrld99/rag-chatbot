@@ -90,8 +90,9 @@ def test_procedure_prompt_requires_supported_ordered_details():
     )
 
     assert "This is a procedure question" in prompt
-    assert "prerequisites, ordered actions" in prompt
-    assert "Do not reduce a documented procedure to a generic summary" in prompt
+    assert "only actions the user must perform as ordered steps" in prompt
+    assert "is not an application step" in prompt
+    assert "instead of inventing a multi-step process" in prompt
 
 
 def test_document_system_prompt_has_unambiguous_json_contract():

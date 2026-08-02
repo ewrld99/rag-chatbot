@@ -20,6 +20,15 @@ _START_TIME = time.monotonic()          # wall-clock seconds since process start
 _START_DATETIME = datetime.now(timezone.utc).isoformat()
 
 
+class PublicUploadStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        if any(part.startswith(".") for part in path.replace("\\", "/").split("/")):
+            from starlette.exceptions import HTTPException
+
+            raise HTTPException(status_code=404)
+        return await super().get_response(path, scope)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_auth_configuration()
@@ -32,6 +41,10 @@ async def lifespan(app: FastAPI):
         seed_default_settings(db)
     finally:
         db.close()
+    from app.services.hybrid_executor import get_hybrid_executor
+    get_hybrid_executor()
+    from app.services.storage_reconciler import start_storage_reconciler
+    start_storage_reconciler()
     start_scheduler()
     try:
         yield
@@ -41,7 +54,11 @@ async def lifespan(app: FastAPI):
         from app.services.embedding_service import close_embedding_clients
         from app.services.generation_service import close_generation_clients
         from app.services.reranker_service import close_reranker_client
+        from app.services.hybrid_executor import close_hybrid_executor
+        from app.services.storage_reconciler import stop_storage_reconciler
         await close_rate_limiter()
+        await stop_storage_reconciler()
+        close_hybrid_executor()
         close_embedding_clients()
         close_reranker_client()
         await close_generation_clients()
@@ -51,7 +68,11 @@ app = FastAPI(title="RAG Chatbot", lifespan=lifespan)
 
 # ── Static files ─────────────────────────────────────────────────────────────
 os.makedirs(settings.UPLOADS_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=settings.UPLOADS_DIR), name="uploads")
+app.mount(
+    "/uploads",
+    PublicUploadStaticFiles(directory=settings.UPLOADS_DIR),
+    name="uploads",
+)
 
 # ── CORS — origins loaded from ALLOWED_ORIGINS env var ──────────────────────
 allowed_origins = [
@@ -100,6 +121,7 @@ async def health_check() -> JSONResponse:
         db_status = f"error: {exc}"
 
     healthy = db_status == "ok"
+    from app.api.limiter import rate_limiter_status
     payload = {
         "service": "UDOM RAG Chatbot",
         "status": "healthy" if healthy else "degraded",
@@ -108,6 +130,7 @@ async def health_check() -> JSONResponse:
         "uptime_seconds": uptime_seconds,
         "checks": {
             "database": db_status,
+            "rate_limiter": rate_limiter_status(),
         },
     }
     return JSONResponse(

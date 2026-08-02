@@ -9,10 +9,10 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, cast
 from uuid import UUID
 
 from langchain_core.documents import Document
+from sqlalchemy.orm import joinedload
 from starlette.concurrency import run_in_threadpool
 
 from app.db.models import DocumentChunk
-from app.services.alias_expansion_service import AliasExpansionService
 from app.services.conversation_service import static_conversational_response
 from app.services.conversation_context import generation_history
 from app.services.generation_resilience import GenerationUnavailableError
@@ -28,7 +28,6 @@ from app.services.query_normalization import (
     tokenize,
 )
 from app.services.retrieval_service import RetrievalService
-from app.services.settings_service import SettingsService
 from app.services.source_service import format_source_records
 from app.core.config import settings
 from app.core.logging import format_log_event
@@ -105,12 +104,12 @@ class RAGPipeline:
     ):
         self.retrieval_service = retrieval_service
         if generator is None:
-            model_router = ModelRouter(SettingsService(retrieval_service.db))
+            model_router = ModelRouter(retrieval_service.runtime_settings)
             generator = GenerationService(model_router=model_router)
         self.generator = generator
         self.intent_router = intent_router or IntentRouter(
-            retrieval_service.db,
-            self.generator,
+            generator=self.generator,
+            session_factory=retrieval_service.session_factory,
         )
         self._last_scored_documents: List[Tuple[Document, float]] = []
         self.document_refusal = GenerationService.DOCUMENT_REFUSAL
@@ -198,6 +197,66 @@ class RAGPipeline:
             return self._base_response(query, self.out_of_scope_response, decision)
 
         return None
+
+    def _arbitrate_student_support_route(
+        self,
+        decision: IntentDecision,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]],
+        user_profile: Optional[Dict[str, Any]],
+    ) -> tuple[IntentDecision, str | None, Dict[str, Any] | None]:
+        if not self._should_probe_documents(query, decision):
+            return decision, None, None
+
+        retrieval_query = self._retrieval_query(
+            decision,
+            query,
+            chat_history,
+            user_profile=user_profile,
+        )
+        retrieval = self._retrieve_document_context(
+            retrieval_query,
+            filters=decision.filters,
+        )
+        confidence = retrieval["confidence"]
+        if not self._retrieval_supports_route_override(confidence):
+            self._last_scored_documents = []
+            return decision, None, None
+
+        promoted = self.intent_router.promote_to_document_search(
+            decision,
+            query,
+            float(confidence.get("confidence") or 0.0),
+        )
+        logger.info(
+            "Routing promoted by retrieval | from=%s to=%s tier=%s confidence=%.4f query=%s",
+            decision.intent,
+            promoted.intent,
+            confidence.get("tier"),
+            float(confidence.get("confidence") or 0.0),
+            retrieval_query[:120],
+        )
+        return promoted, retrieval_query, retrieval
+
+    def _should_probe_documents(
+        self,
+        query: str,
+        decision: IntentDecision,
+    ) -> bool:
+        probe = getattr(self.intent_router, "should_probe_documents", None)
+        return bool(callable(probe) and probe(query, decision))
+
+    @staticmethod
+    def _retrieval_supports_route_override(confidence: Dict[str, Any]) -> bool:
+        if not confidence.get("sufficient") or confidence.get("tier") != "high":
+            return False
+        if int(confidence.get("lexical_overlap") or 0) < 2:
+            return False
+        matched_sources = set(confidence.get("matched_sources") or [])
+        sparse_rank = confidence.get("best_sparse_rank")
+        return "sparse" in matched_sources or (
+            isinstance(sparse_rank, int) and sparse_rank <= 10
+        )
 
     def _base_response(
         self,
@@ -338,6 +397,17 @@ class RAGPipeline:
         with trace.stage("intent_ms"):
             decision = self.intent_router.classify(query, chat_history=chat_history, user_profile=user_profile)
 
+        retrieval_query: str | None = None
+        retrieval: Dict[str, Any] | None = None
+        if self._should_probe_documents(query, decision):
+            with trace.stage("routing_retrieval_ms"):
+                decision, retrieval_query, retrieval = self._arbitrate_student_support_route(
+                    decision,
+                    query,
+                    model_history,
+                    user_profile,
+                )
+
         if decision.intent in {
             "CONVERSATIONAL",
             "STUDENT_SUPPORT",
@@ -355,10 +425,19 @@ class RAGPipeline:
             assert response is not None
             return response
 
-        with trace.stage("query_rewrite_ms"):
-            retrieval_query = self._retrieval_query(decision, query, model_history, user_profile=user_profile)
-        with trace.stage("retrieval_ms"):
-            retrieval = self._retrieve_document_context(retrieval_query, filters=decision.filters)
+        if retrieval_query is None or retrieval is None:
+            with trace.stage("query_rewrite_ms"):
+                retrieval_query = self._retrieval_query(
+                    decision,
+                    query,
+                    model_history,
+                    user_profile=user_profile,
+                )
+            with trace.stage("retrieval_ms"):
+                retrieval = self._retrieve_document_context(
+                    retrieval_query,
+                    filters=decision.filters,
+                )
         generation_query = self._generation_query(decision, query, retrieval_query)
 
         if self._is_empty_context(retrieval["context"]) or not retrieval["confidence"]["sufficient"]:
@@ -542,6 +621,18 @@ class RAGPipeline:
         model_history = generation_history(chat_history)
         with trace.stage("intent_ms"):
             decision = await run_in_threadpool(self.intent_router.classify, query, chat_history, user_profile)
+
+        retrieval_query: str | None = None
+        retrieval: Dict[str, Any] | None = None
+        if self._should_probe_documents(query, decision):
+            with trace.stage("routing_retrieval_ms"):
+                decision, retrieval_query, retrieval = await run_in_threadpool(
+                    self._arbitrate_student_support_route,
+                    decision,
+                    query,
+                    model_history,
+                    user_profile,
+                )
         yield {
             "type": "routing",
             "routing": decision.to_dict(),
@@ -601,22 +692,23 @@ class RAGPipeline:
             trace.log(intent=decision.intent, source=decision.source)
             return
 
-        with trace.stage("query_rewrite_ms"):
-            yield {"type": "status", "message": "Preparing a focused search query..."}
-            retrieval_query = await run_in_threadpool(
-                self._retrieval_query,
-                decision,
-                query,
-                model_history,
-                user_profile,
-            )
-        with trace.stage("retrieval_ms"):
-            yield {"type": "status", "message": "Searching official documents..."}
-            retrieval = await run_in_threadpool(
-                self._retrieve_document_context,
-                retrieval_query,
-                decision.filters,
-            )
+        if retrieval_query is None or retrieval is None:
+            with trace.stage("query_rewrite_ms"):
+                yield {"type": "status", "message": "Preparing a focused search query..."}
+                retrieval_query = await run_in_threadpool(
+                    self._retrieval_query,
+                    decision,
+                    query,
+                    model_history,
+                    user_profile,
+                )
+            with trace.stage("retrieval_ms"):
+                yield {"type": "status", "message": "Searching official documents..."}
+                retrieval = await run_in_threadpool(
+                    self._retrieve_document_context,
+                    retrieval_query,
+                    decision.filters,
+                )
         generation_query = self._generation_query(decision, query, retrieval_query)
 
         if self._is_empty_context(retrieval["context"]) or not retrieval["confidence"]["sufficient"]:
@@ -757,12 +849,28 @@ class RAGPipeline:
         model_history = generation_history(chat_history)
         decision = self.intent_router.classify(query, chat_history=chat_history, user_profile=user_profile)
 
+        decision, retrieval_query, retrieval = self._arbitrate_student_support_route(
+            decision,
+            query,
+            model_history,
+            user_profile,
+        )
+
         response = self._non_document_debug_response(decision, query, model_history, user_profile)
         if response is not None:
             return response
 
-        retrieval_query = self._retrieval_query(decision, query, model_history, user_profile=user_profile)
-        retrieval = self._retrieve_document_context(retrieval_query, filters=decision.filters)
+        if retrieval_query is None or retrieval is None:
+            retrieval_query = self._retrieval_query(
+                decision,
+                query,
+                model_history,
+                user_profile=user_profile,
+            )
+            retrieval = self._retrieve_document_context(
+                retrieval_query,
+                filters=decision.filters,
+            )
         generation_query = self._generation_query(decision, query, retrieval_query)
         sources = self._format_sources(retrieval["documents"])
         grounding = self.generator.grounding_metadata()
@@ -776,7 +884,10 @@ class RAGPipeline:
                 grounding = direct_curriculum["grounding"]
                 sources = self._format_sources(direct_curriculum["documents"])
             else:
-                direct_almanac = self._direct_almanac_event_answer(generation_query, retrieval["documents"])
+                direct_almanac = self._direct_almanac_event_answer(
+                    generation_query,
+                    retrieval["documents"],
+                )
                 if direct_almanac is not None:
                     answer = direct_almanac["answer"]
                     grounding = direct_almanac["grounding"]
@@ -943,14 +1054,15 @@ class RAGPipeline:
         preferred_indexes.extend(anchor_index - offset for offset in range(1, window + 1))
         preferred_indexes = [index for index in preferred_indexes if index >= 0]
 
-        rows = (
-            self.retrieval_service.db.query(DocumentChunk)
-            .filter(
-                DocumentChunk.document_id == document_id,
-                DocumentChunk.chunk_index.in_(preferred_indexes),
+        with self.retrieval_service.database_session() as db:
+            rows = (
+                db.query(DocumentChunk)
+                .filter(
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.chunk_index.in_(preferred_indexes),
+                )
+                .all()
             )
-            .all()
-        )
         if not rows:
             return documents
 
@@ -1014,18 +1126,19 @@ class RAGPipeline:
             return documents
 
         window = max(1, settings.GENERATION_PROCEDURE_SECTION_WINDOW)
-        rows = (
-            self.retrieval_service.db.query(DocumentChunk)
-            .filter(
-                DocumentChunk.document_id == document_id,
-                DocumentChunk.chunk_index.between(
-                    max(0, anchor_index - window),
-                    anchor_index + window,
-                ),
+        with self.retrieval_service.database_session() as db:
+            rows = (
+                db.query(DocumentChunk)
+                .filter(
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.chunk_index.between(
+                        max(0, anchor_index - window),
+                        anchor_index + window,
+                    ),
+                )
+                .order_by(DocumentChunk.chunk_index.asc())
+                .all()
             )
-            .order_by(DocumentChunk.chunk_index.asc())
-            .all()
-        )
         if not rows:
             return documents
 
@@ -1337,7 +1450,7 @@ class RAGPipeline:
         if not terms:
             terms = {term for term in tokenize(query) if len(term) > 2}
         try:
-            aliases = AliasExpansionService(self.retrieval_service.db).get_expansions(query)
+            aliases = self.retrieval_service.alias_expansions(query)
         except Exception:
             aliases = {}
         for term, values in aliases.items():
@@ -1399,22 +1512,24 @@ class RAGPipeline:
             return scored_docs
 
         metadata = DocumentChunk.metadata_
-        db_query = (
-            self.retrieval_service.db.query(DocumentChunk)
-            .filter(metadata["category"].astext == "curriculum")
-            .filter(metadata["record_type"].astext == "course")
-            .filter(metadata["programme"].astext == constraints["programme"])
-        )
-        if constraints.get("year_of_study"):
-            db_query = db_query.filter(metadata["year_of_study"].astext == constraints["year_of_study"])
-        if constraints.get("semester"):
-            db_query = db_query.filter(metadata["semester"].astext == constraints["semester"])
+        with self.retrieval_service.database_session() as db:
+            db_query = (
+                db.query(DocumentChunk)
+                .options(joinedload(DocumentChunk.document))
+                .filter(metadata["category"].astext == "curriculum")
+                .filter(metadata["record_type"].astext == "course")
+                .filter(metadata["programme"].astext == constraints["programme"])
+            )
+            if constraints.get("year_of_study"):
+                db_query = db_query.filter(metadata["year_of_study"].astext == constraints["year_of_study"])
+            if constraints.get("semester"):
+                db_query = db_query.filter(metadata["semester"].astext == constraints["semester"])
 
-        rows = (
-            db_query.order_by(DocumentChunk.chunk_index.asc())
-            .limit(self._CURRICULUM_METADATA_MAX_ROWS)
-            .all()
-        )
+            rows = (
+                db_query.order_by(DocumentChunk.chunk_index.asc())
+                .limit(self._CURRICULUM_METADATA_MAX_ROWS)
+                .all()
+            )
         if not rows:
             return scored_docs
 
@@ -1489,17 +1604,18 @@ class RAGPipeline:
             return None
 
         metadata = DocumentChunk.metadata_
-        rows = (
-            self.retrieval_service.db.query(
-                metadata["programme"].astext.label("programme"),
-                metadata["programme_acronym"].astext.label("programme_acronym"),
+        with self.retrieval_service.database_session() as db:
+            rows = (
+                db.query(
+                    metadata["programme"].astext.label("programme"),
+                    metadata["programme_acronym"].astext.label("programme_acronym"),
+                )
+                .filter(metadata["category"].astext == "curriculum")
+                .filter(metadata["record_type"].astext == "course")
+                .filter(metadata["programme"].astext.isnot(None))
+                .distinct()
+                .all()
             )
-            .filter(metadata["category"].astext == "curriculum")
-            .filter(metadata["record_type"].astext == "course")
-            .filter(metadata["programme"].astext.isnot(None))
-            .distinct()
-            .all()
-        )
 
         query_token_set = set(query_tokens)
         query_acronyms = {
@@ -1554,7 +1670,7 @@ class RAGPipeline:
         query_tokens = set(tokenize(query))
         alias_expansions: dict[str, list[str]] = {}
         try:
-            alias_expansions.update(AliasExpansionService(self.retrieval_service.db).get_expansions(query))
+            alias_expansions.update(self.retrieval_service.alias_expansions(query))
         except Exception:
             pass
         for term, aliases in FALLBACK_ALIAS_EXPANSIONS.items():

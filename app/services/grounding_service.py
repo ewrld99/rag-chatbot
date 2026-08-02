@@ -14,11 +14,39 @@ _WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![\w.])\d+(?:,\d{3})*(?:\.\d+)?(?:\s*%)?")
 _MARKDOWN_RE = re.compile(r"[*_`>#|]")
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "of",
+        "or",
+        "shall",
+        "that",
+        "the",
+        "their",
+        "this",
+        "to",
+        "with",
+    }
+)
 
 
 class GroundedClaim(BaseModel):
     claim: str = Field(min_length=1, max_length=3000)
-    evidence_ids: list[str] = Field(min_length=1, max_length=8)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=8)
 
     model_config = {"extra": "ignore"}
 
@@ -171,6 +199,8 @@ class GroundingService:
                     normalized_claim["evidence_ids"] = normalized_claim.get("evidence")
                 if "evidence_ids" not in normalized_claim and "evidence_id" in normalized_claim:
                     normalized_claim["evidence_ids"] = [normalized_claim.get("evidence_id")]
+                if "evidence_ids" not in normalized_claim:
+                    normalized_claim["evidence_ids"] = []
                 normalized_claims.append(normalized_claim)
             normalized["claims"] = normalized_claims
 
@@ -252,6 +282,40 @@ class GroundingService:
         )
         return draft.model_copy(update={"answer": rebuilt_answer})
 
+    def reconcile_evidence_ids(
+        self,
+        draft: GroundedDraft,
+        evidence: dict[str, EvidenceChunk],
+    ) -> GroundedDraft:
+        """Replace invalid model-cited IDs when a retrieved chunk clearly supports the claim."""
+        if draft.coverage == "none" or not draft.claims or not evidence:
+            return draft
+
+        changed = False
+        claims: list[GroundedClaim] = []
+        for claim in draft.claims:
+            unique_ids = list(dict.fromkeys(claim.evidence_ids))
+            valid_ids = [evidence_id for evidence_id in unique_ids if evidence_id in evidence]
+            invalid_ids = [evidence_id for evidence_id in unique_ids if evidence_id not in evidence]
+            if unique_ids and not invalid_ids:
+                claims.append(claim)
+                continue
+
+            repaired_ids = list(valid_ids)
+            for evidence_id in self._matching_evidence_ids(claim.claim, evidence):
+                if evidence_id not in repaired_ids:
+                    repaired_ids.append(evidence_id)
+                if len(repaired_ids) >= 8:
+                    break
+
+            if repaired_ids:
+                claims.append(claim.model_copy(update={"evidence_ids": repaired_ids}))
+                changed = True
+            else:
+                claims.append(claim)
+
+        return draft.model_copy(update={"claims": claims}) if changed else draft
+
     def validate(
         self,
         draft: GroundedDraft,
@@ -273,6 +337,8 @@ class GroundingService:
         for index, claim in enumerate(draft.claims):
             claim_messages: list[str] = []
             unique_ids = list(dict.fromkeys(claim.evidence_ids))
+            if not unique_ids:
+                claim_messages.append("does not cite evidence IDs")
             if len(unique_ids) != len(claim.evidence_ids):
                 claim_messages.append("contains duplicate evidence IDs")
 
@@ -571,6 +637,46 @@ class GroundingService:
                 continue
             numbers.add(str(int(number)) if number.is_integer() else f"{number:g}")
         return numbers
+
+    def _matching_evidence_ids(
+        self,
+        claim: str,
+        evidence: dict[str, EvidenceChunk],
+    ) -> list[str]:
+        claim_numbers = self._numbers(claim)
+        claim_tokens = self._content_tokens(claim)
+        if not claim_tokens and not claim_numbers:
+            return []
+
+        matches: list[tuple[float, str]] = []
+        for evidence_id, chunk in evidence.items():
+            text = chunk.text or ""
+            evidence_numbers = self._numbers(text)
+            if claim_numbers and not claim_numbers <= evidence_numbers:
+                continue
+
+            evidence_tokens = self._content_tokens(text)
+            token_overlap = claim_tokens & evidence_tokens
+            if claim_tokens:
+                overlap_ratio = len(token_overlap) / len(claim_tokens)
+                min_overlap = 0.35 if claim_numbers else 0.6
+                if overlap_ratio < min_overlap or len(token_overlap) < min(2, len(claim_tokens)):
+                    continue
+            else:
+                overlap_ratio = 1.0
+
+            number_bonus = 0.25 if claim_numbers else 0.0
+            matches.append((overlap_ratio + number_bonus, evidence_id))
+
+        matches.sort(reverse=True)
+        return [evidence_id for _score, evidence_id in matches[:3]]
+
+    def _content_tokens(self, text: str) -> set[str]:
+        return {
+            token
+            for token in _WORD_RE.findall(self._normalize_text(text))
+            if len(token) > 2 and token not in _STOPWORDS
+        }
 
     def _normalize_text(self, text: str) -> str:
         return " ".join(_WORD_RE.findall(_MARKDOWN_RE.sub("", text).casefold()))

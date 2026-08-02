@@ -5,9 +5,14 @@ from typing import Final
 
 MODEL_OPTIONS: Final[tuple[dict[str, str], ...]] = (
     {
+        "id": "llama3.2:3b",
+        "label": "Llama 3.2 3B Local",
+        "description": "Primary local Ollama model for grounded answers.",
+    },
+    {
         "id": "gemma3:4b",
         "label": "Gemma 3 4B Local",
-        "description": "Default local model for grounded answers on CPU-only systems.",
+        "description": "Local fallback model for grounded answers on CPU-only systems.",
     },
     {
         "id": "qwen3.5:4b",
@@ -34,8 +39,9 @@ MODEL_OPTIONS: Final[tuple[dict[str, str], ...]] = (
 SUPPORTED_MODEL_IDS: Final[tuple[str, ...]] = tuple(
     option["id"] for option in MODEL_OPTIONS
 )
-DEFAULT_MODEL: Final[str] = "gemma3:4b"
+DEFAULT_MODEL: Final[str] = "llama3.2:3b"
 DEFAULT_ANSWER_MODEL_ORDER: Final[tuple[str, ...]] = (
+    "llama3.2:3b",
     "gemma3:4b",
     "gemini-3.6-flash",
     "llama-3.3-70b-versatile",

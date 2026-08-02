@@ -155,6 +155,24 @@ def test_official_document_terms_skip_llm_classifier():
     assert decision.source == "rule:document_search"
 
 
+def test_discontinued_student_policy_question_routes_to_document_search():
+    class FailIfClassifiedOfficialRouter(StubRouter):
+        def _classify_with_llm(self, query, normalized_query, aliases, chat_history):
+            raise AssertionError("Discontinuation policy must skip LLM classification.")
+
+    router = FailIfClassifiedOfficialRouter()
+
+    decision = router.classify(
+        "Can failing to submit an assignment cause a student to be discontinued from study?"
+    )
+
+    assert decision.intent == "UDOM_DOCUMENT_SEARCH"
+    assert decision.source == "rule:document_search"
+    assert decision.standalone_query == (
+        "Can failing to submit an assignment cause a student to be discontinued from study?"
+    )
+
+
 def test_swahili_official_question_routes_to_document_search():
     class FailIfClassifiedSwahiliRouter(StubRouter):
         def _classify_with_llm(self, query, normalized_query, aliases, chat_history):

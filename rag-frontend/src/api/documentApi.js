@@ -37,37 +37,39 @@ export async function uploadDocument(file, onProgress, onStatus, strategy = "aut
         const decoder = new TextDecoder();
         let done = false;
         let finalData = null;
+        let buffered = "";
+
+        const consumeLine = (line) => {
+            if (!line.trim()) return;
+            const data = JSON.parse(line);
+            if (data.error) {
+                throw new Error(data.error);
+            }
+            if (data.progress !== undefined) {
+                onProgress?.(data.progress);
+            }
+            if (data.status) {
+                onStatus?.(data.status);
+            }
+            if (data.progress === 100 && data.chunks_stored !== undefined) {
+                finalData = data;
+            }
+        };
 
         while (!done) {
             const { value, done: readerDone } = await reader.read();
             done = readerDone;
             if (value) {
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split('\\n').filter(Boolean);
+                buffered += decoder.decode(value, { stream: true });
+                const lines = buffered.split("\n");
+                buffered = lines.pop() || "";
                 for (const line of lines) {
-                    try {
-                        const data = JSON.parse(line);
-                        if (data.error) {
-                            throw new Error(data.error);
-                        }
-                        if (data.progress !== undefined) {
-                            onProgress?.(data.progress);
-                        }
-                        if (data.status) {
-                            onStatus?.(data.status);
-                        }
-                        if (data.progress === 100 && data.chunks_stored !== undefined) {
-                            finalData = data;
-                        }
-                    } catch (e) {
-                        if (e.message !== "Unexpected end of JSON input") {
-                            // If it's the error thrown by `data.error`, re-throw it
-                            if (line.includes('"error"')) throw e;
-                        }
-                    }
+                    consumeLine(line);
                 }
             }
         }
+        buffered += decoder.decode();
+        if (buffered.trim()) consumeLine(buffered);
         return finalData || { message: "Document processed successfully" };
     } catch (error) {
         throw new Error(
@@ -128,5 +130,23 @@ export function deleteDocumentsBatch(ids) {
 export function reindexDocument(id) {
     return requestDocument(`/documents/${encodeURIComponent(id)}/reindex`, {
         method: "POST",
+    });
+}
+
+export function getDocumentQuality(id) {
+    return requestDocument(`/documents/${encodeURIComponent(id)}/quality`);
+}
+
+export function auditDocumentQuality(ids = []) {
+    return requestDocument(`/documents/quality-audit`, {
+        method: "POST",
+        body: JSON.stringify({ document_ids: ids }),
+    });
+}
+
+export function approveDocumentQuality(id, reason) {
+    return requestDocument(`/documents/${encodeURIComponent(id)}/quality/approve`, {
+        method: "POST",
+        body: JSON.stringify({ reason }),
     });
 }

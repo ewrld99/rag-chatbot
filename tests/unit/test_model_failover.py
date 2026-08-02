@@ -8,14 +8,16 @@ from app.services.model_router import InvalidModelPreference, ModelRouter
 class StubSettings:
     generation_user_selection_enabled = True
     generation_allowed_models = [
+        "llama3.2:3b",
         "gemma3:4b",
         "qwen3.5:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
     ]
-    generation_default_model = "gemma3:4b"
+    generation_default_model = "llama3.2:3b"
     generation_answer_model_order = [
+        "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
@@ -44,6 +46,7 @@ def test_selected_answer_model_is_tried_before_automatic_fallbacks():
 
     assert router.candidates("document_answer", "llama-3.1-8b-instant") == [
         "llama-3.1-8b-instant",
+        "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
@@ -121,7 +124,7 @@ def test_failed_selected_model_falls_back_and_reports_selected_model():
 
     def callback(model):
         calls.append(model)
-        if model in {"llama-3.1-8b-instant", "qwen3.5:4b", "gemma3:4b"}:
+        if model in {"llama-3.1-8b-instant", "llama3.2:3b", "qwen3.5:4b", "gemma3:4b"}:
             raise GenerationUnavailableError(retry_after=600)
         return "answer"
 
@@ -136,11 +139,13 @@ def test_failed_selected_model_falls_back_and_reports_selected_model():
     assert result.fallback_used is True
     assert calls == [
         "llama-3.1-8b-instant",
+        "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
     ]
     assert [call["circuit_key"] for call in resilience.calls] == [
         "groq:llama-3.1-8b-instant",
+        "ollama:llama3.2:3b",
         "ollama:gemma3:4b",
         "gemini:gemini-3.6-flash",
     ]

@@ -1,8 +1,10 @@
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Iterator, TypeAlias
 
 from sqlalchemy import create_engine
 from sqlalchemy import text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.core.config import settings
 
@@ -10,10 +12,12 @@ engine = create_engine(
     settings.DATABASE_URL,
     pool_size=getattr(settings, "DATABASE_POOL_SIZE", 20),
     max_overflow=getattr(settings, "DATABASE_MAX_OVERFLOW", 20),
+    pool_timeout=getattr(settings, "DATABASE_POOL_TIMEOUT_SECONDS", 10.0),
     pool_pre_ping=True,
     pool_recycle=1800,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionFactory: TypeAlias = Callable[[], Session]
 Base = declarative_base()
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -22,6 +26,46 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    finally:
+        db.close()
+
+
+def get_session_factory() -> SessionFactory:
+    return SessionLocal
+
+
+def pool_snapshot() -> dict[str, int]:
+    """Return cheap QueuePool diagnostics for structured latency logs."""
+    pool = engine.pool
+    return {
+        "pool_checked_out": int(getattr(pool, "checkedout", lambda: 0)()),
+        "pool_overflow": int(getattr(pool, "overflow", lambda: 0)()),
+    }
+
+
+def session_factory_from_session(db: Session) -> SessionFactory:
+    """Create independent sessions on the same bind without retaining *db*."""
+    local_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        bind=db.get_bind(),
+        join_transaction_mode="create_savepoint",
+    )
+    return local_factory
+
+
+@contextmanager
+def session_scope(
+    session_factory: SessionFactory = SessionLocal,
+) -> Iterator[Session]:
+    """Own one transaction and always release its connection promptly."""
+    db = session_factory()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
