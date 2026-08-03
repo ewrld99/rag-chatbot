@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: str = ""
     LOG_LEVEL: str = "INFO"
 
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_OPENAI_BASE_URL: str = "https://openrouter.ai/api/v1"
     GEMINI_API_KEY: str = ""
     GEMINI_OPENAI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -50,34 +52,36 @@ class Settings(BaseSettings):
 
     # Provider-neutral generation settings. Empty values fall back to the
     # legacy GROQ_* names below so existing deployments remain compatible.
-    GENERATION_MODEL: str = ""
+    GENERATION_MODEL: str = "google/gemma-4-26b-a4b-it"
     GENERATION_ALLOWED_MODELS: str = ""
     GENERATION_ANSWER_MODEL_ORDER: str = ""
     GENERATION_UTILITY_MODEL_ORDER: str = ""
 
     # Deprecated compatibility aliases; model_provider() performs routing.
     GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama3.2:3b"
+    GROQ_MODEL: str = "google/gemma-4-26b-a4b-it"
     GROQ_ALLOWED_MODELS: str = (
+        "google/gemma-4-26b-a4b-it,"
+        "google/gemma-4-26b-a4b-it:free,"
         "llama3.2:3b,"
         "gemma3:4b,"
         "qwen3.5:4b,"
         "gemini-3.6-flash,"
-        "llama-3.3-70b-versatile,"
-        "llama-3.1-8b-instant"
+        "llama-3.3-70b-versatile"
     )
     GROQ_ANSWER_MODEL_ORDER: str = (
+        "google/gemma-4-26b-a4b-it,"
+        "google/gemma-4-26b-a4b-it:free,"
         "llama3.2:3b,"
         "gemma3:4b,"
         "gemini-3.6-flash,"
         "llama-3.3-70b-versatile,"
-        "llama-3.1-8b-instant,"
         "qwen3.5:4b"
     )
     GROQ_UTILITY_MODEL_ORDER: str = (
+        "llama-3.1-8b-instant,"
         "qwen2.5:1.5b,"
         "gemma3:4b,"
-        "llama-3.1-8b-instant,"
         "llama-3.3-70b-versatile"
     )
     GROQ_USER_MODEL_SELECTION_ENABLED: bool = True
@@ -117,7 +121,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     # --- Web Crawler ---
-    CRAWLER_ENABLED: bool = False
+    CRAWLER_ENABLED: bool = True
 
     # --- File Uploads & Server ---
     BASE_URL: str = "http://localhost:8000"

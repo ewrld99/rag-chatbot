@@ -155,3 +155,32 @@ def test_rag_pipeline_uses_deterministic_document_follow_up_query():
 
     assert retrieval_query == decision.standalone_query
     assert pipeline._generation_query(decision, "give the name", retrieval_query) == retrieval_query
+
+
+def test_rag_pipeline_rewrites_swahili_document_query_for_retrieval():
+    pipeline = object.__new__(RAGPipeline)
+
+    class Generator:
+        def is_history_dependent_query(self, _query):
+            return False
+
+        def rewrite_query(self, query, chat_history, user_profile=None):
+            assert query == "nataka kufahamu hatua za kughairisha mwaka wa masomo"
+            return "procedure to postpone a year of study"
+
+    pipeline.generator = Generator()
+    decision = IntentDecision(
+        intent="UDOM_DOCUMENT_SEARCH",
+        confidence=0.9,
+        reason="document search",
+        standalone_query="nataka kufahamu hatua za kughairisha mwaka wa masomo",
+        normalized_query="nataka kufahamu hatua za kughairisha mwaka wa masomo",
+        source="rule:document_search",
+    )
+
+    retrieval_query = pipeline._retrieval_query(
+        decision,
+        "nataka kufahamu hatua za kughairisha mwaka wa masomo",
+    )
+
+    assert retrieval_query == "procedure to postpone a year of study"

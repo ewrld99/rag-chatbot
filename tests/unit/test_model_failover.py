@@ -13,7 +13,6 @@ class StubSettings:
         "qwen3.5:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ]
     generation_default_model = "llama3.2:3b"
     generation_answer_model_order = [
@@ -21,13 +20,12 @@ class StubSettings:
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "qwen3.5:4b",
     ]
     generation_utility_model_order = [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
 
@@ -44,12 +42,11 @@ class PassthroughResilience:
 def test_selected_answer_model_is_tried_before_automatic_fallbacks():
     router = ModelRouter(StubSettings())
 
-    assert router.candidates("document_answer", "llama-3.1-8b-instant") == [
-        "llama-3.1-8b-instant",
+    assert router.candidates("document_answer", "llama-3.3-70b-versatile") == [
+        "llama-3.3-70b-versatile",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
-        "llama-3.3-70b-versatile",
         "qwen3.5:4b",
     ]
 
@@ -67,19 +64,19 @@ def test_lightweight_utility_operations_use_the_configured_utility_order(operati
     router = ModelRouter(StubSettings())
 
     assert router.candidates(operation, "gemini-3.6-flash") == [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
 
 
-def test_grounding_verification_uses_gemma_first():
+def test_grounding_verification_uses_instant_llama_first():
     router = ModelRouter(StubSettings())
 
     assert router.candidates("grounding_verification", "auto") == [
-        "gemma3:4b",
         "llama-3.1-8b-instant",
+        "gemma3:4b",
         "llama-3.3-70b-versatile",
         "qwen2.5:1.5b",
     ]
@@ -93,8 +90,8 @@ def test_stale_gemini_utility_setting_is_filtered_at_runtime():
     ]
 
     assert ModelRouter(settings).candidates("grounding_verification", "auto") == [
-        "gemma3:4b",
         "llama-3.1-8b-instant",
+        "gemma3:4b",
         "llama-3.3-70b-versatile",
         "qwen2.5:1.5b",
     ]
@@ -102,8 +99,8 @@ def test_stale_gemini_utility_setting_is_filtered_at_runtime():
 
 def test_disabled_unknown_or_utility_only_model_cannot_be_selected():
     settings = StubSettings()
-    settings.generation_allowed_models = ["llama-3.1-8b-instant"]
-    settings.generation_default_model = "llama-3.1-8b-instant"
+    settings.generation_allowed_models = ["llama-3.3-70b-versatile"]
+    settings.generation_default_model = "llama-3.3-70b-versatile"
     router = ModelRouter(settings)
 
     with pytest.raises(InvalidModelPreference):
@@ -111,6 +108,9 @@ def test_disabled_unknown_or_utility_only_model_cannot_be_selected():
 
     with pytest.raises(InvalidModelPreference):
         router.normalize_preference("qwen2.5:1.5b")
+
+    with pytest.raises(InvalidModelPreference):
+        router.normalize_preference("llama-3.1-8b-instant")
 
 
 def test_failed_selected_model_falls_back_and_reports_selected_model():
@@ -124,13 +124,13 @@ def test_failed_selected_model_falls_back_and_reports_selected_model():
 
     def callback(model):
         calls.append(model)
-        if model in {"llama-3.1-8b-instant", "llama3.2:3b", "qwen3.5:4b", "gemma3:4b"}:
+        if model in {"llama-3.3-70b-versatile", "llama3.2:3b", "qwen3.5:4b", "gemma3:4b"}:
             raise GenerationUnavailableError(retry_after=600)
         return "answer"
 
     result = service.execute(
         "document_answer",
-        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
         callback,
     )
 
@@ -138,13 +138,13 @@ def test_failed_selected_model_falls_back_and_reports_selected_model():
     assert result.selected_model == "gemini-3.6-flash"
     assert result.fallback_used is True
     assert calls == [
-        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
     ]
     assert [call["circuit_key"] for call in resilience.calls] == [
-        "groq:llama-3.1-8b-instant",
+        "groq:llama-3.3-70b-versatile",
         "ollama:llama3.2:3b",
         "ollama:gemma3:4b",
         "gemini:gemini-3.6-flash",

@@ -26,12 +26,13 @@ const RefreshIcon = () => (
 
 // ─── Setting metadata ──────────────────────────────────────────────────────────
 const GENERATION_MODELS = [
+    "google/gemma-4-26b-a4b-it",
+    "google/gemma-4-26b-a4b-it:free",
     "llama3.2:3b",
     "gemma3:4b",
     "qwen3.5:4b",
     "gemini-3.6-flash",
     "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
 ];
 
 const SETTING_META = {
@@ -77,6 +78,7 @@ const SETTING_META = {
     },
     max_upload_size_mb: { label: "Max Upload Size (MB)", type: "number", min: 1,    max: 100,  step: 1,   reindex: false },
     allowed_extensions: { label: "Allowed Extensions",  type: "text",                                    reindex: false },
+    crawler_enabled:    { label: "Enable Web Crawler",  type: "toggle",                                  reindex: false },
     crawler_allowlist:  { label: "Crawler Allowlist (Domains)", type: "text",                            reindex: false },
     crawler_blocklist:  { label: "Crawler Blocklist (Domains)", type: "text",                            reindex: false },
     crawler_max_age_days:{ label: "Max Announcement Age (Days)", type: "number", min: 0, max: 3650, step: 1, reindex: false },
@@ -128,7 +130,7 @@ const GROUPS = [
         label: "Web Crawler",
         eyebrow: "Crawling Restrictions",
         description: "Configure which domains the web crawler is allowed or blocked from visiting. Comma-separated.",
-        keys: ["crawler_allowlist", "crawler_blocklist", "crawler_max_age_days"],
+        keys: ["crawler_enabled", "crawler_allowlist", "crawler_blocklist", "crawler_max_age_days"],
     },
 ];
 
@@ -370,7 +372,10 @@ export default function RagSettings() {
             return;
         }
         addToast(`"${SETTING_META[key]?.label || key}" saved successfully.`, "success");
-    }, [addToast, loadSettings]);
+        if (key === "crawler_enabled") {
+            fetchCrawlerStatus();
+        }
+    }, [addToast, loadSettings, fetchCrawlerStatus]);
 
     const handleTriggerFull = async () => {
         try {

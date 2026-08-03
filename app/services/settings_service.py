@@ -50,6 +50,7 @@ DEFAULT_SETTINGS = [
     {"key": "similarity_metric", "value": "cosine", "description": "Vector similarity metric", "category": "retrieval"},
     {"key": "max_upload_size_mb", "value": "20", "description": "Maximum allowed upload size in megabytes", "category": "upload"},
     {"key": "allowed_extensions", "value": "pdf,docx,txt", "description": "Comma-separated list of allowed file extensions", "category": "upload"},
+    {"key": "crawler_enabled", "value": "true", "description": "Enable manual web crawler controls in the admin UI", "category": "crawler"},
     {"key": "crawler_allowlist", "value": "www.udom.ac.tz,portal.udom.ac.tz,coi.udom.ac.tz,oas.udom.ac.tz,sr2.udom.ac.tz", "description": "Comma-separated domains allowed for crawling", "category": "crawler"},
     {"key": "crawler_blocklist", "value": "twitter.com,facebook.com,instagram.com,/university_documents/,/login,/logout,/admin,/search,/profile", "description": "Comma-separated domains or paths strictly blocked from crawling", "category": "crawler"},
     {"key": "crawler_max_age_days", "value": "90", "description": "Maximum age of announcements in days (0 to disable)", "category": "crawler"},
@@ -86,6 +87,8 @@ _LEGACY_GENERATION_VALUES = {
         "gemini-3.6-flash,llama-3.3-70b-versatile,llama-3.1-8b-instant",
     },
     "generation_default_model": {
+        "llama3.2:3b",
+        "gemini-3.6-flash",
         "qwen3.5:4b",
         "gemma3:4b",
         "openai/gpt-oss-120b",
@@ -118,23 +121,10 @@ def seed_default_settings(db: Session):
         ):
             existing.value = setting_data["value"]
             continue
-        if (
-            setting_data["key"] == "generation_default_model"
-            and str(existing.value).strip() == "gemini-3.6-flash"
-            and _has_legacy_hosted_answer_defaults(db)
-        ):
-            existing.value = setting_data["value"]
-            continue
         if setting_data["key"] == "generation_default_model":
             existing_value = str(existing.value).strip()
-            if existing_value not in SUPPORTED_MODEL_IDS:
-                existing.value = setting_data["value"]
-            elif (
-                existing_value in _LEGACY_GENERATION_VALUES["generation_default_model"]
-                and existing_value != setting_data["value"]
-                and _has_legacy_answer_routing_defaults(db)
-            ):
-                existing.value = setting_data["value"]
+            if existing_value not in SUPPORTED_MODEL_IDS or existing_value != DEFAULT_MODEL:
+                existing.value = DEFAULT_MODEL
             continue
 
         if (
@@ -415,6 +405,10 @@ class SettingsService:
         return self._list("crawler_allowlist", ["www.udom.ac.tz", "portal.udom.ac.tz", "coi.udom.ac.tz", "oas.udom.ac.tz", "sr2.udom.ac.tz"])
 
     @property
+    def crawler_enabled(self) -> bool:
+        return self._bool("crawler_enabled", env_settings.CRAWLER_ENABLED)
+
+    @property
     def crawler_blocklist(self) -> List[str]:
         return self._list("crawler_blocklist", ["twitter.com", "facebook.com", "instagram.com", "/university_documents/", "/login", "/logout", "/admin", "/search", "/profile"])
 
@@ -499,7 +493,13 @@ class SettingsService:
                 if value not in SUPPORTED_MODEL_IDS:
                     raise ValueError("generation_default_model is not supported")
                 if value not in self.generation_allowed_models:
-                    raise ValueError("generation_default_model must be enabled")
+                    allowed_setting = self.db.query(SystemSetting).filter_by(key="generation_allowed_models").first()
+                    if allowed_setting:
+                        current = [m.strip() for m in str(allowed_setting.value).split(",") if m.strip()]
+                        if value not in current:
+                            allowed_setting.value = ",".join([value, *current])
+                            self.db.add(allowed_setting)
+                            self.db.commit()
             elif key in {
                 "generation_allowed_models",
                 "generation_answer_model_order",
@@ -544,10 +544,10 @@ class SettingsService:
                 ):
                     raise ValueError(f"{key} may contain only enabled models")
                 value = ",".join(models)
-            elif key == "generation_user_selection_enabled":
+            elif key in {"generation_user_selection_enabled", "crawler_enabled"}:
                 if value.lower() not in {"true", "false"}:
                     raise ValueError(
-                        "generation_user_selection_enabled must be true or false"
+                        f"{key} must be true or false"
                     )
                 value = value.lower()
             elif key == "allowed_extensions":

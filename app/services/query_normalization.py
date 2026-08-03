@@ -23,7 +23,7 @@ class QueryVariant:
 
 
 MAX_EXPANDED_TERMS = 12
-TOKEN_RE = re.compile(r"[a-z0-9]+")
+TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 SAFE_METADATA_TEXT_KEYS = ("source", "document_title", "source_url", "category")
 
 DOMAIN_TERMS = {
@@ -31,6 +31,19 @@ DOMAIN_TERMS = {
     "dodoma",
     "university",
     "universityofdodoma",
+}
+
+SWAHILI_QUERY_TERMS = {
+    "ada", "ahirisha", "baada", "barua", "chuo", "eleza", "fanya",
+    "hatua", "hati", "hivyo", "jinsi", "kanuni", "kuahirisha",
+    "kufahamu", "kufanya", "kughairi", "kughairisha", "kuhusu",
+    "kujisajili", "kusitisha", "kutuma", "maadili", "mahafali", "malipo",
+    "masomo", "matokeo", "mavazi", "mchakato", "mfumo", "mhitimu",
+    "mitihani", "mtihani", "mwanafunzi", "mwaka", "nani", "nataka",
+    "nidhamu", "nipe", "nini", "nita", "nitaruhusiwa", "ombeni",
+    "ombi", "programu", "rufaa", "sajili", "shahada",
+    "taratibu", "utaratibu", "udahili", "usajili", "vipi", "wapi",
+    "wastani",
 }
 
 QUESTION_STOPWORDS = {
@@ -96,7 +109,11 @@ FALLBACK_ALIAS_EXPANSIONS: dict[str, list[str]] = {
         "intermission",
         "kuahirisha",
         "ahirisha",
+        "kughairi",
+        "kughairisha",
         "kuahirisha masomo",
+        "kughairi masomo",
+        "kughairisha mwaka wa masomo",
         "kusitisha masomo",
     ],
     "registration": ["registration", "register", "student registration", "usajili", "kujisajili"],
@@ -152,6 +169,11 @@ def tokenize(query: str) -> list[str]:
 
 def token_set(text: str) -> set[str]:
     return set(tokenize(text))
+
+
+def likely_swahili_query(query: str) -> bool:
+    tokens = set(tokenize(query))
+    return bool(tokens & SWAHILI_QUERY_TERMS)
 
 
 def metadata_search_text(metadata: Mapping[str, object] | None) -> str:

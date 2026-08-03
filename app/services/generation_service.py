@@ -1,3 +1,145 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from functools import lru_cache
+import asyncio
+import inspect
+import json
+import re
+import logging
+from typing import Dict, Any, AsyncGenerator, List, Literal, Optional
+import httpx
+from groq import Groq, AsyncGroq
+from openai import OpenAI, AsyncOpenAI
+from langchain_core.documents import Document
+from pydantic import BaseModel, Field
+from app.core.config import settings
+from app.core.logging import format_log_event
+from app.core.time import application_now
+from app.services.generation_resilience import (
+    GenerationUnavailableError,
+    is_structured_output_error,
+)
+from app.services.grounding_service import (
+    EvidenceChunk,
+    GroundedClaim,
+    GroundedDraft,
+    GroundingOutcome,
+    GroundingService,
+    ValidationReport,
+    VerificationReport,
+)
+from app.services.model_failover import ModelExecutionResult, ModelFailoverService
+from app.services.model_catalog import model_provider
+from app.services.model_router import ModelRouter
+from app.services.tls_service import system_ssl_context
+
+logger = logging.getLogger(__name__)
+
+
+class _VerificationClaimPayload(BaseModel):
+    index: int
+    verdict: Literal["SUPPORTED", "CONTRADICTED", "NOT_ENOUGH_INFORMATION"]
+
+
+class _VerificationPayload(BaseModel):
+    claims: list[_VerificationClaimPayload]
+
+
+class _GroundedClaimsPayload(BaseModel):
+    coverage: Literal["full", "partial", "none"]
+    claims: list[GroundedClaim] = Field(default_factory=list, max_length=30)
+
+
+class _IntentClassifierPayload(BaseModel):
+    intent: Literal[
+        "CONVERSATIONAL",
+        "STUDENT_SUPPORT",
+        "UDOM_DOCUMENT_SEARCH",
+        "CLARIFY",
+        "OUT_OF_SCOPE",
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
+    standalone_query: str | None = None
+
+
+class _JSONClaimStreamExtractor:
+    """Incrementally decode claim strings from a streamed JSON object."""
+
+    _CLAIM_KEY = re.compile(r'"claim"\s*:\s*"')
+    _ESCAPES = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+
+    def __init__(self, *, ordered: bool) -> None:
+        self.ordered = ordered
+        self.reset()
+
+    def reset(self) -> None:
+        self.buffer = ""
+        self.cursor = 0
+        self.in_claim = False
+        self.claim_count = 0
+
+    def feed(self, delta: str) -> list[str]:
+        if not delta:
+            return []
+        self.buffer += delta
+        output: list[str] = []
+
+        while True:
+            if not self.in_claim:
+                match = self._CLAIM_KEY.search(self.buffer, self.cursor)
+                if match is None:
+                    self.cursor = max(self.cursor, len(self.buffer) - 32)
+                    break
+                self.cursor = match.end()
+                self.in_claim = True
+                self.claim_count += 1
+                prefix = f"{self.claim_count}. " if self.ordered else "- "
+                output.append(prefix)
+
+            decoded: list[str] = []
+            while self.cursor < len(self.buffer):
+                character = self.buffer[self.cursor]
+                if character == '"':
+                    self.cursor += 1
+                    self.in_claim = False
+                    decoded.append("\n")
+                    break
+                if character != "\\":
+                    decoded.append(character)
+                    self.cursor += 1
+                    continue
+                if self.cursor + 1 >= len(self.buffer):
+                    break
+
+                escape = self.buffer[self.cursor + 1]
+                if escape == "u":
+                    if self.cursor + 6 > len(self.buffer):
+                        break
+                    raw_codepoint = self.buffer[self.cursor + 2:self.cursor + 6]
+                    try:
+                        decoded.append(chr(int(raw_codepoint, 16)))
+                    except ValueError:
+                        decoded.append("\\u" + raw_codepoint)
+                    self.cursor += 6
+                    continue
+
+                decoded.append(self._ESCAPES.get(escape, escape))
+                self.cursor += 2
+
+            if decoded:
+                output.append("".join(decoded))
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
@@ -146,6 +288,8 @@ class _JSONClaimStreamExtractor:
 
 @dataclass(frozen=True)
 class _GenerationClients:
+    openrouter: OpenAI | None
+    async_openrouter: AsyncOpenAI | None
     gemini: OpenAI | None
     async_gemini: AsyncOpenAI | None
     ollama: OpenAI
@@ -157,6 +301,22 @@ class _GenerationClients:
 @lru_cache(maxsize=1)
 def get_generation_clients() -> _GenerationClients:
     """Build one process-wide HTTP client pool shared by request services."""
+    openrouter = None
+    async_openrouter = None
+    if settings.OPENROUTER_API_KEY:
+        openrouter = OpenAI(
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url=settings.OPENROUTER_OPENAI_BASE_URL,
+            http_client=httpx.Client(verify=system_ssl_context()),
+            max_retries=0,
+        )
+        async_openrouter = AsyncOpenAI(
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url=settings.OPENROUTER_OPENAI_BASE_URL,
+            http_client=httpx.AsyncClient(verify=system_ssl_context()),
+            max_retries=0,
+        )
+
     gemini = None
     async_gemini = None
     if settings.GEMINI_API_KEY:
@@ -201,6 +361,8 @@ def get_generation_clients() -> _GenerationClients:
         )
 
     return _GenerationClients(
+        openrouter=openrouter,
+        async_openrouter=async_openrouter,
         gemini=gemini,
         async_gemini=async_gemini,
         ollama=ollama,
@@ -216,10 +378,10 @@ async def close_generation_clients() -> None:
         return
 
     clients = get_generation_clients()
-    for client in (clients.gemini, clients.ollama, clients.groq):
+    for client in (clients.openrouter, clients.gemini, clients.ollama, clients.groq):
         if client is not None:
             client.close()
-    for client in (clients.async_gemini, clients.async_ollama, clients.async_groq):
+    for client in (clients.async_openrouter, clients.async_gemini, clients.async_ollama, clients.async_groq):
         if client is None:
             continue
         result = client.close()
@@ -233,28 +395,34 @@ class GenerationService:
     _CALCULATION_QUERY_RE = re.compile(
         r"\b(?:calculate|calculated|calculating|calculation|compute|computed|"
         r"formula|equation|gpa|cgpa|grade point average|hesabu|kuhesabu|"
-        r"inahesabiwa|wastani)\b",
+        r"inahesabiwa|wastani|alama|jumla|uzito)\b",
         re.IGNORECASE,
     )
     _PROCEDURE_QUERY_RE = re.compile(
         r"\b(?:how to|how do|how does|process|procedure|steps?|apply|"
         r"register|appeal|submit|postpone|postponement|defer|deferment|"
-        r"jinsi|utaratibu|hatua)\b",
+        r"jinsi|utaratibu|taratibu|hatua|omba|maombi|sajili|jisajili|"
+        r"rufaa|wasilisha|tuma|ahirisha|kuahirisha|kughairi|kughairisha|"
+        r"kusitisha)\b",
         re.IGNORECASE,
     )
     _CURRICULUM_LIST_QUERY_RE = re.compile(
-        r"\b(?:course|courses|unit|units|module|modules|subject|subjects|curriculum)\b",
+        r"\b(?:course|courses|unit|units|module|modules|subject|subjects|"
+        r"curriculum|kozi|somo|masomo|moduli|programu|mtaala)\b",
         re.IGNORECASE,
     )
     _ENUMERATION_QUERY_RE = re.compile(
         r"\b(?:what\s+(?:is|are)|which\s+(?:is|are)|list|show|give|provide|"
-        r"tell\s+me|explain)\b",
+        r"tell\s+me|explain|ni\s+nini|zipi|ipi|orodhesha|onyesha|toa|"
+        r"nipe|eleza|fafanua|taja)\b",
         re.IGNORECASE,
     )
     _ENUMERATION_TOPIC_RE = re.compile(
         r"\b(?:dress(?:ing)?\s+codes?|attire|rules?|requirements?|conditions?|"
         r"criteria|documents?|prohibited|forbidden|allowed|acceptable|appropriate|"
-        r"inappropriate|penalties|sanctions?|types?|categories?)\b",
+        r"inappropriate|penalties|sanctions?|types?|categories?|kanuni|sheria|"
+        r"mahitaji|masharti|vigezo|nyaraka|hati|marufuku|inaruhusiwa|"
+        r"yanayofaa|yasiyofaa|adhabu|aina|makundi|mavazi)\b",
         re.IGNORECASE,
     )
     _EVIDENCE_LIST_ITEM_RE = re.compile(
@@ -271,7 +439,9 @@ class GenerationService:
         r"title|titles|details?|answer|source|sources)|"
         r"(?:more|further)\s+(?:details?|information)|"
         r"(?:what|who)\s+(?:is|are)\s+(?:the\s+|his\s+|her\s+|their\s+)?"
-        r"(?:name|date|number|title)|nipe\s+jina|eleza\s+zaidi)\s*[?.!]*\s*$",
+        r"(?:name|date|number|title)|nipe\s+jina|eleza\s+zaidi|fafanua|"
+        r"toa\s+(?:tarehe|jina|namba|chanzo|vyanzo)|"
+        r"taja\s+(?:tarehe|jina|namba|chanzo|vyanzo))\s*[?.!]*\s*$",
         re.IGNORECASE,
     )
     _QUERY_TYPO_TERMS = {
@@ -322,6 +492,23 @@ class GenerationService:
         "Ask exactly one focused clarification question before answering. "
         "Keep it brief, natural, and in the same language the user used."
     )
+    OUT_OF_SCOPE_SYSTEM_PROMPT = (
+        "You are a friendly University of Dodoma (UDOM) assistant. "
+        "The user's latest request is outside your supported scope: official UDOM document questions "
+        "and general university student support. "
+        "Do not answer the out-of-scope request. Briefly explain the boundary and redirect the user "
+        "toward a UDOM or student-support question. "
+        "Respond in the same language as the latest user message. Keep it natural and concise."
+    )
+    DOCUMENT_REFUSAL_SYSTEM_PROMPT = (
+        "You are a UDOM document-grounded assistant. "
+        "The application has determined that the available official documents do not contain enough "
+        "reliable evidence to answer the user's latest question. "
+        "Do not answer using general knowledge, guesses, or assumptions. "
+        "Briefly explain that the available official documents do not provide the needed information, "
+        "and suggest checking the relevant UDOM office, department, or official source. "
+        "Respond in the same language as the latest user message. Keep it natural and concise."
+    )
 
     def __init__(self, model_router: ModelRouter | None = None):
         self.model_router = model_router or ModelRouter()
@@ -329,6 +516,8 @@ class GenerationService:
         self.model = self.model_router.default_model
         self._validate_default_provider_configuration()
         clients = get_generation_clients()
+        self.openrouter_client = clients.openrouter
+        self.async_openrouter_client = clients.async_openrouter
         self.gemini_client = clients.gemini
         self.async_gemini_client = clients.async_gemini
         self.ollama_client = clients.ollama
@@ -342,6 +531,8 @@ class GenerationService:
 
     def _validate_default_provider_configuration(self) -> None:
         provider = model_provider(self.model)
+        if provider == "openrouter" and not settings.OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY is missing while OpenRouter is the default generation model")
         if provider == "gemini" and not settings.GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY is missing while Gemini is the default generation model")
         if provider == "groq" and not settings.GROQ_API_KEY:
@@ -349,6 +540,10 @@ class GenerationService:
 
     def _sync_client_for_model(self, model: str) -> Any:
         provider = model_provider(model)
+        if provider == "openrouter":
+            if self.openrouter_client is None:
+                raise RuntimeError("OPENROUTER_API_KEY is missing for OpenRouter generation")
+            return self.openrouter_client
         if provider == "gemini":
             if self.gemini_client is None:
                 raise RuntimeError("GEMINI_API_KEY is missing for Gemini generation")
@@ -359,6 +554,8 @@ class GenerationService:
             if self.client is None:
                 raise RuntimeError("GROQ_API_KEY is missing for Groq generation")
             return self.client
+        if getattr(self, "openrouter_client", None) is not None:
+            return self.openrouter_client
         if getattr(self, "client", None) is not None:
             return self.client
         if getattr(self, "gemini_client", None) is not None:
@@ -367,6 +564,10 @@ class GenerationService:
 
     def _async_client_for_model(self, model: str) -> Any:
         provider = model_provider(model)
+        if provider == "openrouter":
+            if self.async_openrouter_client is None:
+                raise RuntimeError("OPENROUTER_API_KEY is missing for OpenRouter generation")
+            return self.async_openrouter_client
         if provider == "gemini":
             if self.async_gemini_client is None:
                 raise RuntimeError("GEMINI_API_KEY is missing for Gemini generation")
@@ -377,6 +578,8 @@ class GenerationService:
             if self.async_client is None:
                 raise RuntimeError("GROQ_API_KEY is missing for Groq generation")
             return self.async_client
+        if getattr(self, "async_openrouter_client", None) is not None:
+            return self.async_openrouter_client
         if getattr(self, "async_client", None) is not None:
             return self.async_client
         if getattr(self, "async_gemini_client", None) is not None:
@@ -841,9 +1044,8 @@ class GenerationService:
     def _gemini_parse_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         parse_kwargs = dict(kwargs)
         parse_kwargs.pop("response_format", None)
-        # Gemini 3.6 may spend completion tokens on reasoning before emitting
-        # schema output. The schema itself bounds the response safely.
-        parse_kwargs.pop("max_tokens", None)
+        # Bounded max_tokens prevents Gemini 3.6 from stalling in an unbounded reasoning loop.
+        parse_kwargs["max_tokens"] = min(int(kwargs.get("max_tokens") or 2500), 3000)
         return parse_kwargs
 
     @staticmethod
@@ -935,16 +1137,17 @@ class GenerationService:
             "Use coverage 'full' when the documents fully answer the question.\n"
             "Use coverage 'partial' when the documents partly answer it; answer with what is available and clearly state what is not covered.\n"
             "Use coverage 'none' only when the documents contain absolutely nothing relevant to the question. "
-            "Return no claims in that case; the application supplies this refusal phrase:\n"
-            f"\"{self.DOCUMENT_REFUSAL}\"\n"
-            "Never mix a partial answer with the refusal phrase.\n\n"
+            "Return no claims in that case; the application will generate a separate refusal message. "
+            "Never include refusal text in the JSON answer or mix a partial answer with a refusal.\n\n"
             "[GENERAL REASONING]\n"
             "Do not use general reasoning for factual UDOM claims. You may use basic reasoning only to organize, summarize, or perform transparent arithmetic from retrieved evidence.\n\n"
             "[FORMATTING]\n"
-            "Write claim text as clear user-facing factual units. The application will format those units as bullets or ordered steps. "
-            "Be complete before concise: remove repetition, but do not omit relevant formulas, steps, "
-            "conditions, programme distinctions, examples present in the evidence, or exceptions. "
-            "Be professional and helpful.\n\n"
+            "Write claim text as clean, well-structured, non-repetitive user-facing list items or sentences.\n"
+            "CRITICAL: DO NOT repeat the main question preamble across multiple claims! "
+            "(For example, DO NOT write: 'The courses for first-year include X', 'The courses for first-year include Y'. "
+            "Instead, state each item directly: 'LG 102 Communication Skills — Core (7.5 credits)').\n"
+            "Be complete before concise: remove repetitive preambles, but retain all course codes, titles, statuses, credits, formulas, steps, conditions, or exceptions present in the evidence.\n"
+            "Be professional, clear, and well-structured.\n\n"
             "[SOURCES]\n"
             "Do not include citations, document IDs, source names, URLs, or a Sources section inside claim text. "
             "Evidence IDs belong only in each claim's evidence_ids array. "
@@ -954,12 +1157,12 @@ class GenerationService:
             "{\n"
             '  "coverage": "full | partial | none",\n'
             '  "claims": [\n'
-            '    {"claim": "One complete user-facing factual sentence, step, formula, or table row", '
+            '    {"claim": "Clean concise factual item, step, formula, or detail without repetitive intro phrases", '
             '"evidence_ids": ["ev-..."]}\n'
             "  ]\n"
             "}\n"
             "The claims array is the answer: do not add or repeat an answer field. "
-            "Keep claim records atomic and in the order they should be shown to the user. "
+            "Keep claim records in logical, natural reading order. "
             "Omit Markdown markers such as bullets, numbering, bolding, and table pipes from claim text. "
             "Each evidence ID must come from a provided document and directly support the complete claim. "
             "Do not cite an evidence ID merely because its document is topically related. "
@@ -1127,12 +1330,10 @@ class GenerationService:
             )
         if self._CURRICULUM_LIST_QUERY_RE.search(query):
             return (
-                "This is a curriculum/course-list question. Treat each retrieved "
-                "'UDOM Undergraduate Curriculum Course' document as one valid course row. "
-                "When the rows match the requested programme, year of study, and semester, "
-                "answer with a compact Markdown table containing Course Code, Course Title, "
-                "Status, and Credits. Do not refuse merely because each course is in a separate "
-                "document element."
+                "This is a curriculum/course-list question. List EVERY single course present in "
+                "the retrieved evidence for the requested programme, year of study, and semester. "
+                "For each course, include its Course Code, Course Title, Status (Core/Elective), and Credits. "
+                "Do NOT omit, summarize, or truncate any course. Include all course items present in the evidence."
             )
         if self._is_enumeration_query(query):
             return (
@@ -1223,6 +1424,13 @@ QUESTION:
             raise GenerationUnavailableError() from exc
 
         grounding_outcome = self._set_grounding_outcome(outcome)
+        grounding_outcome = self._dynamic_document_refusal_outcome(
+            grounding_outcome,
+            query,
+            chat_history,
+            user_profile,
+            reason="Retrieved evidence did not support an answer.",
+        )
 
         return {
             "query": query,
@@ -1236,6 +1444,73 @@ QUESTION:
             "grounding": grounding_outcome.to_dict(),
             **self.model_metadata(),
         }
+
+    def _dynamic_document_refusal_outcome(
+        self,
+        outcome: GroundingOutcome,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]],
+        user_profile: Optional[Dict[str, Any]],
+        reason: Optional[str] = None,
+    ) -> GroundingOutcome:
+        if outcome.status != "refused":
+            return outcome
+        try:
+            answer = self.generate_document_refusal(
+                query,
+                chat_history,
+                user_profile=user_profile,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("Dynamic document refusal failed; using static safety fallback")
+            return outcome
+        updated = GroundingOutcome(
+            answer=self.sanitize_document_answer(answer),
+            coverage=outcome.coverage,
+            evidence_ids=outcome.evidence_ids,
+            claim_count=outcome.claim_count,
+            supported_claim_count=outcome.supported_claim_count,
+            repaired=outcome.repaired,
+            status=outcome.status,
+        )
+        self._last_grounding_outcome = updated
+        return updated
+
+    async def _dynamic_document_refusal_outcome_async(
+        self,
+        outcome: GroundingOutcome,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]],
+        user_profile: Optional[Dict[str, Any]],
+        reason: Optional[str] = None,
+    ) -> GroundingOutcome:
+        if outcome.status != "refused":
+            return outcome
+        try:
+            chunks = [
+                chunk
+                async for chunk in self.stream_document_refusal(
+                    query,
+                    chat_history,
+                    user_profile=user_profile,
+                    reason=reason,
+                )
+            ]
+        except Exception:
+            logger.exception("Dynamic streamed document refusal failed; using static safety fallback")
+            return outcome
+        updated = GroundingOutcome(
+            answer=self.sanitize_document_answer("".join(chunks)),
+            coverage=outcome.coverage,
+            evidence_ids=outcome.evidence_ids,
+            claim_count=outcome.claim_count,
+            supported_claim_count=outcome.supported_claim_count,
+            repaired=outcome.repaired,
+            status=outcome.status,
+        )
+        self._last_grounding_outcome = updated
+        return updated
 
     def grounding_metadata(self) -> Dict[str, Any]:
         outcome = self._last_grounding_outcome
@@ -1342,15 +1617,20 @@ QUESTION:
         batch_size = max(1, settings.GENERATION_VERIFICATION_BATCH_SIZE)
         if len(claim_indexes) > batch_size:
             combined = VerificationReport()
-            for start in range(0, len(claim_indexes), batch_size):
-                batch = claim_indexes[start:start + batch_size]
-                report = (
-                    self._semantic_verify(draft, evidence, batch, query)
-                    if query
-                    else self._semantic_verify(draft, evidence, batch)
-                )
-                combined.verdicts.update(report.verdicts)
-                combined.errors.extend(report.errors)
+            batches = [
+                claim_indexes[start:start + batch_size]
+                for start in range(0, len(claim_indexes), batch_size)
+            ]
+            max_workers = min(4, len(batches))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(self._semantic_verify, draft, evidence, batch, query)
+                    for batch in batches
+                ]
+                for future in as_completed(futures):
+                    report = future.result()
+                    combined.verdicts.update(report.verdicts)
+                    combined.errors.extend(report.errors)
             return combined
 
         response = self._create_utility_completion(
@@ -2084,6 +2364,13 @@ QUESTION:
                     raise payload
 
                 grounding_outcome = self._set_grounding_outcome(payload)
+                grounding_outcome = await self._dynamic_document_refusal_outcome_async(
+                    grounding_outcome,
+                    query,
+                    chat_history,
+                    user_profile,
+                    reason="Retrieved evidence did not support an answer.",
+                )
                 final_answer = grounding_outcome.answer
                 yield {
                     "type": "replace",
@@ -2144,11 +2431,45 @@ QUESTION:
         if not claim_indexes:
             return VerificationReport()
 
+        local_verdicts: Dict[int, str] = {}
+        unverified_indexes: List[int] = []
+
+        for idx in claim_indexes:
+            if idx < 0 or idx >= len(draft.claims):
+                continue
+            c = draft.claims[idx]
+            claim_text = str(c.claim or "").strip()
+            if not claim_text:
+                local_verdicts[idx] = "NOT_ENOUGH_INFORMATION"
+                continue
+            ev_ids = [str(e).strip() for e in (c.evidence_ids or []) if str(e).strip()]
+            matched = False
+            for ev_id in ev_ids:
+                if ev_id in evidence:
+                    ev_text = evidence[ev_id].text
+                    clean_claim = claim_text.lower()
+                    clean_ev = ev_text.lower()
+                    # Substring match or complete word-set match
+                    if clean_claim in clean_ev:
+                        matched = True
+                        break
+                    claim_tokens = {t for t in re.findall(r"\w+", clean_claim) if len(t) > 2}
+                    if claim_tokens and all(t in clean_ev for t in claim_tokens):
+                        matched = True
+                        break
+            if matched:
+                local_verdicts[idx] = "SUPPORTED"
+            else:
+                unverified_indexes.append(idx)
+
+        if not unverified_indexes:
+            return VerificationReport(verdicts=local_verdicts)
+
         batch_size = max(1, settings.GENERATION_VERIFICATION_BATCH_SIZE)
-        if len(claim_indexes) > batch_size:
-            combined = VerificationReport()
-            for start in range(0, len(claim_indexes), batch_size):
-                batch = claim_indexes[start:start + batch_size]
+        if len(unverified_indexes) > batch_size:
+            combined = VerificationReport(verdicts=local_verdicts)
+            for start in range(0, len(unverified_indexes), batch_size):
+                batch = unverified_indexes[start:start + batch_size]
                 report = (
                     await self._semantic_verify_async(draft, evidence, batch, query)
                     if query
@@ -2160,15 +2481,17 @@ QUESTION:
 
         response = await self._create_utility_completion_async(
             "grounding_verification",
-            messages=self._verification_messages(draft, evidence, claim_indexes, query),
+            messages=self._verification_messages(draft, evidence, unverified_indexes, query),
             temperature=0.0,
-            max_tokens=min(1000, 120 + (len(claim_indexes) * 100)),
+            max_tokens=min(1000, 120 + (len(unverified_indexes) * 100)),
             response_format={"type": "json_object"},
         )
-        return self.grounding.parse_verification(
+        report = self.grounding.parse_verification(
             str(response.choices[0].message.content or ""),
-            claim_indexes,
+            unverified_indexes,
         )
+        report.verdicts.update(local_verdicts)
+        return report
 
     async def _finalize_grounded_answer_async(
         self,
@@ -2338,6 +2661,62 @@ QUESTION:
             logger.exception("Unexpected conversational answer processing failure")
             raise GenerationUnavailableError() from exc
 
+    def generate_out_of_scope(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Generate a natural refusal for requests outside the assistant scope."""
+        try:
+            response = self.create_completion(
+                "out_of_scope_answer",
+                model=self.model,
+                messages=self._chat_messages(
+                    self.OUT_OF_SCOPE_SYSTEM_PROMPT,
+                    query,
+                    chat_history,
+                ),
+                temperature=0.4,
+                max_tokens=180,
+            )
+            return response.choices[0].message.content.strip()
+        except GenerationUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected out-of-scope answer processing failure")
+            raise GenerationUnavailableError() from exc
+
+    def generate_document_refusal(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> str:
+        """Generate a natural refusal when official document evidence is insufficient."""
+        refusal_context = query
+        if reason:
+            refusal_context = f"{query}\n\nEvidence status: {reason}"
+        try:
+            response = self.create_completion(
+                "document_refusal_answer",
+                model=self.model,
+                messages=self._chat_messages(
+                    self.DOCUMENT_REFUSAL_SYSTEM_PROMPT,
+                    refusal_context,
+                    chat_history,
+                ),
+                temperature=0.35,
+                max_tokens=220,
+            )
+            return response.choices[0].message.content.strip()
+        except GenerationUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected document refusal processing failure")
+            raise GenerationUnavailableError() from exc
+
     def generate_student_support(
         self,
         query: str,
@@ -2389,6 +2768,64 @@ QUESTION:
             raise
         except Exception as exc:
             logger.exception("Unexpected streamed student support answer processing failure")
+            raise GenerationUnavailableError() from exc
+
+    async def stream_out_of_scope(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a natural out-of-scope refusal."""
+        try:
+            response_text = await self._stream_text(
+                "out_of_scope_answer_stream",
+                model=self.model,
+                messages=self._chat_messages(
+                    self.OUT_OF_SCOPE_SYSTEM_PROMPT,
+                    query,
+                    chat_history,
+                ),
+                temperature=0.4,
+                max_tokens=180,
+            )
+            for part in self._text_chunks(response_text):
+                yield part
+        except GenerationUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected streamed out-of-scope answer processing failure")
+            raise GenerationUnavailableError() from exc
+
+    async def stream_document_refusal(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        user_profile: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a natural refusal for insufficient official document evidence."""
+        refusal_context = query
+        if reason:
+            refusal_context = f"{query}\n\nEvidence status: {reason}"
+        try:
+            response_text = await self._stream_text(
+                "document_refusal_answer_stream",
+                model=self.model,
+                messages=self._chat_messages(
+                    self.DOCUMENT_REFUSAL_SYSTEM_PROMPT,
+                    refusal_context,
+                    chat_history,
+                ),
+                temperature=0.35,
+                max_tokens=220,
+            )
+            for part in self._text_chunks(response_text):
+                yield part
+        except GenerationUnavailableError:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected streamed document refusal processing failure")
             raise GenerationUnavailableError() from exc
 
     async def stream_conversational(

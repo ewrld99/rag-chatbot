@@ -294,6 +294,59 @@ def test_partial_outcome_keeps_only_semantically_supported_claims():
     assert outcome.supported_claim_count == 1
 
 
+def test_partial_ordered_answer_is_renumbered_after_filtering():
+    service = GroundingService()
+    document = _document(
+        "Submit the postponement request through SR2. "
+        "The request is forwarded to the relevant approval authority."
+    )
+    evidence = service.build_evidence([document])
+    evidence_id = service.evidence_id(document)
+    draft = GroundedDraft(
+        coverage="full",
+        answer=(
+            "6. Pay an unsupported fee.\n"
+            "7. Submit the postponement request through SR2.\n"
+            "8. The request is forwarded to the relevant approval authority."
+        ),
+        claims=[
+            GroundedClaim(
+                claim="Pay an unsupported fee.",
+                evidence_ids=[evidence_id],
+            ),
+            GroundedClaim(
+                claim="Submit the postponement request through SR2.",
+                evidence_ids=[evidence_id],
+            ),
+            GroundedClaim(
+                claim="The request is forwarded to the relevant approval authority.",
+                evidence_ids=[evidence_id],
+            ),
+        ],
+    )
+
+    outcome = service.finalize(
+        draft,
+        service.validate(draft, evidence),
+        VerificationReport(
+            verdicts={
+                0: "NOT_ENOUGH_INFORMATION",
+                1: "SUPPORTED",
+                2: "SUPPORTED",
+            }
+        ),
+        refusal="No evidence.",
+        repaired=True,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.answer == (
+        "1. Submit the postponement request through SR2.\n\n"
+        "2. The request is forwarded to the relevant approval authority."
+    )
+    assert outcome.supported_claim_count == 2
+
+
 def test_stub_answer_is_rebuilt_from_claims_before_validation():
     service = GroundingService()
     document = _document(
@@ -443,6 +496,7 @@ class _StubGenerationService(GenerationService):
         self.grounding = GroundingService()
         self.answer_payloads = list(answer_payloads)
         self.verification_reports = list(verification_reports)
+        self.refusal_queries: list[str] = []
         self.model_preference = "auto"
         self._last_model_execution = None
         self._last_grounding_outcome = None
@@ -455,6 +509,10 @@ class _StubGenerationService(GenerationService):
 
     def _semantic_verify(self, *_args, **_kwargs) -> VerificationReport:
         return self.verification_reports.pop(0)
+
+    def generate_document_refusal(self, query, *_args, **_kwargs):
+        self.refusal_queries.append(query)
+        return "Generated document refusal."
 
 
 class _RepairUnavailableGenerationService(_StubGenerationService):
@@ -822,10 +880,11 @@ def test_generation_skips_repair_when_disabled_and_no_claims_are_supported(monke
         documents=[document],
     )
 
-    assert result["answer"] == GenerationService.DOCUMENT_REFUSAL
+    assert result["answer"] == "Generated document refusal."
     assert result["grounding"]["repaired"] is False
     assert result["grounding"]["status"] == "refused"
     assert generator.answer_payloads == [repair_payload]
+    assert generator.refusal_queries == ["How is GPA calculated?"]
 
 
 def test_generation_returns_verified_partial_when_repair_is_unavailable():
@@ -883,7 +942,7 @@ def test_semantic_verification_batches_claims(monkeypatch):
     generator = _StubGenerationService([], [])
     calls = []
 
-    def verify(_draft, _evidence, indexes):
+    def verify(_draft, _evidence, indexes, _query=""):
         calls.append(list(indexes))
         return VerificationReport(
             verdicts={index: "SUPPORTED" for index in indexes}
@@ -927,9 +986,10 @@ def test_generation_refuses_after_two_malformed_drafts():
         documents=[_document()],
     )
 
-    assert result["answer"] == GenerationService.DOCUMENT_REFUSAL
+    assert result["answer"] == "Generated document refusal."
     assert result["grounding"]["status"] == "refused"
     assert result["evidence_ids"] == []
+    assert generator.refusal_queries == ["What is the policy?"]
 
 
 def test_async_finalization_reconciles_stub_answer():

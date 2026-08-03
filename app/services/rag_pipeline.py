@@ -13,7 +13,6 @@ from sqlalchemy.orm import joinedload
 from starlette.concurrency import run_in_threadpool
 
 from app.db.models import DocumentChunk
-from app.services.conversation_service import static_conversational_response
 from app.services.conversation_context import generation_history
 from app.services.generation_resilience import GenerationUnavailableError
 from app.services.generation_service import GenerationService
@@ -22,6 +21,7 @@ from app.services.intent_router import IntentDecision, IntentRouter
 from app.services.model_router import ModelRouter
 from app.services.query_normalization import (
     FALLBACK_ALIAS_EXPANSIONS,
+    likely_swahili_query,
     metadata_search_text,
     significant_tokens,
     token_set,
@@ -72,28 +72,43 @@ class RAGPipeline:
     _COMPLEX_GENERATION_QUERY_RE = re.compile(
         r"\b(?:calculate|calculated|calculating|calculation|compute|computed|"
         r"formula|equation|gpa|cgpa|grade point average|classification|"
-        r"regulation|regulations|policy|policies|requirement|requirements)\b",
+        r"regulation|regulations|policy|policies|requirement|requirements|"
+        r"hesabu|kuhesabu|inahesabiwa|wastani|alama|kanuni|sera|mahitaji)\b",
         re.IGNORECASE,
     )
     _PROCEDURE_GENERATION_QUERY_RE = re.compile(
         r"\b(?:how to|how do|process|procedure|steps?|apply|submit|"
-        r"postpone|defer|deferment|register|appeal|jinsi|utaratibu|hatua)\b",
+        r"postpone|defer|deferment|register|appeal|jinsi|utaratibu|taratibu|"
+        r"hatua|omba|maombi|wasilisha|tuma|sajili|jisajili|rufaa|"
+        r"ahirisha|kuahirisha|kughairi|kughairisha|kusitisha)\b",
         re.IGNORECASE,
     )
     _CURRICULUM_LIST_QUERY_RE = re.compile(
-        r"\b(?:course|courses|unit|units|module|modules|subject|subjects|curriculum)\b",
+        r"\b(?:course|courses|unit|units|module|modules|subject|subjects|"
+        r"curriculum|kozi|somo|masomo|moduli|programu|mtaala)\b",
         re.IGNORECASE,
     )
     _ALMANAC_DATE_QUERY_RE = re.compile(
         r"\b(?:when|date|start|starts|starting|begin|begins|end|ends|finish|finishes|"
-        r"examination|examinations|exam|exams|semester|supplementary|special)\b",
+        r"examination|examinations|exam|exams|semester|supplementary|special|"
+        r"lini|tarehe|anza|unaanza|kuanza|mwisho|malizika|mtihani|mitihani|"
+        r"muhula|nyongeza|maalum)\b",
         re.IGNORECASE,
     )
+    _ALMANAC_EVENT_STOPWORDS = {
+        "academic", "all", "and", "are", "calendar", "date", "day", "does",
+        "event", "for", "is", "of", "on", "program", "programme", "programmes",
+        "programs", "the", "university", "when",
+    }
     _CURRICULUM_STOPWORDS = {
         "what", "which", "list", "show", "give", "tell", "are", "the", "for",
         "student", "students", "course", "courses", "unit", "units", "module",
         "modules", "subject", "subjects", "semester", "year", "first", "second",
         "third", "fourth", "fifth", "one", "two", "three", "four", "five",
+        "orodhesha", "onyesha", "toa", "nipe", "eleza", "taja", "zipi", "ipi",
+        "kozi", "somo", "masomo", "moduli", "programu", "mtaala", "mwanafunzi",
+        "wanafunzi", "mwaka", "muhula", "wa", "kwa", "katika", "kwanza",
+        "pili", "tatu", "nne", "tano", "shahada", "chuo", "udom",
     }
 
     def __init__(
@@ -112,11 +127,6 @@ class RAGPipeline:
             session_factory=retrieval_service.session_factory,
         )
         self._last_scored_documents: List[Tuple[Document, float]] = []
-        self.document_refusal = GenerationService.DOCUMENT_REFUSAL
-        self.out_of_scope_response = (
-            "I can help with official University of Dodoma document questions and "
-            "general university student support. This question is outside that scope."
-        )
 
     def _is_empty_context(self, context: str) -> bool:
         return not context or context.strip() == "No relevant context found."
@@ -137,6 +147,14 @@ class RAGPipeline:
         ) and decision.standalone_query:
             return decision.standalone_query
         if chat_history and self.generator.is_history_dependent_query(query):
+            rewritten_query = self.generator.rewrite_query(
+                query,
+                chat_history,
+                user_profile=user_profile,
+            )
+            if rewritten_query:
+                return rewritten_query
+        if decision.intent == "UDOM_DOCUMENT_SEARCH" and likely_swahili_query(query):
             rewritten_query = self.generator.rewrite_query(
                 query,
                 chat_history,
@@ -169,13 +187,11 @@ class RAGPipeline:
         user_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any] | None:
         if decision.intent == "CONVERSATIONAL":
-            answer = static_conversational_response(query)
-            if answer is None:
-                answer = self.generator.generate_conversational(
-                    query,
-                    chat_history,
-                    user_profile=user_profile,
-                )
+            answer = self.generator.generate_conversational(
+                query,
+                chat_history,
+                user_profile=user_profile,
+            )
             return self._base_response(query, answer, decision, include_model=True)
 
         if decision.intent == "STUDENT_SUPPORT":
@@ -194,7 +210,12 @@ class RAGPipeline:
             return self._base_response(query, answer, decision, include_model=True)
 
         if decision.intent == "OUT_OF_SCOPE":
-            return self._base_response(query, self.out_of_scope_response, decision)
+            answer = self.generator.generate_out_of_scope(
+                query,
+                chat_history,
+                user_profile=user_profile,
+            )
+            return self._base_response(query, answer, decision, include_model=True)
 
         return None
 
@@ -245,6 +266,14 @@ class RAGPipeline:
     ) -> bool:
         probe = getattr(self.intent_router, "should_probe_documents", None)
         return bool(callable(probe) and probe(query, decision))
+
+    def _should_demote_to_student_support(
+        self,
+        query: str,
+        decision: IntentDecision,
+    ) -> bool:
+        demote = getattr(self.intent_router, "should_demote_to_student_support", None)
+        return bool(callable(demote) and demote(query, decision))
 
     @staticmethod
     def _retrieval_supports_route_override(confidence: Dict[str, Any]) -> bool:
@@ -441,6 +470,30 @@ class RAGPipeline:
         generation_query = self._generation_query(decision, query, retrieval_query)
 
         if self._is_empty_context(retrieval["context"]) or not retrieval["confidence"]["sufficient"]:
+            # Before issuing a cold refusal, check whether the query is broad enough
+            # to receive a useful student-support coaching answer instead.
+            if self._should_demote_to_student_support(query, decision):
+                demoted = self.intent_router.demote_to_student_support(decision, query)
+                logger.info(
+                    "Routing demoted by empty retrieval | from=%s to=%s query=%s",
+                    decision.intent,
+                    demoted.intent,
+                    retrieval_query[:120],
+                )
+                with trace.stage("generation_ms"):
+                    response = self._non_document_response(
+                        demoted, query, model_history, user_profile
+                    )
+                trace.log(
+                    intent=demoted.intent,
+                    source=demoted.source,
+                    docs=len(retrieval["documents"]),
+                    confidence=retrieval["confidence"],
+                    answered=True,
+                    demotion="student_support",
+                )
+                assert response is not None
+                return response
             trace.log(
                 intent=decision.intent,
                 source=decision.source,
@@ -448,15 +501,23 @@ class RAGPipeline:
                 confidence=retrieval["confidence"],
                 answered=False,
             )
+            with trace.stage("generation_ms"):
+                answer = self.generator.generate_document_refusal(
+                    query,
+                    model_history,
+                    user_profile=user_profile,
+                    reason=str(retrieval["confidence"].get("reason") or ""),
+                )
             return {
                 "query": query,
-                "answer": self.document_refusal,
+                "answer": answer,
                 "sources": [],
                 "context_used": False,
                 "routing": decision.to_dict(),
                 "conversation": self._conversation_payload(decision),
                 "retrieval_query": retrieval_query,
                 "retrieval_confidence": retrieval["confidence"],
+                **self.generator.model_metadata(),
             }
 
         direct_curriculum = self._direct_curriculum_course_answer(generation_query, retrieval["documents"])
@@ -640,20 +701,15 @@ class RAGPipeline:
         }
 
         if decision.intent == "CONVERSATIONAL":
-            answer = static_conversational_response(query)
-            if answer is not None:
-                trace.mark("first_token_ms")
-                yield {"type": "stream", "token": answer}
-            else:
-                async for event in self._yield_timed_stream(
-                    trace,
-                    self.generator.stream_conversational(
-                        query,
-                        model_history,
-                        user_profile=user_profile,
-                    ),
-                ):
-                    yield event
+            async for event in self._yield_timed_stream(
+                trace,
+                self.generator.stream_conversational(
+                    query,
+                    model_history,
+                    user_profile=user_profile,
+                ),
+            ):
+                yield event
             yield {"type": "model", **self.generator.model_metadata()}
             yield {"type": "sources", "sources": []}
             trace.log(intent=decision.intent, source=decision.source)
@@ -686,8 +742,16 @@ class RAGPipeline:
             trace.log(intent=decision.intent, source=decision.source)
             return
         if decision.intent == "OUT_OF_SCOPE":
-            trace.mark("first_token_ms")
-            yield {"type": "stream", "token": self.out_of_scope_response}
+            async for event in self._yield_timed_stream(
+                trace,
+                self.generator.stream_out_of_scope(
+                    query,
+                    model_history,
+                    user_profile=user_profile,
+                ),
+            ):
+                yield event
+            yield {"type": "model", **self.generator.model_metadata()}
             yield {"type": "sources", "sources": []}
             trace.log(intent=decision.intent, source=decision.source)
             return
@@ -712,8 +776,52 @@ class RAGPipeline:
         generation_query = self._generation_query(decision, query, retrieval_query)
 
         if self._is_empty_context(retrieval["context"]) or not retrieval["confidence"]["sufficient"]:
-            trace.mark("first_token_ms")
-            yield {"type": "stream", "token": self.document_refusal}
+            # Before issuing a cold refusal, check whether the query is broad enough
+            # to receive a useful student-support coaching answer instead.
+            if self._should_demote_to_student_support(query, decision):
+                demoted = self.intent_router.demote_to_student_support(decision, query)
+                logger.info(
+                    "Routing demoted by empty retrieval | from=%s to=%s query=%s",
+                    decision.intent,
+                    demoted.intent,
+                    retrieval_query[:120],
+                )
+                yield {
+                    "type": "routing",
+                    "routing": demoted.to_dict(),
+                    "conversation": self._conversation_payload(demoted),
+                }
+                async for event in self._yield_timed_stream(
+                    trace,
+                    self.generator.stream_student_support(
+                        query,
+                        model_history,
+                        user_profile=user_profile,
+                    ),
+                ):
+                    yield event
+                yield {"type": "model", **self.generator.model_metadata()}
+                yield {"type": "sources", "sources": []}
+                trace.log(
+                    intent=demoted.intent,
+                    source=demoted.source,
+                    docs=len(retrieval["documents"]),
+                    confidence=retrieval["confidence"],
+                    answered=True,
+                    demotion="student_support",
+                )
+                return
+            async for event in self._yield_timed_stream(
+                trace,
+                self.generator.stream_document_refusal(
+                    query,
+                    model_history,
+                    user_profile=user_profile,
+                    reason=str(retrieval["confidence"].get("reason") or ""),
+                ),
+            ):
+                yield event
+            yield {"type": "model", **self.generator.model_metadata()}
             yield {"type": "sources", "sources": []}
             trace.log(
                 intent=decision.intent,
@@ -876,7 +984,12 @@ class RAGPipeline:
         grounding = self.generator.grounding_metadata()
 
         if self._is_empty_context(retrieval["context"]) or not retrieval["confidence"]["sufficient"]:
-            answer = self.document_refusal
+            answer = self.generator.generate_document_refusal(
+                query,
+                model_history,
+                user_profile=user_profile,
+                reason=str(retrieval["confidence"].get("reason") or ""),
+            )
         else:
             direct_curriculum = self._direct_curriculum_course_answer(generation_query, retrieval["documents"])
             if direct_curriculum is not None:
@@ -985,7 +1098,74 @@ class RAGPipeline:
             return self._procedure_context_documents(documents, query)
         if self.generator._is_enumeration_query(query):
             return self._enumeration_context_documents(documents, query)
+        if self.generator._CURRICULUM_LIST_QUERY_RE.search(query or ""):
+            return self._curriculum_context_documents(documents, query)
         return documents
+
+    def _curriculum_context_documents(
+        self,
+        documents: List[Document],
+        query: str,
+    ) -> List[Document]:
+        """Promote contiguous chunks around the strongest course/curriculum hit to capture full tables."""
+        anchor = next(
+            (
+                document
+                for document in documents
+                if document.metadata.get("source_type") == "document"
+                and not document.metadata.get("neighbor_expansion")
+                and isinstance(document.metadata.get("chunk_index"), int)
+            ),
+            None,
+        )
+        if anchor is None:
+            return documents
+
+        try:
+            document_id = UUID(str(anchor.metadata.get("document_id")))
+            anchor_index = int(anchor.metadata["chunk_index"])
+        except (TypeError, ValueError, KeyError):
+            return documents
+
+        window = 3
+        with self.retrieval_service.database_session() as db:
+            rows = (
+                db.query(DocumentChunk)
+                .filter(
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.chunk_index.between(
+                        max(0, anchor_index - window),
+                        anchor_index + window,
+                    ),
+                )
+                .order_by(DocumentChunk.chunk_index.asc())
+                .all()
+            )
+        if not rows:
+            return documents
+
+        promoted: list[Document] = []
+        promoted_ids: set[str] = set()
+        for row in rows:
+            chunk_id = str(row.id)
+            metadata = {
+                **dict(anchor.metadata or {}),
+                **dict(row.metadata_ or {}),
+                "chunk_id": chunk_id,
+                "document_id": str(row.document_id),
+                "chunk_index": row.chunk_index,
+                "page_number": row.page_number,
+                "section_expansion": True,
+            }
+            promoted.append(Document(page_content=row.chunk_text, metadata=metadata))
+            promoted_ids.add(chunk_id)
+
+        promoted.extend(
+            document
+            for document in documents
+            if str(document.metadata.get("chunk_id")) not in promoted_ids
+        )
+        return promoted
 
     def _enumeration_context_documents(
         self,
@@ -1262,6 +1442,8 @@ class RAGPipeline:
             activity = self._almanac_activity(document.page_content)
             if not event_date or not activity:
                 continue
+            if not self._almanac_event_matches_query(query, activity, metadata):
+                continue
 
             answer = f"{activity} is on {event_date}."
             grounding_service = GroundingService()
@@ -1288,6 +1470,94 @@ class RAGPipeline:
         if not match:
             return ""
         return " ".join(match.group(1).strip(" .").split())
+
+    @classmethod
+    def _almanac_event_matches_query(
+        cls,
+        query: str,
+        activity: str,
+        metadata: Dict[str, Any],
+    ) -> bool:
+        query_text = cls._normalize_almanac_match_text(query)
+        activity_text = cls._normalize_almanac_match_text(activity)
+        query_terms = set(tokenize(query_text)) - cls._ALMANAC_EVENT_STOPWORDS
+        activity_terms = set(tokenize(activity_text))
+
+        if cls._asks_for_start(query_text) and not cls._asks_for_start(activity_text):
+            return False
+        if cls._asks_for_end(query_text) and not cls._asks_for_end(activity_text):
+            return False
+        if cls._mentions_examinations(query_text) and not (
+            cls._mentions_examinations(activity_text)
+            or metadata.get("event_type") == "examination"
+        ):
+            return False
+        if cls._mentions_supplementary_or_special(query_text) and not cls._mentions_supplementary_or_special(activity_text):
+            return False
+        if cls._mentions_semester_two(query_text) and not cls._mentions_semester_two(activity_text):
+            return False
+        if cls._mentions_semester_one(query_text) and not cls._mentions_semester_one(activity_text):
+            return False
+        if "nondegree" in query_terms and "nondegree" not in activity_terms:
+            return False
+        if "degree" in query_terms and "degree" not in activity_terms:
+            return False
+
+        matched_terms = query_terms & activity_terms
+        required_terms = {
+            term
+            for term in query_terms
+            if term not in {
+                "begin", "begins", "beginning", "end", "ends", "examination",
+                "examinations", "exam", "exams", "finish", "finishes", "start",
+                "starts", "starting",
+            }
+        }
+        if required_terms:
+            return len(matched_terms & required_terms) >= min(2, len(required_terms))
+        return bool(matched_terms)
+
+    @staticmethod
+    def _normalize_almanac_match_text(value: str) -> str:
+        text = str(value or "").casefold()
+        text = re.sub(r"\bsemester\s+(?:ii|2|two|second)\b", "semester_two", text)
+        text = re.sub(r"\b(?:muhula|semester)\s+(?:wa\s+)?(?:pili|2)\b", "semester_two", text)
+        text = re.sub(r"\bsemester\s+(?:i|1|one|first)\b", "semester_one", text)
+        text = re.sub(r"\b(?:muhula|semester)\s+(?:wa\s+)?(?:kwanza|1)\b", "semester_one", text)
+        text = re.sub(r"\bnon\s*-\s*degree\b", "nondegree", text)
+        text = re.sub(r"\b(?:zisizo\s+za\s+)?shahada\b", "degree", text)
+        text = text.replace("programmes", "programs").replace("programme", "program")
+        text = text.replace("examinations", "examination").replace("exams", "exam")
+        text = text.replace("mitihani", "examination").replace("mtihani", "exam")
+        text = text.replace("tarehe", "date").replace("lini", "when")
+        text = text.replace("kuanza", "start").replace("unaanza", "start").replace("anza", "start")
+        text = text.replace("mwisho", "end").replace("malizika", "end")
+        text = text.replace("nyongeza", "supplementary").replace("maalum", "special")
+        return text.replace("_", " ")
+
+    @staticmethod
+    def _asks_for_start(text: str) -> bool:
+        return bool(re.search(r"\b(?:start|starts|starting|begin|begins|beginning|anza|kuanza|unaanza)\b", text))
+
+    @staticmethod
+    def _asks_for_end(text: str) -> bool:
+        return bool(re.search(r"\b(?:end|ends|ending|finish|finishes|finishing|mwisho|malizika)\b", text))
+
+    @staticmethod
+    def _mentions_examinations(text: str) -> bool:
+        return bool(re.search(r"\b(?:examination|exam|mtihani|mitihani)\b", text))
+
+    @staticmethod
+    def _mentions_supplementary_or_special(text: str) -> bool:
+        return bool(re.search(r"\b(?:supplementary|special|nyongeza|maalum)\b", text))
+
+    @staticmethod
+    def _mentions_semester_two(text: str) -> bool:
+        return "semester two" in text
+
+    @staticmethod
+    def _mentions_semester_one(text: str) -> bool:
+        return "semester one" in text
 
     @staticmethod
     def _curriculum_course_sort_key(document: Document) -> tuple[int, str]:
@@ -1617,12 +1887,36 @@ class RAGPipeline:
                 .all()
             )
 
+        lowered_query = (query or "").lower()
         query_token_set = set(query_tokens)
         query_acronyms = {
             acronym.lower()
             for acronym in re.findall(r"\b[A-Z][A-Z0-9]{2,}\b", query or "")
         }
 
+        # 1. Exact phrase & clean field matching (e.g. "software engineering" -> "Bachelor of Science in Software Engineering")
+        phrase_matches = []
+        for row in rows:
+            prog_name = (row.programme or "").strip()
+            prog_lower = prog_name.lower()
+            clean_field = re.sub(
+                r"\b(?:bachelor|master|diploma|certificate|science|arts|degree|of|in|with|honours|bsc|msc|ba|ma|diploma)\b",
+                "",
+                prog_lower,
+                flags=re.I,
+            )
+            clean_field = re.sub(r"[\(\)]", "", clean_field).strip()
+
+            if prog_lower and prog_lower in lowered_query:
+                phrase_matches.append((len(prog_lower), prog_name))
+            elif clean_field and len(clean_field) >= 4 and clean_field in lowered_query:
+                phrase_matches.append((len(clean_field), prog_name))
+
+        if phrase_matches:
+            phrase_matches.sort(key=lambda item: item[0], reverse=True)
+            return phrase_matches[0][1]
+
+        # 2. Acronym matching
         exact_acronym_matches = []
         for row in rows:
             programme = row.programme or ""
@@ -1648,23 +1942,31 @@ class RAGPipeline:
                 if alias_tokens <= haystack_tokens:
                     return programme
 
-        # If the user supplied an explicit acronym like IDIT, do not fall back
-        # to broad fuzzy programme matching. A wrong exact-looking programme is
-        # worse than no deterministic curriculum supplement.
         if query_acronyms:
             return None
+
+        # 3. Specific token scoring (ignore generic words like bachelor, science, degree)
+        generic_tokens = {
+            "bachelor", "master", "diploma", "certificate", "science", "arts",
+            "degree", "programme", "program", "student", "students", "udom",
+            "university", "dodoma", "course", "courses", "year", "semester",
+            "one", "two", "first", "second", "third", "fourth", "bsc", "msc", "ba", "ma",
+        }
+        specific_query_tokens = set(query_tokens) - generic_tokens
+        if not specific_query_tokens:
+            specific_query_tokens = set(query_tokens)
 
         best_programme: str | None = None
         best_score = 0
         for row in rows:
             programme = row.programme or ""
             haystack_tokens = set(tokenize(f"{programme} {row.programme_acronym or ''}"))
-            score = sum(1 for token in query_tokens if token in haystack_tokens)
+            score = sum(1 for token in specific_query_tokens if token in haystack_tokens)
             if score > best_score:
                 best_score = score
                 best_programme = programme
 
-        return best_programme if best_score >= 2 else None
+        return best_programme if best_score >= 1 else None
 
     def _programme_alias_tokens_from_query(self, query: str) -> set[str]:
         query_tokens = set(tokenize(query))
@@ -1698,11 +2000,11 @@ class RAGPipeline:
     def _year_of_study_from_query(query: str) -> str | None:
         lowered = (query or "").lower()
         patterns = [
-            (r"\b(?:year\s+one|first\s+year|1st\s+year|year\s+1)\b", "1"),
-            (r"\b(?:year\s+two|second\s+year|2nd\s+year|year\s+2)\b", "2"),
-            (r"\b(?:year\s+three|third\s+year|3rd\s+year|year\s+3)\b", "3"),
-            (r"\b(?:year\s+four|fourth\s+year|4th\s+year|year\s+4)\b", "4"),
-            (r"\b(?:year\s+five|fifth\s+year|5th\s+year|year\s+5)\b", "5"),
+            (r"\b(?:year\s+one|first\s+year|1st\s+year|year\s+1|1\s+year|mwaka\s+(?:wa\s+)?kwanza|mwaka\s+1|1\s+mwaka)\b", "1"),
+            (r"\b(?:year\s+two|second\s+year|2nd\s+year|year\s+2|2\s+year|mwaka\s+(?:wa\s+)?pili|mwaka\s+2|2\s+mwaka)\b", "2"),
+            (r"\b(?:year\s+three|third\s+year|3rd\s+year|year\s+3|3\s+year|mwaka\s+(?:wa\s+)?tatu|mwaka\s+3|3\s+mwaka)\b", "3"),
+            (r"\b(?:year\s+four|fourth\s+year|4th\s+year|year\s+4|4\s+year|mwaka\s+(?:wa\s+)?nne|mwaka\s+4|4\s+mwaka)\b", "4"),
+            (r"\b(?:year\s+five|fifth\s+year|5th\s+year|year\s+5|5\s+year|mwaka\s+(?:wa\s+)?tano|mwaka\s+5|5\s+mwaka)\b", "5"),
         ]
         return next((value for pattern, value in patterns if re.search(pattern, lowered)), None)
 
@@ -1710,8 +2012,8 @@ class RAGPipeline:
     def _semester_from_query(query: str) -> str | None:
         lowered = (query or "").lower()
         patterns = [
-            (r"\b(?:semester\s+one|semester\s+1|sem\s+one|sem\s+1|first\s+semester|1st\s+semester)\b", "1"),
-            (r"\b(?:semester\s+two|semester\s+2|sem\s+two|sem\s+2|second\s+semester|2nd\s+semester)\b", "2"),
+            (r"\b(?:semester\s+one|semester\s+1|sem\s+one|sem\s+1|first\s+semester|1st\s+semester|muhula\s+(?:wa\s+)?kwanza|semester\s+(?:ya\s+|wa\s+)?kwanza|muhula\s+1)\b", "1"),
+            (r"\b(?:semester\s+two|semester\s+2|sem\s+two|sem\s+2|second\s+semester|2nd\s+semester|muhula\s+(?:wa\s+)?pili|semester\s+(?:ya\s+|wa\s+)?pili|muhula\s+2)\b", "2"),
         ]
         return next((value for pattern, value in patterns if re.search(pattern, lowered)), None)
 

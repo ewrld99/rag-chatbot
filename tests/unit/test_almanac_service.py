@@ -118,3 +118,78 @@ def test_direct_almanac_answer_uses_retrieved_event_without_llm():
     )
     assert result["grounding"]["status"] == "grounded"
     assert result["documents"] == [document]
+
+
+def test_direct_almanac_answer_skips_mismatched_top_event():
+    pipeline = object.__new__(RAGPipeline)
+    supplementary = Document(
+        page_content=(
+            "UDOM Academic Almanac Event\n"
+            "Date: 2026-10-12\n"
+            "Activity: Start of Supplementary/Special University Examinations "
+            "for all Undergraduate and Postgraduate Programmes.\n"
+            "Event Type: examination\n"
+            "Academic Year: 2025/2026"
+        ),
+        metadata={
+            "category": "academic_calendar",
+            "record_type": "almanac_event",
+            "date": "2026-10-12",
+            "event_type": "examination",
+        },
+    )
+    semester_two = Document(
+        page_content=(
+            "UDOM Academic Almanac Event\n"
+            "Date: 2026-07-20\n"
+            "Activity: Start of Semester Two Examinations for Degree and "
+            "Non-Degree Programmes.\n"
+            "Event Type: examination\n"
+            "Academic Year: 2025/2026"
+        ),
+        metadata={
+            "category": "academic_calendar",
+            "record_type": "almanac_event",
+            "date": "2026-07-20",
+            "event_type": "examination",
+        },
+    )
+
+    result = pipeline._direct_almanac_event_answer(
+        "When is the start of semester two examination for degree and non-degree programs?",
+        [supplementary, semester_two],
+    )
+
+    assert result is not None
+    assert result["answer"] == (
+        "Start of Semester Two Examinations for Degree and Non-Degree "
+        "Programmes is on 2026-07-20."
+    )
+    assert result["documents"] == [semester_two]
+
+
+def test_direct_almanac_answer_falls_back_when_no_event_matches_query():
+    pipeline = object.__new__(RAGPipeline)
+    document = Document(
+        page_content=(
+            "UDOM Academic Almanac Event\n"
+            "Date: 2026-10-12\n"
+            "Activity: Start of Supplementary/Special University Examinations "
+            "for all Undergraduate and Postgraduate Programmes.\n"
+            "Event Type: examination\n"
+            "Academic Year: 2025/2026"
+        ),
+        metadata={
+            "category": "academic_calendar",
+            "record_type": "almanac_event",
+            "date": "2026-10-12",
+            "event_type": "examination",
+        },
+    )
+
+    result = pipeline._direct_almanac_event_answer(
+        "When is the start of semester two examination for degree and non-degree programs?",
+        [document],
+    )
+
+    assert result is None

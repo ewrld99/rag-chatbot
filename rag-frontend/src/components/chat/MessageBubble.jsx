@@ -60,6 +60,8 @@ function SourceList({ sources }) {
 }
 
 const MODEL_LABELS = {
+    "google/gemma-4-26b-a4b-it": "Gemma 4 26B (OpenRouter)",
+    "google/gemma-4-26b-a4b-it:free": "Gemma 4 26B Free (OpenRouter)",
     "llama3.2:3b": "Llama 3.2 3B Local",
     "gemma3:4b": "Gemma 3 4B Local",
     "gemini-3.6-flash": "Gemini 3.6 Flash",

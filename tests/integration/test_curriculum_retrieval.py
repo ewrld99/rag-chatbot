@@ -229,6 +229,86 @@ def test_direct_curriculum_course_answer_uses_metadata_rows():
     assert result["documents"] == documents
 
 
+def test_curriculum_constraints_parse_swahili_year_and_semester(db_session):
+    programme = "Bachelor of Science in Software Engineering (BSc SE)"
+    document = DocumentModel(
+        title="curriculum-swahili-test",
+        filename="curriculum-swahili-test.pdf",
+        status="active",
+        quality_status="ok",
+    )
+    db_session.add(document)
+    db_session.flush()
+    for index, metadata in enumerate(
+        [
+            _course_metadata(programme, "1", "1", "LG 102", "Communication Skills"),
+            _course_metadata(programme, "1", "2", "CS 123", "Introduction to Software Engineering"),
+        ],
+        start=1,
+    ):
+        db_session.add(
+            DocumentChunk(
+                document_id=document.id,
+                chunk_text=_course_text(metadata),
+                chunk_index=index,
+                embedding=[0.1] * settings.EMBEDDING_DIMENSION,
+                metadata_=metadata,
+            )
+        )
+    db_session.commit()
+
+    pipeline = RAGPipeline.__new__(RAGPipeline)
+    pipeline.retrieval_service = _RetrievalService(db_session)
+
+    constraints = pipeline._curriculum_constraints_from_query(
+        "orodhesha kozi za software engineering mwaka wa kwanza muhula wa pili"
+    )
+
+    assert constraints == {
+        "programme": programme,
+        "year_of_study": "1",
+        "semester": "2",
+    }
+
+
+def test_direct_curriculum_course_answer_supports_swahili_query():
+    pipeline = RAGPipeline.__new__(RAGPipeline)
+    programme = "Bachelor of Science in Software Engineering (BSc SE)"
+    document = Document(
+        page_content=_course_text(
+            _course_metadata(
+                programme,
+                "1",
+                "2",
+                "CS 123",
+                "Introduction to Software Engineering",
+            )
+        ),
+        metadata={
+            **_course_metadata(
+                programme,
+                "1",
+                "2",
+                "CS 123",
+                "Introduction to Software Engineering",
+            ),
+            "chunk_id": "chunk-swahili",
+            "chunk_index": 1,
+            "document_id": "curriculum-doc",
+            "source": "undergraduate curriculum book 2025-2026.pdf",
+            "curriculum_metadata_match": True,
+        },
+    )
+
+    result = pipeline._direct_curriculum_course_answer(
+        "orodhesha kozi za software engineering mwaka wa kwanza muhula wa pili",
+        [document],
+    )
+
+    assert result is not None
+    assert "| CS 123 | Introduction to Software Engineering | Core | 7.5 |" in result["answer"]
+
+
 def test_direct_curriculum_course_answer_keeps_more_than_24_rows():
     pipeline = RAGPipeline.__new__(RAGPipeline)
     programme = "Bachelor of Science in Software Engineering (BSc SE)"

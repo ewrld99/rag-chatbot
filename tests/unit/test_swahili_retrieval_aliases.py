@@ -13,6 +13,16 @@ def test_swahili_postponement_alias_expands_for_retrieval():
     assert "kuahirisha masomo" in expansions["postponement"]
 
 
+def test_swahili_cancellation_alias_expands_for_retrieval():
+    expansions = AliasExpansionService(db=None).get_expansions(
+        "nataka kufahamu hatua za kughairisha mwaka wa masomo"
+    )
+
+    assert "postponement" in expansions
+    assert "deferment" in expansions["postponement"]
+    assert "kughairisha mwaka wa masomo" in expansions["postponement"]
+
+
 def test_swahili_examination_terms_expand_sparse_query():
     variants = build_sparse_query_variants(
         "nitaruhusiwa kufanya mtihani kama coursework ni ndogo"

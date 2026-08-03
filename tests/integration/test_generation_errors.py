@@ -85,11 +85,12 @@ def test_model_catalog_exposes_only_the_approved_models(client):
     body = response.json()
     assert body["default"] == "auto"
     assert [model["id"] for model in body["models"]] == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "qwen3.5:4b",
     ]
 
@@ -150,6 +151,18 @@ def test_chat_rejects_removed_qwen_model(client):
         json={
             "message": "How is GPA calculated?",
             "model_preference": "qwen/qwen3.6-27b",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_chat_rejects_utility_only_llama_instant_model(client):
+    response = client.post(
+        "/api/chat/",
+        json={
+            "message": "How is GPA calculated?",
+            "model_preference": "llama-3.1-8b-instant",
         },
     )
 

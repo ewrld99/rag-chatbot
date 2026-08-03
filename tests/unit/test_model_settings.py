@@ -8,27 +8,29 @@ def test_generation_model_settings_are_seeded(db_session):
     seed_default_settings(db_session)
     service = SettingsService(db_session)
 
-    assert service.generation_default_model == "llama3.2:3b"
+    assert service.generation_default_model == "google/gemma-4-26b-a4b-it"
     assert service.generation_allowed_models == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "qwen3.5:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ]
     assert service.generation_answer_model_order == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "qwen3.5:4b",
     ]
     assert service.generation_utility_model_order == [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
     utility_setting = (
@@ -51,6 +53,12 @@ def test_generation_settings_reject_models_outside_catalog(db_session):
         service.update(
             "generation_allowed_models",
             "openai/gpt-oss-120b",
+        )
+
+    with pytest.raises(ValueError, match="unsupported"):
+        service.update(
+            "generation_allowed_models",
+            "llama-3.1-8b-instant",
         )
 
 
@@ -120,21 +128,23 @@ def test_seed_upgrades_known_legacy_generation_model_lists(db_session):
     seed_default_settings(db_session)
     service = SettingsService(db_session)
 
-    assert service.generation_default_model == "llama3.2:3b"
+    assert service.generation_default_model == "google/gemma-4-26b-a4b-it"
     assert service.generation_allowed_models == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "qwen3.5:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ]
     assert service.generation_answer_model_order == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "qwen3.5:4b",
     ]
 
@@ -154,13 +164,12 @@ def test_seed_prepends_local_default_to_custom_generation_allowlist(db_session):
     seed_default_settings(db_session)
 
     assert SettingsService(db_session).generation_allowed_models == [
-        "llama3.2:3b",
+        "google/gemma-4-26b-a4b-it",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ]
 
 
-def test_seed_preserves_supported_custom_generation_default_after_upgrade(db_session):
+def test_seed_updates_supported_custom_generation_default_to_current_default(db_session):
     db_session.add_all(
         [
             SystemSetting(
@@ -193,7 +202,7 @@ def test_seed_preserves_supported_custom_generation_default_after_upgrade(db_ses
 
     seed_default_settings(db_session)
 
-    assert SettingsService(db_session).generation_default_model == "gemma3:4b"
+    assert SettingsService(db_session).generation_default_model == "google/gemma-4-26b-a4b-it"
 
 
 def test_seed_moves_qwen35_to_last_in_known_answer_order(db_session):
@@ -213,11 +222,12 @@ def test_seed_moves_qwen35_to_last_in_known_answer_order(db_session):
     seed_default_settings(db_session)
 
     assert SettingsService(db_session).generation_answer_model_order == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "qwen3.5:4b",
     ]
 
@@ -248,17 +258,18 @@ def test_seed_removes_qwen_from_generation_model_lists(db_session):
     service = SettingsService(db_session)
 
     assert service.generation_allowed_models == [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
         "llama3.2:3b",
         "gemma3:4b",
         "qwen3.5:4b",
         "gemini-3.6-flash",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ]
     assert service.generation_utility_model_order == [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
 
@@ -278,17 +289,17 @@ def test_seed_migrates_known_utility_defaults_once(db_session):
     service = SettingsService(db_session)
 
     assert service.generation_utility_model_order == [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
 
     seed_default_settings(db_session)
     assert SettingsService(db_session).generation_utility_model_order == [
+        "llama-3.1-8b-instant",
         "qwen2.5:1.5b",
         "gemma3:4b",
-        "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
     ]
 

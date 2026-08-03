@@ -1,0 +1,243 @@
+
+<!DOCTYPE html>
+<html lang="en-US">
+
+<head>
+	<meta charset="UTF-8">
+	<meta http-equiv="X-UA-Compatible" content="IE=edge">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title>Timetable Downloads | Gest</title>
+	<meta name="csrf-param" content="_csrf-backend">
+<meta name="csrf-token" content="_mKi7uH2JzRhapdI3PLuKecwLXALD5EmdQdR9bIr8cKqFMC7haxuViwA_xGEholzqQB5SDNL_U8zNj2G3HuQtw==">
+
+<link href="/assets/af10ee3d/css/bootstrap.css?v=1692640517" rel="stylesheet">
+<link href="/vendors/bootstrap/dist/css/bootstrap.min.css?v=1627037520" rel="stylesheet">
+<link href="/vendors/bootstrap/dist/css/slots.css?v=1627037520" rel="stylesheet">
+<link href="/vendors/font-awesome/css/font-awesome.min.css?v=1627037511" rel="stylesheet">
+<link href="/vendors/nprogress/nprogress.css?v=1627037499" rel="stylesheet">
+<link href="/vendors/iCheck/skins/flat/green.css?v=1627037530" rel="stylesheet">
+<link href="/vendors/bootstrap-progressbar/css/bootstrap-progressbar-3.3.4.min.css?v=1627037503" rel="stylesheet">
+<link href="/vendors/jqvmap/dist/jqvmap.min.css?v=1627037513" rel="stylesheet">
+<link href="/vendors/bootstrap-daterangepicker/daterangepicker.css?v=1627037493" rel="stylesheet">
+<link href="/vendors/select2/select2.min.css?v=1627037500" rel="stylesheet">
+<link href="/vendors/malihu-custom-scrollbar-plugin/jquery.mCustomScrollbar.min.css?v=1627037497" rel="stylesheet">
+<link href="/build/css/custom.min.css?v=1627037569" rel="stylesheet">
+<link href="/style/style.css?v=1775934572" rel="stylesheet">
+<link href="/vendors/notification/notification.css?v=1627037498" rel="stylesheet">
+	<script async src="https://www.googletagmanager.com/gtag/js?id=G-E553F9GHY8"></script>
+	<script>
+		window.dataLayer = window.dataLayer || [];
+
+		function gtag() {
+			dataLayer.push(arguments);
+		}
+		gtag('js', new Date());
+		gtag('config', 'G-E553F9GHY8');
+	</script>
+
+	<style>
+		body {
+			background: whitesmoke;
+		}
+
+		footer {
+			margin-left: 0px;
+			width: 100%;
+			/*bottom: 0px;*/
+			/*margin: 0px;*/
+			/*margin-bottom: 0px;*/
+		}
+	</style>
+</head>
+
+<body class="nav-md">
+
+	
+	<header>
+		<center>
+			<img src="/images/udom_logo.png" alt="" style="height: 90px">
+			<h4> <span style="color: #0066cc; font-weight: bold">UDOM TIMETABLE SYSTEM</span></h4>
+		</center>
+	</header>
+
+	<div class="container body" style="background-color: #f9f9f9">
+
+		<!------------------- page content -------------------->
+		<div class="container" role="main">
+			<!-- top navigation -->
+			<div class="top_nav">
+				<div class="nav_menu" style="border-bottom: 3px solid #0066cc">
+					<nav>
+						<ul class="nav navbar-nav navbar-right">
+							<li class="">
+								<a href="javascript:;" class="user-profile dropdown-toggle" data-toggle="dropdown"
+									aria-expanded="false">
+									<img src="/images/user.png" alt="">
+									<span class="fa fa-angle-down"></span>
+								</a>
+
+																<ul class="dropdown-menu dropdown-usermenu">
+									<li>
+										<a href="/login">
+											<i class="fa fa-sign-in"></i> Login
+										</a>
+									</li>
+								</ul>
+								
+							</li>
+						</ul>
+					</nav>
+				</div>
+			</div>
+			<!-- /top navigation -->
+
+			<div class="col-xs-1 col-md-1 col-lg-1">
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-12 col-lg-10">
+				
+<div class="x_panel">
+	<div class="x_title">
+		<h2>Timetable Downloads</h2>
+		<ul class="nav navbar-right panel_toolbox">
+			<li><a class="collapse-link"><i class="">&nbsp;&nbsp;&nbsp;</i></a></li>
+			<li><a class="collapse-link"><i class="">&nbsp;&nbsp;&nbsp;</i></a></li>
+			<li><a class="collapse-link"><i class="fa fa-chevron-up"></i></a></li>
+		</ul>
+		<div class="clearfix"></div>
+	</div>
+
+	<div class="x_content">
+		<div class="alert alert-success alert-dismissible fade in small" role="alert">
+			<button type="button" class="close" data-dismiss="alert" aria-label="Close"><span
+					aria-hidden="true">×</span></button>
+					</div>
+
+		<form id="downloads" action="/downloads/download" method="post">
+<input type="hidden" name="_csrf-backend" value="_mKi7uH2JzRhapdI3PLuKecwLXALD5EmdQdR9bIr8cKqFMC7haxuViwA_xGEholzqQB5SDNL_U8zNj2G3HuQtw==">
+		<div class="row">
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+
+				<label>Academic Year</label>
+				<div class="form-group">
+					<select name="year" id="year" style="width: 100%" required="required"
+						onchange='$.ajax({url: "/downloads/fetch-semesters",data: $("#downloads").serializeArray(),success: function (data){$(".select2-container").remove();$("#semester").html(data);$(".select2").select2();},});'
+						class="select2 form-control" style="width: 100%">
+
+						<option value="">Select Academic Year</option>
+																		<option value="11">2024/2025</option>
+												<option value="12">2025/2026</option>
+																	</select>
+				</div>
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+				<label>Semester</label>
+				<div class="form-group">
+					<select name="semester" id="semester" style="width: 100%" required="required"
+						onchange='$.ajax({url: "/downloads/fetch-categories",data: $("#downloads").serializeArray(),success: function (data){$(".select2-container").remove();$("#type").html(data);	$(".select2").select2();},});'
+						class="select2 form-control" style="width: 100%">
+						<option value="">Select Semester</option>
+					</select>
+				</div>
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+				<label>Timetable Category</label>
+				<div class="form-group">
+					<select name="type" id="type" class="select2 form-control" required="required" style="width: 100%"
+						onchange='$.ajax({url: "/downloads/opt",data: $("#downloads").serializeArray(),success: function (data){$(".select2-container").remove();$("#option").html(data);$(".select2").select2();},});'>
+						<option value="">Select Category</option>
+					</select>
+				</div>
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+				<label>Option for Download</label>
+				<div class="form-group">
+					<select name="option" id="option" class="form-control select2" required="required"
+						style="width: 100%"
+						onchange='$.ajax({url: "/downloads/data",data: $("#downloads").serializeArray(),success: function (data){$(".select2-container").remove();$("#all_data").html(data);$(".select2").select2();},});'>
+						<option value="">Select Option for Download</option>
+					</select>
+				</div>
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+				<div class="form-group" id="all_data">
+					<label>Select Course/Programme</label>
+					<select name="data[]" id="data" class="form-control select2" style="width: 100%"
+						required="required">
+						<option value="">Not Selected</option>
+					</select>
+				</div>
+			</div>
+
+			<div class="col-xs-12 col-sm-12 col-md-4 col-lg-4">
+				<br>
+				<label>&nbsp;</label>
+				<span id="message" style="display: none;"><img src="/images/ajax-loader.gif"
+						style="height: 20px;">Processing...</span>
+				<button type="submit" id="download" class="btn btn-success btn-sm pull-right">Download</button>
+				<button type="button" id="view" class="btn btn-primary ml-2 pl-3 pr-3 btn-sm pull-right"
+					onclick='$("#message").show();$.ajax({url: "/downloads/view",data: $("#downloads").serializeArray(),success: function (data){$("#view-timetable").html(data);$("#view-div").show();$("#message").hide();},error: function (data){$("#message").hide();},});'>View</button>
+			</div>
+		</div>
+
+		</form>	</div>
+</div> 
+
+<div class="x_panel" style="display: none;" id="view-div">
+	<div class="x_content " id="view-timetable"></div>
+</div>			</div>
+
+			<div class="col-xs-1  col-md-1 col-lg-1">
+			</div>
+
+		</div>
+		<!------------- page content ---------------->
+
+	</div>
+
+	<br><br><br><br><br><br><br><br>
+	<footer class="footer">
+		<div class="container">
+			<center>2026 &copy; UDOM Timetable System</center>
+		</div>
+	</footer>
+
+	<script src="/vendors/jquery/dist/jquery.min.js?v=1627037512"></script>
+<script src="/assets/cb16324e/yii.js?v=1692640517"></script>
+<script src="/assets/cb16324e/yii.activeForm.js?v=1692640517"></script>
+<script src="/vendors/bootstrap/dist/js/bootstrap.min.js?v=1627037520"></script>
+<script src="/vendors/fastclick/lib/fastclick.js?v=1627037511"></script>
+<script src="/vendors/nprogress/nprogress.js?v=1627037499"></script>
+<script src="/vendors/Chart.js/dist/Chart.min.js?v=1627037504"></script>
+<script src="/vendors/gauge.js/dist/gauge.min.js?v=1627037511"></script>
+<script src="/vendors/bootstrap-progressbar/bootstrap-progressbar.min.js?v=1627037493"></script>
+<script src="/vendors/iCheck/icheck.min.js?v=1627037496"></script>
+<script src="/vendors/skycons/skycons.js?v=1627037501"></script>
+<script src="/vendors/Flot/jquery.flot.js?v=1627037495"></script>
+<script src="/vendors/Flot/jquery.flot.pie.js?v=1627037495"></script>
+<script src="/vendors/Flot/jquery.flot.time.js?v=1627037495"></script>
+<script src="/vendors/Flot/jquery.flot.stack.js?v=1627037495"></script>
+<script src="/vendors/Flot/jquery.flot.resize.js?v=1627037495"></script>
+<script src="/vendors/flot.orderbars/js/jquery.flot.orderBars.js?v=1627037511"></script>
+<script src="/vendors/flot-spline/js/jquery.flot.spline.min.js?v=1627037511"></script>
+<script src="/vendors/flot.curvedlines/curvedLines.js?v=1627037495"></script>
+<script src="/vendors/DateJS/build/date.js?v=1627037508"></script>
+<script src="/vendors/jqvmap/dist/jquery.vmap.js?v=1627037513"></script>
+<script src="/vendors/jqvmap/dist/maps/jquery.vmap.world.js?v=1627037534"></script>
+<script src="/vendors/jqvmap/examples/js/jquery.vmap.sampledata.js?v=1627037534"></script>
+<script src="/vendors/moment/moment.js?v=1627037498"></script>
+<script src="/vendors/bootstrap-daterangepicker/daterangepicker.js?v=1627037493"></script>
+<script src="/vendors/select2/select2.full.min.js?v=1627037500"></script>
+<script src="/vendors/datatables.net/js/jquery.dataTables.min.js?v=1627037505"></script>
+<script src="/vendors/malihu-custom-scrollbar-plugin/jquery.mCustomScrollbar.concat.min.js?v=1627037497"></script>
+<script src="/build/js/custom.min.js?v=1627037569"></script>
+<script src="/style/script.js?v=1753124559"></script>
+<script>jQuery(function ($) {
+jQuery('#downloads').yiiActiveForm([], []);
+});</script></body>
+
+</html>

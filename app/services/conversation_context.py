@@ -136,44 +136,58 @@ class ConversationContextResolver:
     )
     _CORRECTION_RE = re.compile(
         r"^\s*(?:i\s+(?:mean|meant)|sorry[, ]+i\s+(?:mean|meant)|not\s+.+(?:but|,)|"
-        r"actually[, ]|rather[, ])",
+        r"actually[, ]|rather[, ]|namaanisha|nilimaanisha|samahani[, ]+namaanisha|"
+        r"sio\s+.+(?:bali|lakini|,))",
         re.IGNORECASE,
     )
     _COMPARISON_RE = re.compile(
-        r"^\s*(?:what|how)\s+about\b|^\s*(?:and\s+)?(?:for|among)\s+\w+|\bcompared\s+(?:with|to)\b",
+        r"^\s*(?:what|how)\s+about\b|^\s*(?:and\s+)?(?:for|among)\s+\w+|"
+        r"^\s*(?:je|vipi)\s+kuhusu\b|^\s*(?:na\s+)?(?:kwa|kuhusu|miongoni\s+mwa)\s+\w+|"
+        r"\bcompared\s+(?:with|to)\b|\b(?:ikilinganishwa|linganisha)\s+na\b",
         re.IGNORECASE,
     )
     _CONTINUATION_RE = re.compile(
-        r"^\s*(?:also|and\s+then|then|next|continue|go\s+on)\b",
+        r"^\s*(?:also|and\s+then|then|next|continue|go\s+on|pia|halafu|kisha|endelea)\b",
         re.IGNORECASE,
     )
     _SHORT_RESPONSE_RE = re.compile(
         r"^\s*(?:yes|no|yeah|nope|correct|the\s+first|the\s+second|first|second|"
-        r"both|all|none|that\s+one|this\s+one)\s*[?.!]*\s*$",
+        r"both|all|none|that\s+one|this\s+one|ndiyo|hapana|sahihi|ya\s+kwanza|"
+        r"ya\s+pili|kwanza|pili|zote|vyote|hakuna|hiyo|hiki|kile)\s*[?.!]*\s*$",
         re.IGNORECASE,
     )
     _REFERENCE_TERMS = {
         "it",
         "its",
         "this",
-        "that",
+        # "that" excluded: common grammatical connector, not a true anaphoric reference
         "these",
         "those",
         "they",
         "them",
-        "there",
+        # "there" excluded: commonly used in general questions, not a history reference
         "same",
         "previous",
         "above",
         "earlier",
         "former",
         "latter",
-        "one",
-        "ones",
+        "hiyo",
+        "hili",
+        "hiki",
+        "kile",
+        "hao",
+        "hayo",
+        "zile",
+        "zilizopita",
+        "iliyopita",
+        "sawa",
+        # "one" / "ones" excluded: used in ordinal phrases ("semester one", "year 1")
     }
     _SELF_CONTAINED_TIME_REFERENCE_RE = re.compile(
         r"\b(?:this|current|next|last)\s+(?:academic\s+)?"
-        r"(?:year|semester|term|month|week|day)\b",
+        r"(?:year|semester|term|month|week|day)\b|"
+        r"\b(?:mwaka|muhula|semester|mwezi|wiki|siku)\s+(?:huu|ujao|uliopita)\b",
         re.IGNORECASE,
     )
 
@@ -519,21 +533,54 @@ class ConversationContextResolver:
         cls,
         previous_query: str,
         follow_up: str,
-        relation: ConversationRelation,
+        relation: ConversationRelation = "refinement",
     ) -> str:
         previous = previous_query.rstrip(" ?.!;")
         current = clean_query_text(follow_up)
-        lowered = current.lower()
-        if re.search(r"\b(?:name|names|jina)\b", lowered):
+        lowered_current = current.lower()
+
+        # 1. Target entity substitution for queries like "does this apply for ID as well?"
+        apply_match = re.search(
+            r"\bdoes\s+(?:this|that|it)\s+apply\s+(?:to|for)\s+(.+?)(?:\s+(?:as\s+well|too))?\s*[?.!]*$",
+            current,
+            re.IGNORECASE,
+        )
+        if apply_match:
+            target = apply_match.group(1).strip().rstrip("?.!")
+            if re.search(r"\blost\s+my\s+[\w\s]+", previous, re.IGNORECASE):
+                return re.sub(r"\blost\s+my\s+[\w\s]+", f"lost my {target}", previous, flags=re.IGNORECASE)
+            if re.search(r"\bfor\s+(?:a\s+|the\s+)?[\w\s]+", previous, re.IGNORECASE):
+                return re.sub(r"\bfor\s+(?:a\s+|the\s+)?[\w\s]+", f"for {target}", previous, flags=re.IGNORECASE)
+            return f"{previous} (applied to {target})"
+
+        # 2. Topic comparisons/substitutions like "what about ID?" or "what about postgraduate students?"
+        about_match = re.search(
+            r"^\s*(?:what|how)\s+about\s+(.+?)\s*[?.!]*$|^\s*(?:and\s+)?for\s+(.+?)\s*[?.!]*$",
+            current,
+            re.IGNORECASE,
+        )
+        if about_match:
+            target = (about_match.group(1) or about_match.group(2)).strip().rstrip("?.!")
+            if "chancellor" in previous.lower() and "chancellor" in target.lower():
+                return re.sub(r"\bchancellor\b", target, previous, flags=re.IGNORECASE)
+            if re.search(r"\blost\s+my\s+[\w\s]+", previous, re.IGNORECASE):
+                return re.sub(r"\blost\s+my\s+[\w\s]+", f"lost my {target}", previous, flags=re.IGNORECASE)
+            return f"{previous} regarding {target}"
+
+        # 3. Refinement queries for names and dates
+        if re.search(r"\b(?:name|names|jina)\b", lowered_current):
             return f"{previous}; provide the person's full name"
-        if re.search(r"\b(?:date|dates|when)\b", lowered):
+        if re.search(r"\b(?:date|dates|when)\b", lowered_current):
             return f"{previous}; provide the exact date"
-        label = {
-            "correction": "correction",
-            "comparison": "compare with",
-            "clarification_response": "clarification",
-        }.get(relation, "follow-up request")
-        return f"{previous}; {label}: {current}"
+
+        # 4. Fallback clean synthesis without artificial prompt-like labels
+        if relation == "correction":
+            return f"{previous} (corrected: {current})"
+        if relation == "comparison":
+            return f"{previous} compared with {current}"
+
+        return f"{previous} ({current})"
+
 
     @classmethod
     def _depends_on_history(cls, query: str) -> bool:

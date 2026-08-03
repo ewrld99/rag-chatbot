@@ -184,23 +184,50 @@ class GroundingService:
         normalized = dict(payload)
         claims = normalized.get("claims")
 
+        # Extract top-level evidence IDs if present (some LLMs output {"evidence": {"ev-1": "..."}, "claims": [...]})
+        top_level_evidence = normalized.get("evidence")
+        default_evidence_ids: list[str] = []
+        if isinstance(top_level_evidence, dict):
+            default_evidence_ids = [str(k) for k in top_level_evidence.keys() if str(k).startswith("ev-")]
+        elif isinstance(top_level_evidence, list):
+            default_evidence_ids = [str(k) for k in top_level_evidence if str(k).startswith("ev-")]
+        elif isinstance(normalized.get("evidence_id"), str):
+            default_evidence_ids = [normalized["evidence_id"]]
+
         if "coverage" not in normalized:
             normalized["coverage"] = "partial" if claims else "none"
 
         if isinstance(claims, list):
             normalized_claims = []
             for claim in claims:
+                # Handle string claims: ["ST 3201 Biostatistics...", "Core 9 ST 3296..."]
+                if isinstance(claim, str):
+                    clean_text = claim.strip()
+                    if clean_text:
+                        normalized_claims.append({
+                            "claim": clean_text,
+                            "evidence_ids": list(default_evidence_ids),
+                        })
+                    continue
+
                 if not isinstance(claim, dict):
-                    normalized_claims.append(claim)
                     continue
 
                 normalized_claim = dict(claim)
+                # Normalize evidence field aliases (evidence_id / evidence → evidence_ids)
                 if "evidence_ids" not in normalized_claim and "evidence" in normalized_claim:
                     normalized_claim["evidence_ids"] = normalized_claim.get("evidence")
                 if "evidence_ids" not in normalized_claim and "evidence_id" in normalized_claim:
                     normalized_claim["evidence_ids"] = [normalized_claim.get("evidence_id")]
                 if "evidence_ids" not in normalized_claim:
-                    normalized_claim["evidence_ids"] = []
+                    normalized_claim["evidence_ids"] = list(default_evidence_ids)
+                # Normalize claim text field aliases:
+                # Some LLMs (llama3.2, gemma3) output "text" or "sentence" instead of "claim".
+                if "claim" not in normalized_claim:
+                    for alias in ("text", "sentence", "statement", "content"):
+                        if alias in normalized_claim:
+                            normalized_claim["claim"] = normalized_claim[alias]
+                            break
                 normalized_claims.append(normalized_claim)
             normalized["claims"] = normalized_claims
 
@@ -218,7 +245,38 @@ class GroundingService:
         return normalized
 
     @staticmethod
+    def _extract_common_prefix(claim_texts: list[str]) -> str | None:
+        """Extract a common sentence preamble shared by at least 3 claims (e.g. 'The courses for first year include ')."""
+        if len(claim_texts) < 3:
+            return None
+        words_list = [t.split() for t in claim_texts if t]
+        if not words_list or not words_list[0]:
+            return None
+
+        max_matching_len = 0
+        first_words = words_list[0]
+        for w_idx, word in enumerate(first_words):
+            matching_count = sum(
+                1 for words in words_list
+                if len(words) > w_idx and words[w_idx].lower() == word.lower()
+            )
+            if matching_count >= 3 and matching_count >= len(claim_texts) * 0.5:
+                max_matching_len = w_idx + 1
+            else:
+                break
+
+        if max_matching_len < 4:
+            return None
+
+        prefix_str = " ".join(first_words[:max_matching_len]) + " "
+        if len(prefix_str.strip()) < 15:
+            return None
+
+        return prefix_str
+
+    @classmethod
     def render_claim_answer(
+        cls,
         draft: GroundedDraft,
         *,
         ordered: bool = False,
@@ -226,10 +284,32 @@ class GroundingService:
         """Render the user-facing answer from the canonical claim sequence."""
         if draft.coverage == "none" or not draft.claims:
             return draft
+
+        claim_texts = [claim.claim.strip() for claim in draft.claims if claim.claim.strip()]
+        if not claim_texts:
+            return draft
+
+        header_prefix = cls._extract_common_prefix(claim_texts)
+
         lines = []
-        for index, claim in enumerate(draft.claims, start=1):
-            prefix = f"{index}." if ordered else "-"
-            lines.append(f"{prefix} {claim.claim.strip()}")
+        if header_prefix:
+            header_text = header_prefix.strip().rstrip(":")
+            lines.append(f"{header_text}:")
+            lines.append("")
+            for index, text in enumerate(claim_texts, start=1):
+                if text.lower().startswith(header_prefix.lower()):
+                    item_text = text[len(header_prefix):].strip()
+                    if item_text and item_text[0].islower():
+                        item_text = item_text[0].upper() + item_text[1:]
+                else:
+                    item_text = text
+                prefix = f"{index}." if ordered else "-"
+                lines.append(f"{prefix} {item_text}")
+        else:
+            for index, text in enumerate(claim_texts, start=1):
+                prefix = f"{index}." if ordered else "-"
+                lines.append(f"{prefix} {text}")
+
         return draft.model_copy(update={"answer": "\n".join(lines)})
 
     def reconcile_stub_answer(self, draft: GroundedDraft) -> GroundedDraft:
@@ -548,9 +628,27 @@ class GroundingService:
             supported_markdown.append(unit["markdown"])
 
         if supported_markdown:
+            if self._is_ordered_markdown_list(supported_markdown):
+                supported_markdown = self._renumber_ordered_markdown(supported_markdown)
             return "\n\n".join(supported_markdown)
 
         return "\n\n".join(dict.fromkeys(supported_claims))
+
+    @staticmethod
+    def _is_ordered_markdown_list(units: list[str]) -> bool:
+        return bool(units) and all(
+            re.match(r"^\s*\d+[.)]\s+", unit)
+            for unit in units
+        )
+
+    @staticmethod
+    def _renumber_ordered_markdown(units: list[str]) -> list[str]:
+        renumbered: list[str] = []
+        for index, unit in enumerate(units, start=1):
+            renumbered.append(
+                re.sub(r"^\s*\d+[.)]\s+", f"{index}. ", unit.strip(), count=1)
+            )
+        return renumbered
 
     def _claim_evidence_ids(
         self,

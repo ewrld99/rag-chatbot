@@ -1,15 +1,24 @@
 from app.services.intent_router import IntentRouter
 
 
-class FailIfClassifiedRouter(IntentRouter):
+class GreetingClassifierRouter(IntentRouter):
     def __init__(self):
         super().__init__(db=None, generator=object())
+        self.classifier_calls = 0
+        self.alias_calls = 0
 
     def _classify_with_llm(self, query, normalized_query, aliases, chat_history):
-        raise AssertionError("Simple conversational turns must not call the LLM classifier.")
+        self.classifier_calls += 1
+        return {
+            "intent": "CONVERSATIONAL",
+            "confidence": 0.94,
+            "reason": "LLM identified a greeting.",
+            "standalone_query": query,
+        }
 
     def _matched_aliases(self, query):
-        raise AssertionError("Simple conversational turns must not query aliases.")
+        self.alias_calls += 1
+        return {}
 
 
 class StubRouter(IntentRouter):
@@ -85,13 +94,42 @@ def test_general_student_support_with_udom_context_stays_support():
     assert decision.action == "student_support"
 
 
-def test_exact_greeting_uses_rule_without_llm_or_database():
-    decision = FailIfClassifiedRouter().classify("Hello!")
+def test_exact_greeting_uses_llm_classifier():
+    router = GreetingClassifierRouter()
+
+    decision = router.classify("Hello!")
 
     assert decision.intent == "CONVERSATIONAL"
     assert decision.action == "conversational"
-    assert decision.confidence == 1.0
-    assert decision.source == "rule:conversational"
+    assert decision.confidence == 0.94
+    assert decision.source == "llm"
+    assert router.classifier_calls == 1
+
+
+def test_social_turn_after_document_topic_uses_llm_classifier_not_follow_up_search():
+    router = GreetingClassifierRouter()
+
+    decision = router.classify(
+        "Thanks",
+        [
+            {
+                "role": "user",
+                "content": "How is GPA calculated at UDOM?",
+                "turn_context": {
+                    "relation": "new_topic",
+                    "is_follow_up": False,
+                    "intent": "UDOM_DOCUMENT_SEARCH",
+                    "standalone_query": "How is GPA calculated at UDOM?",
+                    "status": "completed",
+                },
+            }
+        ],
+    )
+
+    assert decision.intent == "CONVERSATIONAL"
+    assert decision.source == "llm"
+    assert decision.conversation.is_follow_up is True
+    assert router.classifier_calls == 1
 
 
 def test_greeting_with_official_question_routes_to_document_search():
@@ -181,6 +219,19 @@ def test_swahili_official_question_routes_to_document_search():
     router = FailIfClassifiedSwahiliRouter()
 
     decision = router.classify("Nataka kujua utaratibu wa kuahirisha masomo")
+
+    assert decision.intent == "UDOM_DOCUMENT_SEARCH"
+    assert decision.source == "rule:document_search"
+
+
+def test_swahili_cancellation_procedure_routes_to_document_search():
+    class FailIfClassifiedSwahiliRouter(StubRouter):
+        def _classify_with_llm(self, query, normalized_query, aliases, chat_history):
+            raise AssertionError("Swahili postponement/cancellation terms should skip LLM classification.")
+
+    router = FailIfClassifiedSwahiliRouter()
+
+    decision = router.classify("nataka kufahamu hatua za kughairisha mwaka wa masomo")
 
     assert decision.intent == "UDOM_DOCUMENT_SEARCH"
     assert decision.source == "rule:document_search"

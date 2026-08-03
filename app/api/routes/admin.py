@@ -167,11 +167,17 @@ def list_documents(
     )
     
     # Calculate totals
-    total = query.count()
+    count_query = db.query(func.count(DocumentModel.id))
+    if search:
+        search_filter = f"%{search}%"
+        count_query = count_query.filter(
+            (DocumentModel.filename.ilike(search_filter)) | 
+            (DocumentModel.title.ilike(search_filter))
+        )
+    total = count_query.scalar() or 0
     total_pages = max(1, (total + limit - 1) // limit)
     page = min(page, total_pages)
     
-    # Apply pagination
     results = query.offset((page - 1) * limit).limit(limit).all()
     
     items = []
@@ -511,8 +517,9 @@ def _save_completed_upload(
             embeddings,
             persist_review_chunks=True,
         )
-        document.status = "processing"
-        document.indexing_status = "processing"
+        # Do NOT override document.status or indexing_status here — apply() already
+        # set them correctly ("active" / "quality_review" and "idle" respectively).
+        # Only mark storage_state as "promoting" to signal the file move is still pending.
         document.storage_state = "promoting"
         document.storage_error = None
         db.commit()
@@ -603,9 +610,31 @@ def _upload_ingestion_generator(
         reconcile_file_operations(storage=FileStorageService(UPLOAD_DIR))
         with session_scope(SessionLocal) as db:
             document = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
-            if document is None or document.storage_state != "ready":
-                detail = document.storage_error if document is not None else "document disappeared"
-                raise RuntimeError(f"File promotion did not complete: {detail}")
+            if document is None:
+                raise RuntimeError("Document record disappeared after save")
+            # "promoting" is a valid transient state — the inline reconcile may have skipped
+            # the FileOperation row due to advisory lock contention (skip_locked=True) when the
+            # background reconciler loop holds the lock concurrently. The background task will
+            # finish the promotion shortly, so we yield a "pending" status instead of failing.
+            if document.storage_state in ("missing", "storage_failed"):
+                detail = document.storage_error or "File promotion failed with no details"
+                raise RuntimeError(f"File promotion failed: {detail}")
+            if document.storage_state == "promoting":
+                logger.info(
+                    "File promotion still in progress for document %s "
+                    "(lock contention — background reconciler will complete it)",
+                    document_id,
+                )
+                yield json.dumps({
+                    "progress": 100,
+                    "status": "pending_storage",
+                    "filename": filename,
+                    "chunks_stored": len(chunks),
+                    "quality_status": prepared.quality.status,
+                    "quality": prepared.quality.report,
+                    "message": "Document saved and indexed. File storage promotion is completing in the background.",
+                }) + "\n"
+                return
         yield json.dumps({
             "progress": 100,
             "status": "Quality review required" if prepared.quality.blocks_activation else "Done",
@@ -1721,7 +1750,7 @@ def get_crawler_status(db: Session = Depends(get_db), admin_username: str = Depe
     jobs = db.query(CrawlerJob).all()
     job_dict = {job.job_type: job for job in jobs}
     
-    status = {"enabled": settings.CRAWLER_ENABLED}
+    status = {"enabled": SettingsService(db).crawler_enabled}
     for jtype in ["full", "announcements"]:
         if jtype in job_dict:
             j = job_dict[jtype]
@@ -1742,8 +1771,8 @@ def get_crawler_status(db: Session = Depends(get_db), admin_username: str = Depe
             }
     return status
 
-def _require_crawler_enabled():
-    if not settings.CRAWLER_ENABLED:
+def _require_crawler_enabled(db: Session):
+    if not SettingsService(db).crawler_enabled:
         raise HTTPException(status_code=503, detail="Crawler is disabled.")
 
 @router.post("/crawler/cancel/{job_type}")
@@ -1778,26 +1807,29 @@ def _trigger_announcement_crawler_task():
 @router.post("/crawler/trigger-full")
 def trigger_full_crawler(
     background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
     admin_username: str = Depends(require_admin)
 ):
-    _require_crawler_enabled()
+    _require_crawler_enabled(db)
     background_tasks.add_task(_trigger_full_crawler_task, True)
     return {"message": "Fresh full crawler started in the background."}
 
 @router.post("/crawler/resume-full")
 def resume_full_crawler(
     background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
     admin_username: str = Depends(require_admin)
 ):
-    _require_crawler_enabled()
+    _require_crawler_enabled(db)
     background_tasks.add_task(_trigger_full_crawler_task, False)
     return {"message": "Full crawler resume started in the background."}
 
 @router.post("/crawler/trigger-announcements")
 def trigger_announcement_crawler(
     background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
     admin_username: str = Depends(require_admin)
 ):
-    _require_crawler_enabled()
+    _require_crawler_enabled(db)
     background_tasks.add_task(_trigger_announcement_crawler_task)
     return {"message": "Announcement crawler started in the background."}

@@ -184,8 +184,9 @@ class DenseRetriever:
                 doc_query = doc_query.filter(DocumentChunk.is_retrievable.is_(True))
             else:
                 doc_query = (
-                    doc_query.filter(DocumentChunk.document.has(status="active"))
-                    .filter(DocumentChunk.document.has(DocumentModel.quality_status != "review"))
+                    doc_query.join(DocumentChunk.document)
+                    .filter(DocumentModel.status == "active")
+                    .filter(or_(DocumentModel.quality_status != "review", DocumentModel.quality_status.is_(None)))
                 )
 
             # Apply optional metadata filters with graceful fallback:

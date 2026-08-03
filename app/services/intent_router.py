@@ -141,7 +141,7 @@ RoutingDecision = IntentDecision
 
 
 class IntentRouter:
-    """Conversational fast path plus LLM classification and guardrails."""
+    """LLM classification with deterministic guardrails for document routing."""
 
     _ELLIPTICAL_FOLLOW_UP_RE = re.compile(
         r"^\s*(?:"
@@ -173,6 +173,18 @@ class IntentRouter:
         r"\b(?:advice|tips?|coach\w*|motivat\w*|study\s+better|"
         r"improve\s+my|manage\s+my|cope\s+with|help\s+me|"
         r"plan\s+my|organize\s+my|concentrate\s+better)\b",
+        re.IGNORECASE,
+    )
+    _CURRICULUM_LIST_QUERY_RE = re.compile(
+        r"\b(?:what|which|list|name|show|give|tell)\b"
+        r"(?:\s+(?:are|is|the|of|for|in|on|that|a|an|all|some|any)){0,6}"
+        r"\s*(?:courses?|programmes?|programs?|units?|modules?|subjects?|"
+        r"papers?|topics?|classes?|subjects?)\b"
+        r"(?:\s+(?:taken|offered|taught|studied|available|required|"
+        r"for|in|by|at|during|within|under|per)){0,4}"
+        r"(?:\s+\w+){0,8}"
+        r"\s*(?:semester|year|level|stage|term|session|trimester|"
+        r"first|second|third|fourth|1st|2nd|3rd|4th|one|two|three|four)\b",
         re.IGNORECASE,
     )
 
@@ -259,6 +271,27 @@ class IntentRouter:
             )
 
         if conversation.relation == "ambiguous":
+            # Bypass: if the query contains clear UDOM document signals, route directly to
+            # document search instead of asking for clarification. This prevents standalone
+            # questions like "what are the courses that a software engineer takes in semester 1"
+            # from being blocked on grammatical connector words ('that', 'one', etc.).
+            aliases = self._matched_aliases(query)
+            if (
+                self._requires_document_search(set(tokenize(normalized_query)), aliases)
+                or self._requires_official_evidence(query)
+                or self._CURRICULUM_LIST_QUERY_RE.search(query)
+            ):
+                bypass_decision = self._decision(
+                    "UDOM_DOCUMENT_SEARCH",
+                    0.85,
+                    "Query contains clear document signals; bypassing ambiguity clarification.",
+                    clean_query_text(query),
+                    normalized_query,
+                    "rule:document_search_bypass",
+                    self._profile_filters(user_profile),
+                )
+                return self._attach_conversation(bypass_decision, conversation)
+
             source = (
                 "rule:unresolved_follow_up"
                 if conversation.source == "rule" and conversation.referenced_message_id is None
@@ -276,22 +309,8 @@ class IntentRouter:
                 conversation,
             )
 
-        social_turn = conversational_kind(query)
-        if social_turn is not None:
-            return self._attach_conversation(
-                self._decision(
-                    "CONVERSATIONAL",
-                    1.0,
-                    f"Exact {social_turn} phrase matched the conversational fast path.",
-                    clean_query_text(query),
-                    normalized_query,
-                    "rule:conversational",
-                ),
-                conversation,
-            )
-
         follow_up_decision = self._conversation_follow_up_decision(
-            conversation, normalized_query, chat_history, user_profile
+            conversation, query, normalized_query, chat_history, user_profile
         )
         if follow_up_decision is not None:
             return self._attach_conversation(follow_up_decision, conversation)
@@ -303,8 +322,23 @@ class IntentRouter:
             "CLARIFY",
             "OUT_OF_SCOPE",
         }:
+            resolved_intent = conversation.intent
+            # Guardrail: If standalone_query or current query contains official document signals,
+            # or if the query is a correction/follow-up ("i said for...", "i meant..."),
+            # do not allow model classification to demote it to CONVERSATIONAL.
+            if resolved_intent == "CONVERSATIONAL":
+                combined_text = f"{query} {conversation.standalone_query or ''}".lower()
+                aliases = self._matched_aliases(query)
+                if (
+                    self._requires_official_evidence(combined_text)
+                    or self._requires_document_search(set(tokenize(combined_text)), aliases)
+                    or re.search(r"\b(?:i\s+said|i\s+meant|no\s*,?\s*for|instead|for\s+\w+)\b", query, re.I)
+                    or self._history_has_document_signal(chat_history)
+                ):
+                    resolved_intent = "UDOM_DOCUMENT_SEARCH"
+
             model_decision = self._decision(
-                conversation.intent,  # type: ignore[arg-type]
+                resolved_intent,  # type: ignore[arg-type]
                 conversation.confidence,
                 conversation.reason,
                 conversation.standalone_query,
@@ -312,7 +346,7 @@ class IntentRouter:
                 "conversation:model",
                 (
                     self._profile_filters(user_profile)
-                    if conversation.intent == "UDOM_DOCUMENT_SEARCH"
+                    if resolved_intent == "UDOM_DOCUMENT_SEARCH"
                     else {}
                 ),
             )
@@ -342,11 +376,14 @@ class IntentRouter:
     def _conversation_follow_up_decision(
         self,
         conversation: ConversationDecision,
+        query: str,
         normalized_query: str,
         chat_history: list[dict[str, Any]] | None,
         user_profile: dict[str, Any] | None,
     ) -> IntentDecision | None:
         if conversation.is_follow_up is not True or not conversation.standalone_query:
+            return None
+        if conversational_kind(query) is not None:
             return None
 
         intent = conversation.intent
@@ -470,13 +507,8 @@ class IntentRouter:
 
     @staticmethod
     def _resolve_follow_up_query(previous_query: str, follow_up: str) -> str:
-        cleaned_previous = previous_query.rstrip(" ?.!")
-        lowered_follow_up = clean_query_text(follow_up).lower()
-        if re.search(r"\b(?:name|names|jina)\b", lowered_follow_up):
-            return f"{cleaned_previous}; provide the person's full name"
-        if re.search(r"\b(?:date|dates|when)\b", lowered_follow_up):
-            return f"{cleaned_previous}; provide the exact date"
-        return f"{cleaned_previous}; follow-up request: {clean_query_text(follow_up)}"
+        from app.services.conversation_context import ConversationContextResolver
+        return ConversationContextResolver._resolve_query(previous_query, follow_up, "refinement")
 
     def route(
         self,
@@ -519,6 +551,58 @@ class IntentRouter:
         if decision.conversation is None:
             return promoted
         return self._attach_conversation(promoted, decision.conversation)
+
+    def demote_to_student_support(
+        self,
+        decision: IntentDecision,
+        query: str,
+    ) -> IntentDecision:
+        """Demote a UDOM_DOCUMENT_SEARCH route when retrieval finds no relevant evidence.
+
+        Called after retrieval returns insufficient confidence, but only when the
+        question is broad enough to receive a useful student-support answer (e.g.
+        "how do I prepare for exams?" — no documents, but still helpful to answer).
+        Strongly institutional queries (policy, fees, eligibility, discontinuation)
+        are NOT demoted — they get the standard refusal so we don't hallucinate.
+        """
+        demoted = self._decision(
+            "STUDENT_SUPPORT",
+            decision.confidence,
+            "No relevant UDOM documents found; routing to student support guidance.",
+            decision.standalone_query or clean_query_text(query),
+            decision.normalized_query,
+            f"{decision.source}+retrieval_demotion",
+        )
+        if decision.conversation is None:
+            return demoted
+        return self._attach_conversation(demoted, decision.conversation)
+
+    def should_demote_to_student_support(
+        self,
+        query: str,
+        decision: IntentDecision,
+    ) -> bool:
+        """Return True when a no-result UDOM_DOCUMENT_SEARCH should fall back to STUDENT_SUPPORT.
+
+        Conditions that block demotion (keep the refusal instead):
+        - The query contains strongly institutional signals (policy, fees, sanctions,
+          discontinuation, eligibility, deadlines) — hallucinating those is dangerous.
+        - The query contains an explicit evidence request ("according to", "official", etc.)
+        - The query reads as an advice request that probing already handled.
+        """
+        if decision.intent != "UDOM_DOCUMENT_SEARCH":
+            return False
+        # Never demote institutional / high-stakes queries
+        if self._requires_official_evidence(query):
+            return False
+        # Don't demote if rule-based document search was already very confident
+        if decision.source in ("rule:document_search",) and not self._ADVICE_REQUEST_RE.search(query):
+            return False
+        # Demote only if the query could plausibly receive a coaching answer
+        return bool(self._ADVICE_REQUEST_RE.search(query) or self.STUDENT_SUPPORT_TERMS & set(
+            w.lower() for w in query.split()
+        ))
+
 
     def _rule_document_search_decision(
         self,
