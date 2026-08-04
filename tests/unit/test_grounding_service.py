@@ -250,6 +250,42 @@ def test_parse_draft_accepts_json_wrapped_in_markdown_fence():
     assert draft.answer == "- Students must display an identity card."
 
 
+def test_parse_draft_recovers_claims_from_trailing_comma_json():
+    service = GroundingService()
+    raw = """{
+  "coverage": "full",
+  "claims": [
+    {
+      "claim": "A carryover course must be taken flexibly in later years.",
+      "evidence_ids": ["ev-1234567890abcdef"]
+    },
+  ]
+}"""
+
+    draft, error = service.parse_draft(raw)
+
+    assert error is None
+    assert draft is not None
+    assert draft.coverage == "full"
+    assert len(draft.claims) == 1
+    assert draft.claims[0].claim == (
+        "A carryover course must be taken flexibly in later years."
+    )
+
+
+def test_parse_draft_does_not_treat_inner_claim_as_model_refusal():
+    service = GroundingService()
+    raw = (
+        'prefix {"claim":"A carryover course is repeated later.",'
+        '"evidence_ids":["ev-1234567890abcdef"]} suffix'
+    )
+
+    draft, error = service.parse_draft(raw)
+
+    assert draft is None
+    assert error is not None
+
+
 def test_partial_outcome_keeps_only_semantically_supported_claims():
     service = GroundingService()
     document = _document(
@@ -882,7 +918,8 @@ def test_generation_skips_repair_when_disabled_and_no_claims_are_supported(monke
 
     assert result["answer"] == "Generated document refusal."
     assert result["grounding"]["repaired"] is False
-    assert result["grounding"]["status"] == "refused"
+    assert result["grounding"]["status"] == "unsupported_answer"
+    assert result["grounding"]["failure_reason"] == "unsupported_answer"
     assert generator.answer_payloads == [repair_payload]
     assert generator.refusal_queries == ["How is GPA calculated?"]
 
@@ -987,9 +1024,29 @@ def test_generation_refuses_after_two_malformed_drafts():
     )
 
     assert result["answer"] == "Generated document refusal."
-    assert result["grounding"]["status"] == "refused"
+    assert result["grounding"]["status"] == "parse_error"
+    assert result["grounding"]["failure_reason"] == "parse_error"
     assert result["evidence_ids"] == []
     assert generator.refusal_queries == ["What is the policy?"]
+
+
+def test_generation_reports_model_refusal_separately_from_parse_error():
+    generator = _StubGenerationService(
+        [{"coverage": "none", "claims": []}, {"coverage": "none", "claims": []}],
+        [],
+    )
+
+    result = generator.generate_response(
+        "What is carryover?",
+        "<documents />",
+        documents=[_document()],
+    )
+
+    assert result["answer"] == "Generated document refusal."
+    assert result["grounding"]["status"] == "model_refusal"
+    assert result["grounding"]["failure_reason"] == "model_refusal"
+    assert result["evidence_ids"] == []
+    assert generator.refusal_queries == ["What is carryover?"]
 
 
 def test_async_finalization_reconciles_stub_answer():

@@ -59,16 +59,6 @@ function SourceList({ sources }) {
     );
 }
 
-const MODEL_LABELS = {
-    "google/gemma-4-26b-a4b-it": "Gemma 4 26B (OpenRouter)",
-    "google/gemma-4-26b-a4b-it:free": "Gemma 4 26B Free (OpenRouter)",
-    "llama3.2:3b": "Llama 3.2 3B Local",
-    "gemma3:4b": "Gemma 3 4B Local",
-    "gemini-3.6-flash": "Gemini 3.6 Flash",
-    "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
-    "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
-};
-
 const MessageBubble = memo(function MessageBubble({
     id,
     role,
@@ -76,8 +66,6 @@ const MessageBubble = memo(function MessageBubble({
     sources = [],
     feedback,
     onFeedback,
-    selectedModel,
-    fallbackUsed = false,
 }) {
     const isUser = role === "user";
 
@@ -97,15 +85,6 @@ const MessageBubble = memo(function MessageBubble({
                 {!isUser && (
                     <div style={styles.authorRow}>
                         <span style={styles.author}>Assistant</span>
-                        {selectedModel && (
-                            <span
-                                style={styles.modelNote}
-                                title={fallbackUsed ? "The selected model was unavailable, so a fallback answered." : "Model used for this answer"}
-                            >
-                                {MODEL_LABELS[selectedModel] || selectedModel}
-                                {fallbackUsed ? " (fallback)" : ""}
-                            </span>
-                        )}
                     </div>
                 )}
                 <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant), whiteSpace: isUser ? "pre-wrap" : "normal" }}>
@@ -259,11 +238,6 @@ const styles = {
         flexWrap: "wrap",
         gap: "7px",
         minHeight: "18px",
-    },
-    modelNote: {
-        fontSize: "11px",
-        color: "var(--app-faint)",
-        overflowWrap: "anywhere",
     },
     bubble: {
         padding: "0",

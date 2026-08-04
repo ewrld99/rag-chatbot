@@ -1438,7 +1438,7 @@ QUESTION:
             "context_used": bool(
                 context
                 and context.strip()
-                and grounding_outcome.status != "refused"
+                and self._is_answer_outcome(grounding_outcome)
             ),
             "evidence_ids": list(grounding_outcome.evidence_ids),
             "grounding": grounding_outcome.to_dict(),
@@ -1453,7 +1453,7 @@ QUESTION:
         user_profile: Optional[Dict[str, Any]],
         reason: Optional[str] = None,
     ) -> GroundingOutcome:
-        if outcome.status != "refused":
+        if self._is_answer_outcome(outcome):
             return outcome
         try:
             answer = self.generate_document_refusal(
@@ -1473,6 +1473,7 @@ QUESTION:
             supported_claim_count=outcome.supported_claim_count,
             repaired=outcome.repaired,
             status=outcome.status,
+            failure_reason=outcome.failure_reason,
         )
         self._last_grounding_outcome = updated
         return updated
@@ -1485,7 +1486,7 @@ QUESTION:
         user_profile: Optional[Dict[str, Any]],
         reason: Optional[str] = None,
     ) -> GroundingOutcome:
-        if outcome.status != "refused":
+        if self._is_answer_outcome(outcome):
             return outcome
         try:
             chunks = [
@@ -1508,6 +1509,7 @@ QUESTION:
             supported_claim_count=outcome.supported_claim_count,
             repaired=outcome.repaired,
             status=outcome.status,
+            failure_reason=outcome.failure_reason,
         )
         self._last_grounding_outcome = updated
         return updated
@@ -1522,6 +1524,7 @@ QUESTION:
                 "supported_claim_count": 0,
                 "repaired": False,
                 "status": "refused",
+                "failure_reason": "no_evidence",
             }
         return outcome.to_dict()
 
@@ -1535,9 +1538,14 @@ QUESTION:
             supported_claim_count=outcome.supported_claim_count,
             repaired=outcome.repaired,
             status=outcome.status,
+            failure_reason=outcome.failure_reason,
         )
         self._last_grounding_outcome = stored_outcome
         return stored_outcome
+
+    @staticmethod
+    def _is_answer_outcome(outcome: GroundingOutcome) -> bool:
+        return outcome.status in {"grounded", "partial"}
 
     def _document_completion_messages(
         self,
@@ -1682,6 +1690,7 @@ QUESTION:
             outcome = self.grounding.refusal_outcome(
                 refusal=self.DOCUMENT_REFUSAL,
                 repaired=repaired,
+                failure_reason="parse_error",
             )
             return outcome, [parse_error or "Unable to parse grounded answer."], None, None, []
 
@@ -1706,6 +1715,7 @@ QUESTION:
                     refusal=self.DOCUMENT_REFUSAL,
                     repaired=repaired,
                     claim_count=len(draft.claims),
+                    failure_reason="model_refusal",
                 ),
                 reasons,
                 None,
@@ -1720,6 +1730,7 @@ QUESTION:
                     refusal=self.DOCUMENT_REFUSAL,
                     repaired=repaired,
                     claim_count=len(draft.claims),
+                    failure_reason="unsupported_answer",
                 ),
                 reasons,
                 None,
@@ -1837,7 +1848,7 @@ QUESTION:
         initial: GroundingOutcome,
         repaired: GroundingOutcome,
     ) -> GroundingOutcome:
-        if initial.status != "refused" and initial.supported_claim_count > 0:
+        if GenerationService._is_answer_outcome(initial) and initial.supported_claim_count > 0:
             if repaired.supported_claim_count < initial.supported_claim_count:
                 return initial
         return repaired
@@ -1855,6 +1866,7 @@ QUESTION:
             return self.grounding.refusal_outcome(
                 refusal=self.DOCUMENT_REFUSAL,
                 repaired=False,
+                failure_reason="no_evidence",
             )
 
         # Preserve structurally valid units on the first pass so an extra uncited
@@ -1891,7 +1903,7 @@ QUESTION:
             evidence,
         )
         if (
-            initial_outcome.status != "refused"
+            self._is_answer_outcome(initial_outcome)
             and initial_outcome.supported_claim_count > 0
             and not needs_completeness_repair
         ):
@@ -1916,7 +1928,7 @@ QUESTION:
             )
         except GenerationUnavailableError:
             if (
-                initial_outcome.status != "refused"
+                self._is_answer_outcome(initial_outcome)
                 and initial_outcome.supported_claim_count > 0
             ):
                 return initial_outcome
@@ -1974,7 +1986,7 @@ QUESTION:
         reasons: List[str],
         raw_output: str,
     ) -> None:
-        if outcome.status != "refused":
+        if self._is_answer_outcome(outcome):
             return
         logger.warning(
             format_log_event(
@@ -1984,6 +1996,8 @@ QUESTION:
                 claim_count=outcome.claim_count,
                 supported_claim_count=outcome.supported_claim_count,
                 repaired=outcome.repaired,
+                status=outcome.status,
+                failure_reason=outcome.failure_reason,
                 reasons=reasons[:12],
                 raw_preview=raw_output[:600],
                 query=query[:120],
@@ -2309,87 +2323,33 @@ QUESTION:
         user_profile: Optional[Dict[str, Any]] = None,
         documents: Optional[List[Document]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream a provisional claims draft, then publish the verified answer."""
-        extractor = _JSONClaimStreamExtractor(
-            ordered=self._is_procedure_query(query),
-        )
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        streamed_parts: list[str] = []
-
-        async def on_delta(raw_delta: str) -> None:
-            for part in extractor.feed(raw_delta):
-                streamed_parts.append(part)
-                await queue.put(("delta", part))
-
-        async def on_reset() -> None:
-            extractor.reset()
-            if streamed_parts:
-                streamed_parts.clear()
-                await queue.put(("replace", ""))
-
-        async def produce() -> None:
-            try:
-                outcome = await self._generate_grounded_async(
-                    query,
-                    context,
-                    chat_history,
-                    user_profile,
-                    list(documents or []),
-                    draft_delta_callback=on_delta,
-                    draft_reset_callback=on_reset,
-                )
-                await queue.put(("final", outcome))
-            except Exception as exc:
-                await queue.put(("error", exc))
-
-        producer = asyncio.create_task(produce())
+        """Publish only the final validated document answer."""
         try:
-            while True:
-                kind, payload = await queue.get()
-                if kind == "delta":
-                    yield {
-                        "type": "stream",
-                        "token": str(payload),
-                        "provisional": True,
-                    }
-                    continue
-                if kind == "replace":
-                    yield {
-                        "type": "replace",
-                        "answer": str(payload),
-                        "provisional": True,
-                    }
-                    continue
-                if kind == "error":
-                    raise payload
-
-                grounding_outcome = self._set_grounding_outcome(payload)
-                grounding_outcome = await self._dynamic_document_refusal_outcome_async(
-                    grounding_outcome,
-                    query,
-                    chat_history,
-                    user_profile,
-                    reason="Retrieved evidence did not support an answer.",
-                )
-                final_answer = grounding_outcome.answer
-                yield {
-                    "type": "replace",
-                    "answer": final_answer,
-                    "provisional": False,
-                }
-                break
+            outcome = await self._generate_grounded_async(
+                query,
+                context,
+                chat_history,
+                user_profile,
+                list(documents or []),
+            )
+            grounding_outcome = self._set_grounding_outcome(outcome)
+            grounding_outcome = await self._dynamic_document_refusal_outcome_async(
+                grounding_outcome,
+                query,
+                chat_history,
+                user_profile,
+                reason="Retrieved evidence did not support an answer.",
+            )
+            yield {
+                "type": "replace",
+                "answer": grounding_outcome.answer,
+                "provisional": False,
+            }
         except GenerationUnavailableError:
             raise
         except Exception as exc:
             logger.exception("Unexpected streamed document answer processing failure")
             raise GenerationUnavailableError() from exc
-        finally:
-            if not producer.done():
-                producer.cancel()
-                try:
-                    await producer
-                except asyncio.CancelledError:
-                    pass
 
     async def _document_completion_async(
         self,
@@ -2543,6 +2503,7 @@ QUESTION:
             return self.grounding.refusal_outcome(
                 refusal=self.DOCUMENT_REFUSAL,
                 repaired=False,
+                failure_reason="no_evidence",
             )
 
         # Procedure and policy-list queries synthesize information across multiple
@@ -2581,7 +2542,7 @@ QUESTION:
             evidence,
         )
         if (
-            initial_outcome.status != "refused"
+            self._is_answer_outcome(initial_outcome)
             and initial_outcome.supported_claim_count > 0
             and not needs_completeness_repair
         ):
@@ -2608,7 +2569,7 @@ QUESTION:
             )
         except GenerationUnavailableError:
             if (
-                initial_outcome.status != "refused"
+                self._is_answer_outcome(initial_outcome)
                 and initial_outcome.supported_claim_count > 0
             ):
                 return initial_outcome

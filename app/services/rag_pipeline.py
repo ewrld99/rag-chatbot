@@ -628,7 +628,7 @@ class RAGPipeline:
             grounding=generation_result["grounding"],
             selected_model=generation_result["selected_model"],
             fallback_used=generation_result["fallback_used"],
-            answered=generation_result["grounding"].get("status") != "refused",
+            answered=generation_result["grounding"].get("status") in {"grounded", "partial"},
         )
 
         return {
@@ -942,7 +942,7 @@ class RAGPipeline:
             grounding=grounding,
             selected_model=self.generator.model_metadata()["selected_model"],
             fallback_used=self.generator.model_metadata()["fallback_used"],
-            answered=grounding.get("status") != "refused",
+            answered=grounding.get("status") in {"grounded", "partial"},
         )
 
     def run_debug(

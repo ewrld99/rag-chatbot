@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 from app.services.generation_service import (
     GenerationService,
@@ -34,22 +33,10 @@ class _StreamingGenerationService(GenerationService):
         self._last_grounding_outcome = None
         self._last_model_execution = None
         self.model_preference = "auto"
+        self.received_draft_callback = False
 
     async def _generate_grounded_async(self, *_args, **kwargs):
-        callback = kwargs["draft_delta_callback"]
-        payload = json.dumps(
-            {
-                "coverage": "full",
-                "claims": [
-                    {
-                        "claim": "Submit the request through SR2.",
-                        "evidence_ids": ["ev-1"],
-                    }
-                ],
-            }
-        )
-        for start in range(0, len(payload), 12):
-            await callback(payload[start:start + 12])
+        self.received_draft_callback = kwargs.get("draft_delta_callback") is not None
         return GroundingOutcome(
             answer="1. Submit the request through SR2.",
             coverage="full",
@@ -61,9 +48,10 @@ class _StreamingGenerationService(GenerationService):
         )
 
 
-def test_document_stream_emits_draft_tokens_then_verified_replacement():
+def test_document_stream_emits_only_verified_replacement():
+    service = _StreamingGenerationService()
+
     async def collect_events():
-        service = _StreamingGenerationService()
         return [
             event
             async for event in service.stream_generate(
@@ -74,9 +62,9 @@ def test_document_stream_emits_draft_tokens_then_verified_replacement():
 
     events = asyncio.run(collect_events())
 
-    assert any(event["type"] == "stream" for event in events)
-    assert events[-1] == {
+    assert service.received_draft_callback is False
+    assert events == [{
         "type": "replace",
         "answer": "1. Submit the request through SR2.",
         "provisional": False,
-    }
+    }]

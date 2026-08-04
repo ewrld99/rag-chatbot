@@ -113,7 +113,20 @@ class GroundingOutcome:
     claim_count: int
     supported_claim_count: int
     repaired: bool
-    status: Literal["grounded", "partial", "refused"]
+    status: Literal[
+        "grounded",
+        "partial",
+        "refused",
+        "parse_error",
+        "unsupported_answer",
+        "model_refusal",
+    ]
+    failure_reason: Literal[
+        "parse_error",
+        "unsupported_answer",
+        "model_refusal",
+        "no_evidence",
+    ] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +136,7 @@ class GroundingOutcome:
             "supported_claim_count": self.supported_claim_count,
             "repaired": self.repaired,
             "status": self.status,
+            "failure_reason": self.failure_reason,
         }
 
 
@@ -171,7 +185,12 @@ class GroundingService:
         ]
 
     def parse_draft(self, raw: str) -> tuple[GroundedDraft | None, str | None]:
-        payload = self._extract_json_object(raw)
+        payload = self._extract_json_object(
+            raw,
+            expected_keys={"answer", "claims", "coverage"},
+        )
+        if payload is None:
+            payload = self._recover_draft_payload(raw)
         if payload is None:
             return None, "The model did not return a JSON object."
         payload = self._normalize_draft_payload(payload)
@@ -183,6 +202,10 @@ class GroundingService:
     def _normalize_draft_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(payload)
         claims = normalized.get("claims")
+
+        coverage = str(normalized.get("coverage") or "").strip().lower()
+        if coverage in {"full", "partial", "none"}:
+            normalized["coverage"] = coverage
 
         # Extract top-level evidence IDs if present (some LLMs output {"evidence": {"ev-1": "..."}, "claims": [...]})
         top_level_evidence = normalized.get("evidence")
@@ -513,7 +536,7 @@ class GroundingService:
         expected_indexes: Iterable[int],
     ) -> VerificationReport:
         expected = set(expected_indexes)
-        payload = self._extract_json_object(raw)
+        payload = self._extract_json_object(raw, expected_keys={"claims"})
         if payload is None or not isinstance(payload.get("claims"), list):
             return VerificationReport(
                 errors=["The verifier did not return the required JSON object."]
@@ -550,6 +573,7 @@ class GroundingService:
         verification: VerificationReport,
         refusal: str,
         repaired: bool,
+        failure_reason: Literal["unsupported_answer"] = "unsupported_answer",
     ) -> GroundingOutcome:
         structurally_valid = set(validation.valid_claim_indexes(len(draft.claims)))
         supported = structurally_valid & verification.supported_indexes()
@@ -591,6 +615,7 @@ class GroundingService:
             refusal=refusal,
             repaired=repaired,
             claim_count=len(draft.claims),
+            failure_reason=failure_reason,
         )
 
     def refusal_outcome(
@@ -598,7 +623,14 @@ class GroundingService:
         refusal: str,
         repaired: bool,
         claim_count: int = 0,
+        failure_reason: Literal[
+            "parse_error",
+            "unsupported_answer",
+            "model_refusal",
+            "no_evidence",
+        ] = "unsupported_answer",
     ) -> GroundingOutcome:
+        status = "refused" if failure_reason == "no_evidence" else failure_reason
         return GroundingOutcome(
             answer=refusal,
             coverage="none",
@@ -606,7 +638,8 @@ class GroundingService:
             claim_count=claim_count,
             supported_claim_count=0,
             repaired=repaired,
-            status="refused",
+            status=status,
+            failure_reason=failure_reason,
         )
 
     def _supported_answer_units(
@@ -662,20 +695,121 @@ class GroundingService:
                     evidence_ids.append(evidence_id)
         return evidence_ids
 
-    def _extract_json_object(self, raw: str) -> dict[str, Any] | None:
+    def _extract_json_object(
+        self,
+        raw: str,
+        expected_keys: set[str] | None = None,
+    ) -> dict[str, Any] | None:
         if not raw:
             return None
         decoder = json.JSONDecoder()
-        for position, character in enumerate(raw):
+        for candidate in self._json_candidates(raw):
+            for position, character in enumerate(candidate):
+                if character != "{":
+                    continue
+                try:
+                    value, _end = decoder.raw_decode(candidate[position:])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                if expected_keys and not (set(value) & expected_keys):
+                    continue
+                return value
+        return None
+
+    def _json_candidates(self, raw: str) -> list[str]:
+        return list(dict.fromkeys([raw, self._remove_json_trailing_commas(raw)]))
+
+    @staticmethod
+    def _remove_json_trailing_commas(raw: str) -> str:
+        if not raw:
+            return raw
+        result: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+        while index < len(raw):
+            character = raw[index]
+            if in_string:
+                result.append(character)
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                index += 1
+                continue
+            if character == '"':
+                in_string = True
+                result.append(character)
+                index += 1
+                continue
+            if character == ",":
+                lookahead = index + 1
+                while lookahead < len(raw) and raw[lookahead].isspace():
+                    lookahead += 1
+                if lookahead < len(raw) and raw[lookahead] in "]}":
+                    index += 1
+                    continue
+            result.append(character)
+            index += 1
+        return "".join(result)
+
+    def _recover_draft_payload(self, raw: str) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        claims = self._recover_claim_objects(raw)
+        coverage = self._recover_string_field(raw, "coverage")
+        normalized_coverage = coverage.lower() if coverage else None
+        answer = self._recover_string_field(raw, "answer") or ""
+        if normalized_coverage not in {"full", "partial", "none"}:
+            normalized_coverage = "partial" if claims else None
+        if not claims and normalized_coverage is None and not answer.strip():
+            return None
+        return {
+            "coverage": normalized_coverage or "none",
+            "answer": answer,
+            "claims": claims,
+        }
+
+    def _recover_claim_objects(self, raw: str) -> list[dict[str, Any]]:
+        claim_key = re.search(r'"claims"\s*:\s*\[', raw)
+        if not claim_key:
+            return []
+        decoder = json.JSONDecoder()
+        claims_region = self._remove_json_trailing_commas(raw[claim_key.end():])
+        claims: list[dict[str, Any]] = []
+        for position, character in enumerate(claims_region):
+            if character == "]":
+                break
             if character != "{":
                 continue
             try:
-                value, _end = decoder.raw_decode(raw[position:])
+                value, _end = decoder.raw_decode(claims_region[position:])
             except json.JSONDecodeError:
                 continue
-            if isinstance(value, dict):
-                return value
-        return None
+            if isinstance(value, dict) and self._looks_like_draft_claim(value):
+                claims.append(value)
+        return claims
+
+    @staticmethod
+    def _looks_like_draft_claim(value: dict[str, Any]) -> bool:
+        claim_fields = {"claim", "text", "sentence", "statement", "content"}
+        return bool(set(value) & claim_fields)
+
+    @staticmethod
+    def _recover_string_field(raw: str, field: str) -> str | None:
+        match = re.search(rf'"{re.escape(field)}"\s*:\s*"', raw)
+        if not match:
+            return None
+        decoder = json.JSONDecoder()
+        try:
+            value, _end = decoder.raw_decode(raw[match.end() - 1:])
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, str) else None
 
     def _answer_units(self, answer: str) -> list[str]:
         return [unit["plain"] for unit in self._answer_markdown_units(answer)]
